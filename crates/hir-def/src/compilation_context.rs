@@ -72,6 +72,28 @@ impl FileCompilationContext {
         )
     }
 
+    /// [`Self::module_environment`] widened to every environment that may compile the module.
+    pub fn possible_module_environment(
+        &self,
+        metadata: &crate::ModuleMetadata,
+    ) -> crate::execution_env::EnvFlags {
+        crate::execution_env::widen_module_base_env(metadata, self.module_environment(metadata))
+    }
+
+    /// [`Self::body_environment`] over [`Self::possible_module_environment`].
+    pub fn possible_body_environment(
+        &self,
+        metadata: &crate::ModuleMetadata,
+        annotations: &[crate::item_tree::AnnotationKind],
+    ) -> crate::execution_env::EnvFlags {
+        crate::execution_env::possible_body_env_with_base(
+            metadata,
+            annotations,
+            &self.environment,
+            self.module_environment(metadata),
+        )
+    }
+
     /// An actual external host identity is available only through an explicit owner.
     pub fn has_proven_external_owner(&self) -> bool {
         self.origin == CompilationContextOrigin::ExplicitExternalOwner

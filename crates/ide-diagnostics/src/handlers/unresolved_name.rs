@@ -340,6 +340,104 @@ mod tests {
         );
     }
 
+    /// Messages of `UnresolvedName` for `body` as a procedure body, in a module of
+    /// unknown environment (`Caller`) or in a server common module (`Проба`).
+    fn unresolved_in(server_module: bool, body: &str) -> Vec<String> {
+        use crate::test_utils::{check_cfe_at_with_unreadable, check_with_cfe};
+
+        let source = format!("Процедура Тест()\n{body}КонецПроцедуры\n");
+        let diagnostics = if server_module {
+            let mut builder = test_fixture::CfeFixtureBuilder::new("");
+            builder.add_base_module("Проба", &source);
+            check_cfe_at_with_unreadable(
+                "CommonModules/Проба/Ext/Module.bsl",
+                &source,
+                builder.build(),
+                &[],
+                crate::diagnostics,
+            )
+        } else {
+            check_with_cfe(&source, test_fixture::CfeFixtureBuilder::new("").build())
+        };
+        diagnostics
+            .into_iter()
+            .filter(|diag| diag.code == DiagnosticCode::UnresolvedName)
+            .map(|diag| diag.message)
+            .collect()
+    }
+
+    /// The platform never compiles `#Если Сервер И Не Сервер` (the idiom that gives the
+    /// editor a type hint), so a name read there is never looked up. The pair differs in
+    /// the directive lines alone; a branch some environment compiles and the plain body
+    /// keep the verdict.
+    #[test]
+    fn a_name_in_a_branch_no_valuation_compiles_is_not_reported() {
+        for server_module in [false, true] {
+            let plain = unresolved_in(server_module, "    Х = НетТакогоИмени;\n");
+            assert_eq!(plain.len(), 1, "control (server={server_module}): {plain:?}");
+
+            let dead = unresolved_in(
+                server_module,
+                "#Если Сервер И Не Сервер Тогда\n    Х = НетТакогоИмени;\n#КонецЕсли\n",
+            );
+            assert!(dead.is_empty(), "dead branch (server={server_module}): {dead:?}");
+
+            let satisfiable = unresolved_in(
+                server_module,
+                "#Если Сервер Тогда\n    Х = НетТакогоИмени;\n#КонецЕсли\n",
+            );
+            assert_eq!(
+                satisfiable.len(),
+                1,
+                "satisfiable (server={server_module}): {satisfiable:?}"
+            );
+
+            // Only the branch is silent.
+            let after = unresolved_in(
+                server_module,
+                "#Если Сервер И Не Сервер Тогда\n    Х = НетТакогоИмени;\n#КонецЕсли\n    Х = ДругоеНет;\n",
+            );
+            assert_eq!(after.len(), 1, "after the branch (server={server_module}): {after:?}");
+            assert!(after[0].contains("ДругоеНет"), "{after:?}");
+        }
+    }
+
+    /// `#Иначе` of a dropped branch is compiled: it takes everything the branch did not.
+    /// A dropped `#ИначеЕсли` is silent like the dropped `#Если`.
+    #[test]
+    fn the_else_of_a_dropped_branch_is_live() {
+        for server_module in [false, true] {
+            let in_else = unresolved_in(
+                server_module,
+                "#Если Сервер И Не Сервер Тогда\n    А = Скрыто;\n#Иначе\n    Х = НетТакогоИмени;\n#КонецЕсли\n",
+            );
+            assert_eq!(in_else.len(), 1, "#Иначе (server={server_module}): {in_else:?}");
+            assert!(in_else[0].contains("НетТакогоИмени"), "{in_else:?}");
+
+            let in_elsif = unresolved_in(
+                server_module,
+                "#Если Сервер Тогда\n    Х = 1;\n#ИначеЕсли Клиент И Не Клиент Тогда\n    А = Скрыто;\n#КонецЕсли\n",
+            );
+            assert!(in_elsif.is_empty(), "#ИначеЕсли (server={server_module}): {in_elsif:?}");
+        }
+    }
+
+    /// A condition with a symbol nothing is known about is not a contradiction unless a
+    /// recognised operand already forces it.
+    #[test]
+    fn an_undecided_condition_keeps_the_verdict() {
+        let unknown = unresolved_in(
+            false,
+            "#Если Линукс И Не Сервер Тогда\n    Х = НетТакогоИмени;\n#КонецЕсли\n",
+        );
+        assert_eq!(unknown.len(), 1, "{unknown:?}");
+        let forced = unresolved_in(
+            false,
+            "#Если Линукс И Сервер И Не Сервер Тогда\n    Х = НетТакогоИмени;\n#КонецЕсли\n",
+        );
+        assert!(forced.is_empty(), "{forced:?}");
+    }
+
     #[test]
     fn unread_application_module_keeps_unknown_name_indeterminate() {
         use crate::test_utils::check_with_cfe_unreadable;
@@ -893,5 +991,100 @@ mod tests {
         assert!(
             !crate::DiagnosticsConfig::all_enabled().is_disabled(DiagnosticCode::UnresolvedName)
         );
+    }
+
+    /// Messages of `UnresolvedName` for `source` as the body of the common module
+    /// `Caller` whose metadata carries the given flags.
+    fn unresolved_in_flagged_module(
+        server_call: bool,
+        ordinary: bool,
+        ordinary_app_support: bool,
+        source: &str,
+    ) -> Vec<String> {
+        use crate::test_utils::check_with_cfe_config;
+
+        let fixture = test_fixture::CfeFixtureBuilder::new("").build();
+        let modules = fixture.root().join("CommonModules");
+        let ext = modules.join("Caller/Ext");
+        std::fs::create_dir_all(&ext).expect("create CommonModule directory");
+        std::fs::write(ext.join("Module.bsl"), source).expect("write CommonModule body");
+        std::fs::write(
+            modules.join("Caller.xml"),
+            format!(
+                r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">
+<CommonModule uuid="52000000-0000-0000-0000-000000000002"><Properties>
+<Name>Caller</Name>
+<ClientManagedApplication>false</ClientManagedApplication>
+<Server>true</Server>
+<ExternalConnection>true</ExternalConnection>
+<ClientOrdinaryApplication>{ordinary}</ClientOrdinaryApplication>
+<ServerCall>{server_call}</ServerCall>
+</Properties></CommonModule>
+</MetaDataObject>"#
+            ),
+        )
+        .expect("write CommonModule metadata");
+        let config = crate::DiagnosticsConfig {
+            ordinary_app_support,
+            ..crate::DiagnosticsConfig::all_enabled()
+        };
+        check_with_cfe_config(source, fixture, config)
+            .into_iter()
+            .filter(|diag| diag.code == DiagnosticCode::UnresolvedName)
+            .map(|diag| diag.message)
+            .collect()
+    }
+
+    /// A `ServerCall` module flagged «Клиент (обычное приложение)» is compiled in the
+    /// thick client of the ordinary application, so its `#Если Клиент` block is live
+    /// and a name nothing declares there is reported. The pairs differ in one flag.
+    #[test]
+    fn a_client_block_of_a_server_call_module_with_the_ordinary_client_is_live() {
+        let client_block = "#Если Клиент Тогда\nПроцедура Тест()\n    Х = НетТакогоИмени;\nКонецПроцедуры\n#КонецЕсли\n";
+        let in_body = "Процедура Тест()\n#Если Клиент Тогда\n    Х = НетТакогоИмени;\n#КонецЕсли\nКонецПроцедуры\n";
+        for ordinary_app_support in [false, true] {
+            for source in [client_block, in_body] {
+                // Control: without `ServerCall` the module has the ordinary client.
+                let control =
+                    unresolved_in_flagged_module(false, true, ordinary_app_support, source);
+                assert_eq!(
+                    control.len(),
+                    1,
+                    "control (support={ordinary_app_support}): {control:?}"
+                );
+
+                let live = unresolved_in_flagged_module(true, true, ordinary_app_support, source);
+                assert_eq!(
+                    live.len(),
+                    1,
+                    "ServerCall + ordinary (support={ordinary_app_support}): {live:?}"
+                );
+                assert!(live[0].contains("НетТакогоИмени"), "{live:?}");
+            }
+        }
+    }
+
+    /// The suppression keeps its two intended cases next to the live one above: a
+    /// client block of a module no client compiles, and a contradictory condition in a
+    /// module that does have the ordinary client.
+    #[test]
+    fn a_client_block_no_client_compiles_stays_silent() {
+        let client_block = "#Если Клиент Тогда\nПроцедура Тест()\n    Х = НетТакогоИмени;\nКонецПроцедуры\n#КонецЕсли\n";
+        let in_body = "Процедура Тест()\n#Если Клиент Тогда\n    Х = НетТакогоИмени;\n#КонецЕсли\nКонецПроцедуры\n";
+        let contradiction = "Процедура Тест()\n#Если Сервер И Не Сервер Тогда\n    Х = НетТакогоИмени;\n#КонецЕсли\nКонецПроцедуры\n";
+        for ordinary_app_support in [false, true] {
+            for source in [client_block, in_body] {
+                // Server only: no environment of the module is a client.
+                let silent =
+                    unresolved_in_flagged_module(true, false, ordinary_app_support, source);
+                assert!(
+                    silent.is_empty(),
+                    "server only (support={ordinary_app_support}): {silent:?}"
+                );
+            }
+            let dead =
+                unresolved_in_flagged_module(true, true, ordinary_app_support, contradiction);
+            assert!(dead.is_empty(), "contradiction (support={ordinary_app_support}): {dead:?}");
+        }
     }
 }

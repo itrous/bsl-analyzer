@@ -71,6 +71,27 @@ impl PreprocSymbol {
         }
     }
 
+    /// Number of symbol classes that take a bit in [`Self::valuation_bit`].
+    const MODELLED_COUNT: u32 = 9;
+
+    /// Bit of this class in a valuation; `None` for a symbol nothing is known
+    /// about.
+    fn valuation_bit(self) -> Option<u32> {
+        use PreprocSymbol::*;
+        match self {
+            Client => Some(0),
+            Server => Some(1),
+            ThinClient => Some(2),
+            WebClient => Some(3),
+            MobileClient => Some(4),
+            ThickClientOrdinaryApplication => Some(5),
+            ThickClientManagedApplication => Some(6),
+            ExternalConnection => Some(7),
+            MobileAppRuntime => Some(8),
+            Unrecognized => None,
+        }
+    }
+
     /// Whether the symbol holds in environment `env` (a single flag), with an
     /// undecided `Сервер` taken as `server`. `None` — cannot be decided from
     /// the environment alone.
@@ -174,6 +195,42 @@ impl PreprocCondition {
             }
             PreprocCondition::Or(lhs, rhs) => {
                 match (lhs.eval_with(env, server), rhs.eval_with(env, server)) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                }
+            }
+            PreprocCondition::Unknown => None,
+        }
+    }
+
+    /// The condition is false under every valuation of its symbols, whatever
+    /// environment the code runs in: `Сервер И Не Сервер`. The platform drops
+    /// such a branch before reading it. Symbols are taken as independent
+    /// booleans, so this is strictly narrower than "no modelled environment
+    /// compiles the branch" (`Сервер И ТонкийКлиент` is not one), and an
+    /// unrecognized symbol or a malformed condition keeps the verdict
+    /// undecided unless a recognized operand already forces `false`.
+    pub fn is_contradiction(&self) -> bool {
+        (0..1u16 << PreprocSymbol::MODELLED_COUNT)
+            .all(|valuation| self.eval_valuation(valuation) == Some(false))
+    }
+
+    fn eval_valuation(&self, valuation: u16) -> Option<bool> {
+        match self {
+            PreprocCondition::Symbol(sym) => {
+                sym.valuation_bit().map(|bit| valuation & (1 << bit) != 0)
+            }
+            PreprocCondition::Not(inner) => inner.eval_valuation(valuation).map(|v| !v),
+            PreprocCondition::And(lhs, rhs) => {
+                match (lhs.eval_valuation(valuation), rhs.eval_valuation(valuation)) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                }
+            }
+            PreprocCondition::Or(lhs, rhs) => {
+                match (lhs.eval_valuation(valuation), rhs.eval_valuation(valuation)) {
                     (Some(true), _) | (_, Some(true)) => Some(true),
                     (Some(false), Some(false)) => Some(false),
                     _ => None,
@@ -520,6 +577,29 @@ mod tests {
         assert_eq!(t("(Сервер И Не Сервер) ИЛИ Линукс", env), None);
         assert_eq!(t("Сервер И Не Сервер И Линукс", env), Some(false));
         assert_eq!(t("Сервер И Линукс", env), None);
+    }
+
+    /// A contradiction is false under every valuation of its symbols, not merely in
+    /// every modelled environment; each control differs from a contradiction in one
+    /// detail.
+    #[test]
+    fn contradiction_is_a_property_of_the_condition() {
+        let c = |text: &str| PreprocCondition::parse(text).is_contradiction();
+        assert!(c("Сервер И Не Сервер"));
+        assert!(c("Server And Not Server"));
+        assert!(c("НЕ (Сервер ИЛИ НЕ Сервер)"));
+        assert!(c("(Клиент ИЛИ ВебКлиент) И НЕ Клиент И НЕ ВебКлиент"));
+        assert!(c("Линукс И Сервер И Не Сервер"));
+
+        assert!(!c("Сервер"));
+        assert!(!c("Сервер И Не Клиент"));
+        // No modelled environment is both, yet the symbols are independent booleans.
+        assert!(!c("Сервер И ТонкийКлиент"));
+        assert!(!c("Сервер ИЛИ НЕ Сервер"));
+        assert!(!c("Линукс И Не Сервер"));
+        assert!(!c("Линукс И Не Линукс"));
+        assert!(!PreprocCondition::Unknown.is_contradiction());
+        assert!(!c("Сервер И"));
     }
 
     #[test]

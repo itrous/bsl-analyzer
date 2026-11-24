@@ -49,13 +49,18 @@ pub(crate) fn possible_method_env_with_metadata(
     options: &EnvOptions,
 ) -> Option<EnvFlags> {
     let decl = db.interface_method(method)?;
-    let environment = db.file_compilation_context(method.module.file_id).map_or_else(
+    let context = db.file_compilation_context(method.module.file_id);
+    let narrow = context.as_ref().map_or_else(
         || execution_env::body_env(metadata, &decl.directives, options),
         |context| context.body_environment(metadata, &decl.directives),
     );
-    if environment.is_empty() {
+    if narrow.is_empty() {
         return None;
     }
+    let environment = context.as_ref().map_or_else(
+        || execution_env::possible_body_env(metadata, &decl.directives, options),
+        |context| context.possible_body_environment(metadata, &decl.directives),
+    );
     Some(environment & (decl.preproc_env | decl.preproc_undecided))
 }
 
