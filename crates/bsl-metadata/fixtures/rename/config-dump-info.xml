@@ -1,0 +1,11 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<ConfigDumpInfo xmlns='http://v8.1c.ru/8.3/xcf/dumpinfo' format='Hierarchical' version='2.20'>
+  <ConfigVersions>
+    <Metadata name='Catalog.Partners' id='00000000-0000-0000-0000-000000000001' configVersion='opaque-version-1'>
+      <Metadata name='Catalog.Partners.Attribute.Cap&#116;ion' id='00000000-0000-0000-0000-000000000002'/>
+    </Metadata>
+    <Metadata name='Catalog.Partners.Form.Card.Form' id='00000000-0000-0000-0000-000000000050.0' configVersion='opaque-form-version'/>
+    <Metadata name='Catalog.Partners.Help' id='00000000-0000-0000-0000-000000000001.5' configVersion='opaque-help-version'/>
+    <Metadata name='Catalog.Customers' id='00000000-0000-0000-0000-000000000003' configVersion='unrelated-version'/>
+  </ConfigVersions>
+</ConfigDumpInfo>

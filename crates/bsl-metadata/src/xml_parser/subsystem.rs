@@ -56,7 +56,25 @@ pub fn parse_subsystem_xml(xml: &str) -> Result<Subsystem> {
         }
     }
 
-    Ok(Subsystem::new(name).with_content(content).with_child_subsystems(child_subsystems))
+    let mut subsystem =
+        Subsystem::new(name).with_content(content).with_child_subsystems(child_subsystems);
+    subsystem.picture =
+        find_child(props, "Picture").map(|node| node.text().unwrap_or_default().to_string());
+    subsystem.content_refs = find_child(props, "Content").and_then(|node| {
+        node.children()
+            .filter(|child| child.is_element())
+            .map(|child| {
+                (child.tag_name().name() == "Item")
+                    .then(|| child.text().map(str::to_owned))
+                    .flatten()
+            })
+            .collect()
+    });
+    subsystem.uuid = mdo.attribute("uuid").and_then(|value| uuid::Uuid::parse_str(value).ok());
+    (subsystem.object_belonging, subsystem.extended_configuration_object) =
+        super::helpers::parse_extension_ownership(props);
+    subsystem.content_unread = subsystem.content_refs.is_none();
+    Ok(subsystem)
 }
 
 /// Parse a `Type.Name` metadata reference (e.g. `Catalog.Пользователи`) from a subsystem's

@@ -18,6 +18,8 @@ mod graph_db;
 mod graph_query;
 mod http;
 mod indexing;
+mod initialization;
+pub use initialization::{refuse_initialization, InitializationFailure};
 #[cfg(test)]
 mod indexing_runtime_tests;
 #[cfg(test)]
@@ -357,12 +359,25 @@ where
     // RMCP cancels its token when a session ends. A child keeps one client's disconnect
     // from stopping the broker's other sessions while still observing broker shutdown.
     let result = async {
-        let session = match server.serve_with_ct(transport, session_shutdown.child_token()).await {
-            Ok(session) => session,
-            Err(rmcp::service::ServerInitializeError::Cancelled) => return Ok(()),
-            Err(error) => return Err(anyhow::anyhow!("{error}")),
+        let session = match tokio::time::timeout(
+            initialization::INITIALIZE_BUDGET,
+            server.serve_with_ct(transport, session_shutdown.child_token()),
+        )
+        .await
+        {
+            Ok(Ok(session)) => session,
+            Ok(Err(rmcp::service::ServerInitializeError::Cancelled)) => return Ok(()),
+            Ok(Err(error)) => return Err(anyhow::anyhow!("{error}")),
+            Err(_) => {
+                tracing::warn!(phase = "mcp_initialize", "MCP initialize budget expired");
+                anyhow::bail!("MCP initialize timed out waiting for the client handshake");
+            }
         };
+        #[cfg(test)]
+        tracing::debug!(target: "broker_lifetime_probe", phase = "session-initialized");
         session.waiting().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        #[cfg(test)]
+        tracing::debug!(target: "broker_lifetime_probe", phase = "session-waiting-returned");
         Ok(())
     }
     .await;
@@ -406,7 +421,7 @@ impl McpProfile {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct MetadataParams {
-    /// info | tree | object | form | status.
+    /// info (source only) | tree | object | form | template (source only) | status.
     action: String,
     /// `tree`: case-insensitive substring to narrow the returned tree (optional).
     filter: Option<String>,
@@ -420,14 +435,20 @@ struct MetadataParams {
     /// and `mode=auto` without `connection`, e.g. `Документ`/`Справочник`/`ОбщийМодуль`.
     /// Use a plural live-service collection for `mode=infobase` and `mode=auto` with
     /// `connection`, e.g. `Документы`/`Справочники`. Forms are source-only. Required for
-    /// `object` and `form`; values are passed through without singular/plural conversion.
+    /// `object`, `form` and `template`; values are passed through without singular/plural conversion.
     object_type: Option<String>,
     /// Metadata object name, e.g. `ЗаказКлиента`. Required for `object`; for `form` it
     /// selects the owner object (omit for a configuration-level common form).
     object_name: Option<String>,
-    /// `form`: managed-form name (optional; omit for the object's default form).
+    /// `form`: form name (optional; omit to list the owner's forms).
     form_name: Option<String>,
-    /// `tree`/`object` in infobase mode: output budget in tokens (~4 UTF-8 bytes each)
+    /// Source `form`/`template`/Role or ChartOfAccounts object: empty for base, extension label for its visible scope.
+    root_id: Option<String>,
+    /// `template`: template name (optional; omit to list the owner's templates).
+    template_name: Option<String>,
+    /// `object`: exact predefined account code in the selected chart of accounts (optional).
+    predefined_code: Option<String>,
+    /// `tree`/`object`/`info`: output budget in tokens (~4 UTF-8 bytes each)
     /// for `content` and `structuredContent` together (default 6000).
     max_output_tokens: Option<usize>,
     /// Named live 1C connection for `mode=infobase` (optional).
@@ -721,8 +742,8 @@ struct ExecuteParams {
     module_type: Option<check_contract::ModuleType>,
     /// Metadata owner or explicit synthetic context for module checks.
     context: Option<check_contract::ModuleContext>,
-    /// Output budget in tokens (~4 chars each); over-budget output (a `run` context block, an
-    /// evaluated value, a long syntax-error listing) is truncated with a note (default 6000).
+    /// Output budget in tokens (~4 UTF-8 bytes each) for text and structured content together
+    /// (default 6000). Truncated values or user messages are marked explicitly.
     max_output_tokens: Option<usize>,
 }
 
@@ -1403,13 +1424,13 @@ impl McpServer {
         self.state.graph_released()
     }
 
-    /// Browse the configuration's metadata: objects, their structure, and managed forms.
+    /// Browse source/live metadata, managed and ordinary forms, report schemas and templates.
     /// Use to answer "what objects exist / what does object X contain / what is on form Y" —
     /// attributes, tabular sections, forms, types — straight from the metadata substrate. Not
     /// for call relationships (use `graph`) and not for finding code by meaning (use `search`).
-    /// Actions: `info` — configuration summary; `tree` — the metadata object tree (filterable);
+    /// Actions: `info` — source-only configuration summary; `tree` — the metadata object tree (filterable);
     /// `object` — one object's structure (needs `object_type` + `object_name`); `form` — a
-    /// source-only managed form layout (needs `object_type`); `status` — resident readiness.
+    /// source-only form layout (needs `object_type`); `template` — source template contents; `status` — resident readiness.
     /// For `object`, use a singular analyzer type (`Документ`) in source mode or auto without
     /// `connection`, and a plural live-service collection (`Документы`) in infobase mode or auto
     /// with `connection`; the server does not convert between the forms. Reads the
@@ -1427,6 +1448,12 @@ impl McpServer {
 
         let p = params.0;
         let mode = p.mode.as_deref().unwrap_or("auto");
+        if p.predefined_code.as_ref().is_some_and(|code| p.action != "object" || code.is_empty()) {
+            return Err(McpError::invalid_params(
+                "predefined_code requires action=object and a non-empty code",
+                None,
+            ));
+        }
         if !matches!(mode, "auto" | "source" | "infobase") {
             return Err(McpError::invalid_params(
                 format!("Unknown metadata mode '{mode}'. Expected: auto, source, infobase"),
@@ -1450,7 +1477,41 @@ impl McpServer {
             .into());
         }
 
+        let source_only = matches!(p.action.as_str(), "info" | "form" | "template");
         let live = mode == "infobase" || (mode == "auto" && p.connection.is_some());
+        if live && source_only {
+            return Err(McpError::invalid_params(
+                format!("Metadata action '{}' is unavailable in infobase mode", p.action),
+                None,
+            ));
+        }
+        // A loading response must not hide malformed action inputs.
+        if matches!(p.action.as_str(), "object" | "form" | "template") {
+            require(p.object_type.as_deref(), "object_type", &p.action)?;
+        }
+        if p.action == "object" {
+            require(p.object_name.as_deref(), "object_name", &p.action)?;
+        }
+        if p.template_name.is_some() && p.action != "template" {
+            return Err(McpError::invalid_params("template_name requires action=template", None));
+        }
+        let supports_object_root = p.object_type.as_deref().is_some_and(|kind| {
+            matches!(kind.to_lowercase().as_str(), "role" | "роль")
+                || tools::metadata::parse_source_mdo_type(kind)
+                    .is_ok_and(|mdo| mdo == bsl_metadata::MdoType::ChartOfAccounts)
+        });
+        if p.root_id.is_some()
+            && !(matches!(p.action.as_str(), "form" | "template")
+                || p.action == "object" && supports_object_root)
+        {
+            return Err(McpError::invalid_params(
+                "root_id is supported for form, template, and source Role or ChartOfAccounts objects",
+                None,
+            ));
+        }
+        if live && p.root_id.is_some() {
+            return Err(McpError::invalid_params("root_id requires source mode", None));
+        }
         if live {
             return match p.action.as_str() {
                 "tree" => {
@@ -1473,6 +1534,7 @@ impl McpServer {
                         p.connection.as_deref(),
                         &object_type,
                         &object_name,
+                        p.predefined_code.as_deref(),
                         p.max_output_tokens.unwrap_or(tools::response::DEFAULT_OUTPUT_BUDGET_TOKENS),
                     )
                     .await
@@ -1484,21 +1546,6 @@ impl McpServer {
                     None,
                 )),
             }
-            .map(CallToolResponse::from);
-        }
-
-        // `form` reads managed-form XML straight off the configuration source root — data
-        // the metadata substrate does not carry — so it needs neither the resident db nor
-        // a loaded configuration, and stays available while the resident is building or
-        // evicted. `source_root` survives the `MetadataCache` retirement for exactly this.
-        if p.action == "form" {
-            let object_type = require(p.object_type, "object_type", "form")?;
-            return tools::metadata::get_form_structure(
-                self.state.source_root().map(|p| p.as_path()),
-                &object_type,
-                p.object_name.as_deref(),
-                p.form_name.as_deref(),
-            )
             .map(CallToolResponse::from);
         }
 
@@ -1515,6 +1562,10 @@ impl McpServer {
         let filter = p.filter.clone();
         let object_type = p.object_type.clone();
         let object_name = p.object_name.clone();
+        let predefined_code = p.predefined_code.clone();
+        let form_name = p.form_name.clone();
+        let template_name = p.template_name.clone();
+        let root_id = p.root_id.clone();
         let max_output_tokens =
             p.max_output_tokens.unwrap_or(tools::response::DEFAULT_OUTPUT_BUDGET_TOKENS);
 
@@ -1544,12 +1595,48 @@ impl McpServer {
                                     max_output_tokens,
                                 )
                             }
+                            "form" => tools::metadata::form_from_db(
+                                db,
+                                root_id.as_deref(),
+                                &require(object_type.clone(), "object_type", "form")?,
+                                object_name.as_deref(),
+                                form_name.as_deref(),
+                            ),
+                            "template" => tools::metadata::template_from_db(
+                                db,
+                                root_id.as_deref(),
+                                &require(object_type.clone(), "object_type", "template")?,
+                                object_name.as_deref(),
+                                template_name.as_deref(),
+                            ),
                             "object" => {
                                 let object_type =
                                     require(object_type.clone(), "object_type", "object")?;
                                 let object_name =
                                     require(object_name.clone(), "object_name", "object")?;
-                                tools::metadata::object_from_db(db, &object_type, &object_name)
+                                if matches!(object_type.to_lowercase().as_str(), "role" | "роль")
+                                {
+                                    return tools::metadata::role_from_db(
+                                        db,
+                                        root_id.as_deref(),
+                                        &object_name,
+                                    );
+                                }
+                                let result = if let Some(root_id) = root_id.as_deref() {
+                                    tools::metadata::chart_of_accounts_from_db(
+                                        db,
+                                        root_id,
+                                        &object_name,
+                                    )?
+                                } else {
+                                    tools::metadata::object_from_db(db, &object_type, &object_name)?
+                                };
+                                match predefined_code.as_deref() {
+                                    Some(code) => {
+                                        tools::metadata::select_predefined_account(result, code)
+                                    }
+                                    None => Ok(result),
+                                }
                             }
                             other => Err(contract::unknown_action(
                                 McpProfile::Workspace,
@@ -1572,7 +1659,9 @@ impl McpServer {
                 });
 
                 match outcome {
-                    ResidentOutcome::Ready(result, _freshness) => result,
+                    ResidentOutcome::Ready(result, _freshness) => result.and_then(|result| {
+                        tools::metadata::bound_source_response(result, max_output_tokens)
+                    }),
                     ResidentOutcome::Loading => {
                         Ok(tools::metadata::loading(&session.status_report()))
                     }
@@ -1868,16 +1957,29 @@ impl McpServer {
                 .await
             }
             "execute" => {
-                let query = require(p.query, "query", "execute")?;
-                tools::query::execute_query(
-                    &self.state,
-                    &query,
-                    p.limit,
-                    p.parameters,
-                    p.connection.as_deref(),
-                    max_output_tokens,
-                )
-                .await
+                let query = require(p.query, "query", "execute").map_err(|mut error| {
+                    error.data = Some(serde_json::json!({"phase": "admission"}));
+                    error
+                })?;
+                let result = tokio::select! {
+                    biased;
+                    () = ct.cancelled() => {
+                        return Err(McpError::internal_error("Request cancelled", None));
+                    }
+                    result = tools::query::execute_query(
+                        &self.state,
+                        &query,
+                        p.limit,
+                        p.parameters,
+                        p.connection.as_deref(),
+                        max_output_tokens,
+                    ) => result,
+                };
+                if ct.is_cancelled() {
+                    Err(McpError::internal_error("Request cancelled", None))
+                } else {
+                    result
+                }
             }
             other => Err(contract::unknown_action(McpProfile::Workspace, "query", other)),
         }
@@ -1888,7 +1990,13 @@ impl McpServer {
     /// database (use `query` for SDBL) and not for analyzer findings (use `diagnostics`).
     /// Actions: `check` — syntax-check `code`; `run` — execute `code`; `eval` — evaluate the
     /// single expression in `code`. `run`/`eval` execute code, so this tool is not read-only.
-    /// Output is bounded by `max_output_tokens` and appends a truncation note.
+    /// `run` returns user messages in their original order, with explicit unavailable/truncated state.
+    /// Interrupted transport reports `unknown_execution_state`; execution is never retried automatically.
+    /// `max_output_tokens` bounds text and structured output together.
+    /// For complete modules, a configured check_executor retains priority and never falls back.
+    /// With no executor, epf_module_check explicitly enables only an admitted synthetic server
+    /// Object module through HTTP; declarations are checked without invoking their bodies.
+    /// Real metadata owners and unsupported/client contexts require the external executor.
     #[tool(name = "execute")]
     async fn execute(
         &self,
@@ -3145,7 +3253,14 @@ impl McpServer {
 
         // Off the async executor: parsing a 1 MB module takes tens of milliseconds, and the
         // whole answer is one such parse.
+        let disk_gate = self.state.diagnostics().disk_gate.clone();
         tokio::task::spawn_blocking(move || {
+            let _disk_read = disk_gate.try_read().map_err(|error| {
+                McpError::internal_error(
+                    error.to_string(),
+                    Some(serde_json::json!({"retry": !disk_gate.recovery_required()})),
+                )
+            })?;
             // Built per call, from the project alone. Milliseconds on real configurations, and
             // caching it would mean a second lifecycle to invalidate beside the resident's.
             let project = crate::project::at(&workspace_root).map_err(|e| {
@@ -3579,6 +3694,51 @@ mod session_config_tests {
 #[cfg(test)]
 mod surface_guards {
     use super::*;
+
+    #[tokio::test]
+    async fn metadata_source_only_actions_refuse_infobase_mode_before_selecting_connection() {
+        let server = McpServer::new(McpProfile::Workspace, SharedState::shared());
+        for action in ["info", "form", "template"] {
+            for (mode, connection) in [("infobase", None), ("auto", Some("absent"))] {
+                let params = serde_json::from_value::<MetadataParams>(
+                    serde_json::json!({"action":action,"mode":mode,"connection":connection}),
+                )
+                .unwrap();
+                let error = server
+                    .metadata(
+                        Parameters(params),
+                        tokio_util::sync::CancellationToken::new(),
+                        tasks::TaskCapable(false),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code.0, -32602);
+                assert!(
+                    error.message.contains(&format!(
+                        "Metadata action '{action}' is unavailable in infobase mode"
+                    )),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_schema_describes_source_only_info_and_exact_account_code() {
+        let schema = tool_input_schema(McpProfile::Workspace, "metadata");
+        assert!(schema["properties"]["action"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("info (source only)"));
+        assert!(schema["properties"]["predefined_code"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("exact predefined account code"));
+        assert!(schema["properties"]["root_id"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("ChartOfAccounts"));
+    }
 
     fn tool_input_schema(profile: McpProfile, name: &str) -> serde_json::Value {
         let router = McpServer::gated_router(profile, &ToolGate::for_launch(profile, &[]));
@@ -4074,6 +4234,9 @@ mod tests {
                     object_type: None,
                     object_name: None,
                     form_name: None,
+                    root_id: None,
+                    template_name: None,
+                    predefined_code: None,
                     max_output_tokens: None,
                     connection: None,
                     mode: None,
@@ -4414,6 +4577,9 @@ mod graph_supersession_contract {
             object_type: None,
             object_name: None,
             form_name: None,
+            root_id: None,
+            template_name: None,
+            predefined_code: None,
             max_output_tokens: None,
             connection: None,
             mode: Some("auto".to_owned()),
@@ -5782,14 +5948,20 @@ mod tool_descriptions {
             database (use `query` for SDBL) and not for analyzer findings (use `diagnostics`).
             Actions: `check` — syntax-check `code`; `run` — execute `code`; `eval` — evaluate the
             single expression in `code`. `run`/`eval` execute code, so this tool is not read-only.
-            Output is bounded by `max_output_tokens` and appends a truncation note.
+            `run` returns user messages in their original order, with explicit unavailable/truncated state.
+            Interrupted transport reports `unknown_execution_state`; execution is never retried automatically.
+            `max_output_tokens` bounds text and structured output together.
+            For complete modules, a configured check_executor retains priority and never falls back.
+            With no executor, epf_module_check explicitly enables only an admitted synthetic server
+            Object module through HTTP; declarations are checked without invoking their bodies.
+            Real metadata owners and unsupported/client contexts require the external executor.
               - action: check | run | eval.
               - code: BSL source to `check`/`run`, or the single expression to `eval`.
               - connection: Named live 1C connection (optional when only one/default connection exists).
               - context: Metadata owner or explicit synthetic context for module checks.
               - input_kind: Source kind for `check`: snippet (default) or complete module.
-              - max_output_tokens: Output budget in tokens (~4 chars each); over-budget output (a `run` context block, an
-            evaluated value, a long syntax-error listing) is truncated with a note (default 6000).
+              - max_output_tokens: Output budget in tokens (~4 UTF-8 bytes each) for text and structured content together
+            (default 6000). Truncated values or user messages are marked explicitly.
               - module_type: Expected module kind when `input_kind` is `module`.
 
             ## graph
@@ -5826,25 +5998,25 @@ mod tool_descriptions {
               - top: How many top-centrality methods to include in `overview` (default: 20).
 
             ## metadata
-            Browse the configuration's metadata: objects, their structure, and managed forms.
+            Browse source/live metadata, managed and ordinary forms, report schemas and templates.
             Use to answer "what objects exist / what does object X contain / what is on form Y" —
             attributes, tabular sections, forms, types — straight from the metadata substrate. Not
             for call relationships (use `graph`) and not for finding code by meaning (use `search`).
-            Actions: `info` — configuration summary; `tree` — the metadata object tree (filterable);
+            Actions: `info` — source-only configuration summary; `tree` — the metadata object tree (filterable);
             `object` — one object's structure (needs `object_type` + `object_name`); `form` — a
-            source-only managed form layout (needs `object_type`); `status` — resident readiness.
+            source-only form layout (needs `object_type`); `template` — source template contents; `status` — resident readiness.
             For `object`, use a singular analyzer type (`Документ`) in source mode or auto without
             `connection`, and a plural live-service collection (`Документы`) in infobase mode or auto
             with `connection`; the server does not convert between the forms. Reads the
             resident analysis host; while it builds it returns a retry envelope, not an error —
             `structuredContent.status == "loading"`, same field `diagnostics`/`graph` set, so retry
             shortly instead of reading the answer as "no such object".
-              - action: info | tree | object | form | status.
+              - action: info (source only) | tree | object | form | template (source only) | status.
               - connection: Named live 1C connection for `mode=infobase` (optional).
               - filter: `tree`: case-insensitive substring to narrow the returned tree (optional).
-              - form_name: `form`: managed-form name (optional; omit for the object's default form).
+              - form_name: `form`: form name (optional; omit to list the owner's forms).
               - max_items: `tree` in infobase mode: maximum returned objects (default 100, max 1000).
-              - max_output_tokens: `tree`/`object` in infobase mode: output budget in tokens (~4 UTF-8 bytes each)
+              - max_output_tokens: `tree`/`object`/`info`: output budget in tokens (~4 UTF-8 bytes each)
             for `content` and `structuredContent` together (default 6000).
               - meta_type: `tree` in infobase mode: metadata collection, e.g. `Справочники`/`Documents`.
               - mode: auto | source | infobase (default auto).
@@ -5855,7 +6027,10 @@ mod tool_descriptions {
             and `mode=auto` without `connection`, e.g. `Документ`/`Справочник`/`ОбщийМодуль`.
             Use a plural live-service collection for `mode=infobase` and `mode=auto` with
             `connection`, e.g. `Документы`/`Справочники`. Forms are source-only. Required for
-            `object` and `form`; values are passed through without singular/plural conversion.
+            `object`, `form` and `template`; values are passed through without singular/plural conversion.
+              - predefined_code: `object`: exact predefined account code in the selected chart of accounts (optional).
+              - root_id: Source `form`/`template`/Role or ChartOfAccounts object: empty for base, extension label for its visible scope.
+              - template_name: `template`: template name (optional; omit to list the owner's templates).
 
             ## outline
             The map of ONE `.bsl` file: its `#Область` tree, the procedures, functions and module
@@ -6308,6 +6483,9 @@ mod rescan_hatch_consultations {
             object_type: Some(object_type.to_owned()),
             object_name: Some(object_name.to_owned()),
             form_name: None,
+            root_id: None,
+            template_name: None,
+            predefined_code: None,
             max_output_tokens: None,
             connection: None,
             mode: None,
@@ -6811,6 +6989,9 @@ mod resident_failed_answers {
             object_type: None,
             object_name: None,
             form_name: None,
+            root_id: None,
+            template_name: None,
+            predefined_code: None,
             max_output_tokens: None,
             connection: None,
             mode: None,

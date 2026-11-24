@@ -45,6 +45,8 @@ pub enum AuthorFilterError {
     ShallowRepository,
     /// The repository has no resolvable HEAD commit.
     UnbornHead(String),
+    /// The repository working directory could not be canonicalized.
+    WorkdirCanonicalization(anyhow::Error),
 }
 
 impl std::fmt::Display for AuthorFilterError {
@@ -59,11 +61,19 @@ impl std::fmt::Display for AuthorFilterError {
                  run `git fetch --unshallow` first"
             ),
             Self::UnbornHead(e) => write!(f, "repository HEAD is not a commit: {e}"),
+            Self::WorkdirCanonicalization(e) => write!(f, "{e:#}"),
         }
     }
 }
 
-impl std::error::Error for AuthorFilterError {}
+impl std::error::Error for AuthorFilterError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::WorkdirCanonicalization(e) => Some(e.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 /// Per-line keep/drop verdicts for one file, 1-based like blame line numbers.
 #[derive(Debug)]
@@ -152,8 +162,11 @@ impl AuthorFilter {
         if repo.is_shallow() {
             return Err(AuthorFilterError::ShallowRepository);
         }
+        if repo.workdir().is_none() {
+            return Err(AuthorFilterError::BareRepository);
+        }
         let workdir =
-            repo.workdir().map(Path::to_path_buf).ok_or(AuthorFilterError::BareRepository)?;
+            crate::repo_workdir(&repo).map_err(AuthorFilterError::WorkdirCanonicalization)?;
         let head_oid = repo
             .head()
             .and_then(|h| h.peel_to_commit())
@@ -456,6 +469,27 @@ mod tests {
     }
 
     #[test]
+    fn canonical_file_paths_drop_vendor_lines_and_keep_own_lines() {
+        let t = TestRepo::new();
+        t.write("Vendor.bsl", &vendor_file());
+        t.commit_as(VENDOR.0, VENDOR.1, "vendor");
+        t.write("Own.bsl", "Перем Наша;\n");
+        t.commit_as(DEV.0, DEV.1, "own file");
+
+        let f = filter(&t, &[VENDOR.0]);
+        assert_eq!(f.workdir, t.root().canonicalize().unwrap());
+        for (file, expected_ignored, expected_survives) in
+            [("Vendor.bsl", 3, false), ("Own.bsl", 0, true)]
+        {
+            let canonical = t.root().join(file).canonicalize().unwrap();
+            let contents = std::fs::read(&canonical).unwrap();
+            let keep = f.lines_kept_cached(&canonical, &contents).unwrap();
+            assert_eq!(keep.ignored_line_count(), expected_ignored, "{file}");
+            assert_eq!(keep.range_survives(1, 1), expected_survives, "{file}");
+        }
+    }
+
+    #[test]
     fn uncommitted_workdir_edit_is_always_kept() {
         let t = TestRepo::new();
         t.write("Module.bsl", &vendor_file());
@@ -573,6 +607,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = AuthorFilter::new(dir.path(), vec!["x".into()]).unwrap_err();
         assert!(matches!(err, AuthorFilterError::NoRepository(_)), "{err}");
+    }
+
+    #[test]
+    fn bare_and_unborn_repositories_retain_their_typed_errors() {
+        let bare = tempfile::tempdir().unwrap();
+        let _repo = Repository::init_bare(bare.path()).unwrap();
+        let err = AuthorFilter::new(bare.path(), vec![VENDOR.0.to_string()]).unwrap_err();
+        assert!(matches!(err, AuthorFilterError::BareRepository), "{err}");
+
+        let unborn = TestRepo::new();
+        let err = AuthorFilter::new(unborn.root(), vec![VENDOR.0.to_string()]).unwrap_err();
+        assert!(matches!(err, AuthorFilterError::UnbornHead(_)), "{err}");
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+mod bounded;
 mod journal;
 pub use journal::JournalGuard;
 
@@ -46,11 +47,12 @@ fn non_empty(value: String) -> Option<String> {
 
 /// Set up the process's logging, failing the start when a log file the user named cannot
 /// be set up. `default_log` marks the daemon's own default log instead: it falls back to
-/// stderr. A failure never truncates the file; the reason is appended to it when it can
-/// be opened.
+/// stderr. `bounded_file` caps the file for a long-lived daemon by rotating it. A failure
+/// never truncates the file; the reason is appended to it when it can be opened.
 pub fn start_logging(
     log_file: Option<PathBuf>,
     default_log: bool,
+    bounded_file: bool,
     profile_filter: Option<String>,
     json_profile_filter: Option<String>,
 ) -> anyhow::Result<JournalGuard> {
@@ -58,7 +60,11 @@ pub fn start_logging(
 
     if !default_log {
         if let Some(path) = &log_file {
-            rotate_explicit_log(path);
+            // A bounded writer already rotates while it writes; the start-time rotation is
+            // for the plain explicit log only.
+            if !bounded_file {
+                rotate_explicit_log(path);
+            }
             // The path arrives already expanded, so the configured value is the only
             // place that still says whether the user opted into per-pid names.
             if let Some(pattern) = non_empty_env("BSL_LOG_FILE")
@@ -70,12 +76,17 @@ pub fn start_logging(
         }
     }
 
-    match setup_logging(log_file.clone(), profile_filter.clone(), json_profile_filter.clone()) {
+    match setup_logging(
+        log_file.clone(),
+        bounded_file,
+        profile_filter.clone(),
+        json_profile_filter.clone(),
+    ) {
         Ok(guard) => Ok(guard),
         Err(error) => {
             eprintln!("Failed to setup logging: {error}");
             if default_log {
-                return setup_logging(None, profile_filter, json_profile_filter);
+                return setup_logging(None, false, profile_filter, json_profile_filter);
             }
             if let Some(path) = &log_file {
                 let _ =
@@ -235,6 +246,7 @@ impl io::Write for &RotatingLogFile {
 
 fn setup_logging(
     log_file: Option<PathBuf>,
+    bounded_file: bool,
     profile_filter: Option<String>,
     json_profile_filter: Option<String>,
 ) -> anyhow::Result<JournalGuard> {
@@ -244,6 +256,9 @@ fn setup_logging(
     // concurrent short-lived daemon candidates (the broker's spawn race) do not
     // truncate the winner's live file.
     let writer: BoxMakeWriter = match log_file {
+        Some(file) if bounded_file => {
+            BoxMakeWriter::new(Mutex::new(bounded::BoundedLog::open(&file, true)?))
+        }
         Some(file) => BoxMakeWriter::new(Arc::new(RotatingLogFile::new(file)?)),
         None => BoxMakeWriter::new(io::stderr),
     };
@@ -266,6 +281,34 @@ fn setup_logging(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_active_mcp_session_survives_repeated_log_rotation() {
+        use mcp_server::{McpProfile, McpServer, SharedState};
+        use rmcp::ServiceExt;
+        use std::{io::Write, time::Duration};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("daemon.log");
+        let mut writer = bounded::BoundedLog::open(&path, true).unwrap();
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let server = McpServer::new(McpProfile::Reference, SharedState::reference(None));
+        let task = tokio::spawn(mcp_server::serve_stream(server, server_io));
+        let budget = test_utils::wait::ceiling(Duration::from_secs(20));
+        let client = tokio::time::timeout(budget, ().serve(client_io)).await.unwrap().unwrap();
+        let payload = vec![b'x'; bounded::LOG_BYTES as usize];
+        for _ in 0..6 {
+            writer.write_all(&payload).unwrap();
+            let tools =
+                tokio::time::timeout(budget, client.list_all_tools()).await.unwrap().unwrap();
+            assert!(!tools.is_empty());
+            assert!(path.metadata().unwrap().len() <= bounded::LOG_BYTES);
+            let previous = directory.path().join("daemon.log.prev");
+            assert!(previous.metadata().map(|m| m.len()).unwrap_or(0) <= bounded::LOG_BYTES);
+        }
+        tokio::time::timeout(budget, client.cancel()).await.unwrap().unwrap();
+        task.abort();
+    }
 
     #[test]
     fn a_blank_value_is_read_as_no_value() {
@@ -337,20 +380,20 @@ mod tests {
         let log = PathBuf::from(env::var_os(CHILD_LOG).unwrap());
         match role.split_once(':') {
             Some(("start", marker)) => {
-                let _guard = start_logging(Some(log), false, None, None).unwrap();
+                let _guard = start_logging(Some(log), false, false, None, None).unwrap();
                 tracing::warn!("{marker}");
             }
             Some(("fail", _)) => {
-                assert!(start_logging(Some(log), false, None, None).is_err());
+                assert!(start_logging(Some(log), false, false, None, None).is_err());
             }
             Some(("default", marker)) => {
-                let _guard = start_logging(Some(log), true, None, None)
+                let _guard = start_logging(Some(log), true, false, None, None)
                     .expect("the daemon's default log falls back to stderr");
                 tracing::warn!("{marker}");
             }
             Some(("explicit", _)) => {
                 assert!(
-                    start_logging(Some(log), false, None, None).is_err(),
+                    start_logging(Some(log), false, false, None, None).is_err(),
                     "an explicit log that cannot be opened must fail the start"
                 );
             }
@@ -663,3 +706,6 @@ mod tests {
         assert!(String::from_utf8_lossy(&bytes).contains("appended-despite-failed-rotation"));
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod broker_rotation_tests;

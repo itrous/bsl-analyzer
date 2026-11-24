@@ -417,6 +417,9 @@ class Sampler:
             own = self.cpu_s()
         rec = {"t": t, "busy_s": busy, "own_cpu_s": own, "error": error}
         self._probes.append(rec)
+        if self.sink is not None:
+            self.sink.event("load_probe", at=rec["t"], busy_s=rec["busy_s"], own_cpu_s=rec["own_cpu_s"],
+                            error=rec["error"], cpu_by_pid=dict(self._cpu))
         return rec
 
     def _emit(self, snap: dict, hwm: dict) -> None:

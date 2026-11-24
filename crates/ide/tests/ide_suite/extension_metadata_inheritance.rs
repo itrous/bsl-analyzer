@@ -136,6 +136,8 @@ fn setup(external_sees_extension: bool) -> Fixture {
         (Some("АРМ".to_string()), external.clone()),
     ];
     db.set_workspace_configs_snapshot(WorkspaceConfigsSnapshot {
+        external_owners: Vec::new(),
+        compilation_overrides: Default::default(),
         extension_scopes: vec![None, Some(bsl_metadata::ExtensionScope::InfoBase), None],
         canonical_paths: paths
             .iter()
@@ -293,6 +295,8 @@ fn extension_metadata_external_dependency_selects_only_named_extension_metadata(
         (Some("АРМ".to_string()), external.clone()),
     ];
     db.set_workspace_configs_snapshot(WorkspaceConfigsSnapshot {
+        external_owners: Vec::new(),
+        compilation_overrides: Default::default(),
         extension_scopes: vec![
             None,
             Some(bsl_metadata::ExtensionScope::InfoBase),

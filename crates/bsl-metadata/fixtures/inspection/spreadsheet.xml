@@ -1,0 +1,5 @@
+<document xmlns="http://v8.1c.ru/8.2/data/spreadsheet" xmlns:core="http://v8.1c.ru/8.1/data/core" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <format><fillType>Parameter</fillType></format><format><fillType>Template</fillType></format>
+  <namedItem xsi:type="NamedItemCells"><name>Header</name><area><type>Rows</type><beginRow>0</beginRow><endRow>1</endRow><beginColumn>-1</beginColumn><endColumn>-1</endColumn></area></namedItem>
+  <rowsItem><index>0</index><row><c><i>3</i><c><f>1</f><parameter>Title</parameter></c></c><c><c><f>2</f><tl><core:item><core:lang>en</core:lang><core:content>[Partner]: [Amount] [&amp;NoParameter] [42]</core:content></core:item></tl></c></c></row></rowsItem>
+</document>

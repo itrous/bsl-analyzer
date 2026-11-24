@@ -7,7 +7,7 @@ use hir::{Body, BodySourceMap, Expr, Literal};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::sync::Arc;
-use syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
+use syntax::{SyntaxKind, SyntaxNode, SyntaxToken, TextRange};
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
     diagnostic_type: DiagnosticType::Vulnerability,
@@ -72,7 +72,7 @@ impl Config {
 }
 
 fn is_localhost(ip: &str) -> bool {
-    ip.starts_with("127.") || ip == "::1"
+    ip.starts_with("127.") || ip.split('%').next() == Some("::1")
 }
 
 fn is_url(content: &str) -> bool {
@@ -168,20 +168,41 @@ fn is_version_return(token: &SyntaxToken, config: &Config) -> bool {
     false
 }
 
-fn is_letter_before_match(content: &str, match_start: usize) -> bool {
-    if match_start == 0 {
-        return false;
+fn has_address_boundaries(content: &str, start: usize, end: usize) -> bool {
+    let is_identifier_part = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.');
+    !content[..start].chars().next_back().is_some_and(is_identifier_part)
+        && !content[end..].chars().next().is_some_and(is_identifier_part)
+}
+
+fn network_address_range(content: &str) -> Option<std::ops::Range<usize>> {
+    let mut offset = 0;
+    while let Some(matched) = PATTERN_NETWORK_ADDRESS.find_at(content, offset) {
+        let start = matched.start();
+        let mut end = matched.end();
+        if matched.as_str().contains(':') {
+            // A compressed IPv6 match may stop at `::`; validate the complete token.
+            end += content[end..]
+                .bytes()
+                .take_while(|b| b.is_ascii_hexdigit() || matches!(b, b':' | b'.'))
+                .count();
+            if content.as_bytes().get(end) == Some(&b'%') {
+                end += 1;
+                end += content[end..].bytes().take_while(u8::is_ascii_alphanumeric).count();
+            }
+            offset = end;
+            let candidate = &content[start..end];
+            let address = candidate.split('%').next()?;
+            if candidate.ends_with('%') || address.parse::<std::net::Ipv6Addr>().is_err() {
+                continue;
+            }
+        } else {
+            offset = end;
+        }
+        if has_address_boundaries(content, start, end) {
+            return Some(start..end);
+        }
     }
-    let bytes = content.as_bytes();
-    if match_start > bytes.len() {
-        return false;
-    }
-    let before = &content[..match_start];
-    if let Some(c) = before.chars().last() {
-        let lower = c.to_ascii_lowercase();
-        return ('g'..='z').contains(&lower) || matches!(c, 'А'..='Я' | 'а'..='я' | 'Ё' | 'ё');
-    }
-    false
+    None
 }
 
 fn find_string_token(root: &SyntaxNode, range: LocalRange) -> Option<SyntaxToken> {
@@ -219,9 +240,9 @@ fn check_body_literals(
             continue;
         }
 
-        let Some(matched) = PATTERN_NETWORK_ADDRESS.find(content) else { continue };
+        let Some(matched) = network_address_range(content) else { continue };
 
-        let first_value = matched.as_str();
+        let first_value = &content[matched.clone()];
         let count_dots = count_char(first_value, '.');
         let count_dots_all = count_char(content, '.');
         let find_alphabet = contains_letter(first_value);
@@ -231,10 +252,6 @@ fn check_body_literals(
         }
 
         if is_localhost(first_value) {
-            continue;
-        }
-
-        if first_value.starts_with(':') && is_letter_before_match(content, matched.start()) {
             continue;
         }
 
@@ -253,6 +270,13 @@ fn check_body_literals(
             continue;
         }
 
+        let literal_text = root.text().slice(range.in_root()).to_string();
+        let address_range = syntax::sdbl_query::map_range_query_to_literal(
+            &literal_text,
+            TextRange::new((matched.start as u32).into(), (matched.end as u32).into()),
+        );
+        let range = LocalRange::of_detached_node(address_range + range.in_root().start());
+
         diagnostics.push(Diagnostic {
             code,
             message: "Используется хранение в коде ip-адреса".to_string(),
@@ -267,9 +291,41 @@ fn check_body_literals(
 #[cfg(test)]
 mod tests {
     use super::check_body;
-    use crate::test_utils::{check_body_diagnostic_with_config, check_diagnostics_snapshot_for};
+    use crate::test_utils::{
+        check_body_diagnostic, check_body_diagnostic_with_config, check_diagnostics_snapshot_for,
+    };
     use crate::{DiagnosticCode, DiagnosticsConfig};
     use expect_test::expect;
+
+    #[test]
+    fn test_identifier_boundaries() {
+        let code = include_str!("fixtures/network_address_identifier_boundaries.bsl");
+        assert!(check_body_diagnostic(code, check_body).is_empty());
+    }
+
+    #[test]
+    fn test_punctuation_address_ranges() {
+        let code = include_str!("fixtures/network_address_punctuation.bsl");
+        let diagnostics = check_body_diagnostic(code, check_body);
+        let addresses: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| {
+                &code[usize::from(diagnostic.range.start())..usize::from(diagnostic.range.end())]
+            })
+            .collect();
+        assert_eq!(
+            addresses,
+            [
+                "192.168.1.1",
+                "2001:0db8:85a3:0000:0000:8a2e:0370:7334",
+                "10.1.4.55",
+                "192.168.1.1",
+                "2001:db8::1",
+                "fe80::1%eth0"
+            ]
+        );
+    }
+
     #[test]
     fn test_comprehensive() {
         let code = r#"
@@ -350,34 +406,34 @@ FoundedElement = HTMLDocument.evaluate(".//img[ancestor::div[@aria-hidden=""Fals
             code,
             DiagnosticCode::UsingHardcodeNetworkAddress,
             expect![[r#"
-                UsingHardcodeNetworkAddress @ 3:16..3:32
+                UsingHardcodeNetworkAddress @ 3:17..3:31
                   message: Используется хранение в коде ip-адреса
                   severity: Warning
-                UsingHardcodeNetworkAddress @ 7:24..7:40
+                UsingHardcodeNetworkAddress @ 7:25..7:39
                   message: Используется хранение в коде ip-адреса
                   severity: Warning
-                UsingHardcodeNetworkAddress @ 10:24..10:65
+                UsingHardcodeNetworkAddress @ 10:25..10:64
                   message: Используется хранение в коде ip-адреса
                   severity: Warning
-                UsingHardcodeNetworkAddress @ 11:24..11:65
+                UsingHardcodeNetworkAddress @ 11:25..11:64
                   message: Используется хранение в коде ip-адреса
                   severity: Warning
-                UsingHardcodeNetworkAddress @ 13:45..13:86
+                UsingHardcodeNetworkAddress @ 13:46..13:85
                   message: Используется хранение в коде ip-адреса
                   severity: Warning
-                UsingHardcodeNetworkAddress @ 21:19..21:30
+                UsingHardcodeNetworkAddress @ 21:20..21:29
                   message: Используется хранение в коде ip-адреса
                   severity: Warning
-                UsingHardcodeNetworkAddress @ 24:8..24:120
+                UsingHardcodeNetworkAddress @ 24:42..24:51
                   message: Используется хранение в коде ip-адреса
                   severity: Warning
-                UsingHardcodeNetworkAddress @ 58:105..58:115
+                UsingHardcodeNetworkAddress @ 58:106..58:114
                   message: Используется хранение в коде ip-адреса
                   severity: Warning
-                UsingHardcodeNetworkAddress @ 66:10..66:23
+                UsingHardcodeNetworkAddress @ 66:11..66:22
                   message: Используется хранение в коде ip-адреса
                   severity: Warning
-                UsingHardcodeNetworkAddress @ 72:7..72:16
+                UsingHardcodeNetworkAddress @ 72:8..72:15
                   message: Используется хранение в коде ip-адреса
                   severity: Warning"#]],
         );
@@ -570,7 +626,7 @@ FoundedElement = HTMLDocument.evaluate(".//img[ancestor::div[@aria-hidden=""Fals
             code,
             DiagnosticCode::UsingHardcodeNetworkAddress,
             expect![[r#"
-                UsingHardcodeNetworkAddress @ 3:10..3:23
+                UsingHardcodeNetworkAddress @ 3:11..3:22
                   message: Используется хранение в коде ip-адреса
                   severity: Warning"#]],
         );
@@ -587,7 +643,7 @@ FoundedElement = HTMLDocument.evaluate(".//img[ancestor::div[@aria-hidden=""Fals
             code,
             DiagnosticCode::UsingHardcodeNetworkAddress,
             expect![[r#"
-                UsingHardcodeNetworkAddress @ 3:10..3:51
+                UsingHardcodeNetworkAddress @ 3:11..3:50
                   message: Используется хранение в коде ip-адреса
                   severity: Warning"#]],
         );

@@ -1,0 +1,7 @@
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">
+  <Catalog uuid="00000000-0000-0000-0000-000000000011"><Properties><Name>Partners</Name><ObjectBelonging>Adopted</ObjectBelonging><ExtendedConfigurationObject>00000000-0000-0000-0000-000000000001</ExtendedConfigurationObject></Properties><ChildObjects>
+    <TabularSection uuid="00000000-0000-0000-0000-000000000012"><Properties><Name>Rows</Name><ObjectBelonging>Adopted</ObjectBelonging><ExtendedConfigurationObject>00000000-0000-0000-0000-000000000002</ExtendedConfigurationObject></Properties><ChildObjects>
+      <Attribute uuid="00000000-0000-0000-0000-000000000013"><Properties><Name>Caption</Name><ObjectBelonging>Adopted</ObjectBelonging><ExtendedConfigurationObject>00000000-0000-0000-0000-000000000003</ExtendedConfigurationObject></Properties></Attribute>
+    </ChildObjects></TabularSection>
+  </ChildObjects></Catalog>
+</MetaDataObject>

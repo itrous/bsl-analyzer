@@ -201,6 +201,15 @@ impl<'db> NarrowingTransfer<'db> {
         Self { db, base_types }
     }
 
+    fn forget_property_outputs(body: &Body, expr: ExprIdx, state: &mut NarrowState) {
+        for_each_expr_child(body, expr, &mut |child| {
+            Self::forget_property_outputs(body, child, state);
+        });
+        if let Some((_, output, _)) = crate::structure_keys::property_out_arg(body, expr) {
+            state.narrowed.remove(&fold_name(output));
+        }
+    }
+
     fn apply_guard(&self, state: &mut NarrowState, guard: &Guard, on_true: bool) {
         match guard {
             Guard::TypeCheck { var, type_name } => {
@@ -319,6 +328,9 @@ impl Transfer<NarrowState> for NarrowingTransfer<'_> {
     fn transfer_stmt(&self, stmt_id: RawIdx, state: &NarrowState, body: &Body) -> NarrowState {
         let mut new_state = state.clone();
         let stmt_idx: StmtIdx = Idx::from_raw(stmt_id);
+        for_each_stmt_expr_root(body, stmt_idx, &mut |expr| {
+            Self::forget_property_outputs(body, expr, &mut new_state);
+        });
         if let Stmt::Assign { target, value } = body.stmt_idx(stmt_idx) {
             if let Expr::Path(name) = body.expr_idx(*target) {
                 let new_arms = self.infer_rhs_type(*value, &new_state, body);
@@ -335,6 +347,7 @@ impl Transfer<NarrowState> for NarrowingTransfer<'_> {
 
     fn transfer_expr(&self, expr_id: ExprId, state: &NarrowState, body: &Body) -> NarrowState {
         let mut new_state = state.clone();
+        Self::forget_property_outputs(body, expr_id.to_idx(), &mut new_state);
         new_state.pending_guard = recognize_guard(expr_id.to_idx(), body);
         new_state
     }
@@ -563,6 +576,17 @@ pub fn narrowed_type_at<DB: TypeKernelDb + ?Sized>(
     expr_idx: ExprIdx,
     name: &Name,
 ) -> Option<TypeId> {
+    // A CFG vertex spans the whole condition: its input still holds the value from
+    // before an output write on the left of a short-circuit expression.
+    if body.exprs_iter().any(|(_, expr)| {
+        let Expr::BinaryOp { lhs, rhs, op: BinaryOp::And | BinaryOp::Or } = expr else {
+            return false;
+        };
+        expr_covers_expr(body, *rhs, expr_idx)
+            && expression_writes_property_output(body, *lhs, name)
+    }) {
+        return None;
+    }
     let cfg = result.cfg();
 
     let node = containing_vertex(body, cfg, expr_idx)?;
@@ -571,6 +595,19 @@ pub fn narrowed_type_at<DB: TypeKernelDb + ?Sized>(
         return None;
     }
     Some(db.union(arms.to_vec()))
+}
+
+fn expression_writes_property_output(body: &Body, expr: ExprIdx, name: &Name) -> bool {
+    if crate::structure_keys::property_out_arg(body, expr)
+        .is_some_and(|(_, output, _)| output.eq_ignore_case(name))
+    {
+        return true;
+    }
+    let mut writes = false;
+    for_each_expr_child(body, expr, &mut |child| {
+        writes |= expression_writes_property_output(body, child, name);
+    });
+    writes
 }
 
 /// Applies a guard from an enclosing `?(Усл, А, Б)` to an expression sitting in one of its arms.

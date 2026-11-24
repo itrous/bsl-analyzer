@@ -1,0 +1,18 @@
+{
+  "reference": "own synthetic ExternalDataProcessor BSLProbe_valid, built by ibcmd and accepted by native feasibility Create; no runtime acceptance of the Rust writer",
+  "platform": "8.3.27.2130",
+  "compatibility": "НеИспользовать",
+  "epf_sha256": "6c46be914150f45334b124f13fd4a12b35b03f5bd1fa2f9c9665308d00d5743c",
+  "source_sha256": "f34646d1eb3b782fb19ee9839ce0ccb9ab7f8cd516482deb5300222087450c4e",
+  "native_receipt_sha256": "43918432fc4d937f95b71129955a2afbc4294702e8403d9659fdebe4f0147bfd",
+  "native_reference_case": "valid",
+  "native_control_cases": [
+    "valid",
+    "main_body",
+    "invalid",
+    "owner_context",
+    "client_branch",
+    "event_names"
+  ],
+  "rust_native_acceptance": "pending"
+}

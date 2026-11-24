@@ -1,0 +1,8 @@
+{
+  "fixture": "crates/bsl-metadata/fixtures/rename/native-default-roles-configuration.xml",
+  "source": ".artifacts/resolve-outstanding-implementation-20261107/final-acceptance/duplicate-interception-native-preparation-20261111/run/absent-applied-continuation/baseline-export/Configuration.xml",
+  "sha256": "7d2d4931159a8bd001608323a7880db5393f67230682cfa6923985a382846312",
+  "transformation": "none, byteexact native full descriptor including BOM/CRLF/UUID/opaque IDs",
+  "qualification": "historical BA095 native baseline export; not new native execution",
+  "empty_shape_example": "carrier-corpus/base/Configuration.xml native DefaultRoles empty"
+}

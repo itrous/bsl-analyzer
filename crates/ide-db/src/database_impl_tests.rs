@@ -1365,6 +1365,8 @@ fn a_chain_resolves_the_owning_extension_first_and_lists_each_name_once() {
     // Slot 0 is the dependency, slot 1 the borrower whose closure names it. No base
     // slot: this is the extension-only shape, where the chain is all there is.
     db.set_workspace_configs_snapshot(WorkspaceConfigsSnapshot {
+        external_owners: Vec::new(),
+        compilation_overrides: Default::default(),
         extension_scopes: vec![
             Some(bsl_metadata::ExtensionScope::InfoBase),
             Some(bsl_metadata::ExtensionScope::InfoBase),
@@ -1439,9 +1441,9 @@ fn per_file_lookups_serve_an_extension_only_project_from_its_chain() {
     // both roots declare the same metadata.
     let resolve_with = |label: Option<String>| -> Option<String> {
         let root = std::env::temp_dir().join(format!(
-            "bsl_extension_only_lookup_{}_{:?}",
+            "bsl_extension_only_lookup_{}_{}",
             std::process::id(),
-            label
+            label.as_deref().unwrap_or("base")
         ));
         let role_path = root.join("Roles/РольРасширения.xml");
         std::fs::create_dir_all(role_path.parent().unwrap()).unwrap();
@@ -6606,6 +6608,23 @@ fn resolve_metadata_object_across_roots_merges_base_and_extension() {
         db.resolve_metadata_object_across_roots(MdoType::Catalog, "НетТакого").is_none(),
         "an absent object resolves to None",
     );
+    let base = db
+        .resolve_metadata_object_for_inspection_root("", MdoType::Catalog, "Общий")
+        .unwrap()
+        .unwrap();
+    let extension = db
+        .resolve_metadata_object_for_inspection_root("Расш", MdoType::Catalog, "Общий")
+        .unwrap()
+        .unwrap();
+    assert_ne!(base.uuid, extension.uuid);
+    assert_eq!(extension.uuid, merged.uuid);
+    assert!(db
+        .resolve_metadata_object_for_inspection_root("", MdoType::Catalog, "ТолькоРасш")
+        .unwrap()
+        .is_none());
+    assert!(db
+        .resolve_metadata_object_for_inspection_root("Несуществующий", MdoType::Catalog, "Общий")
+        .is_err());
 }
 
 #[test]
@@ -6656,6 +6675,8 @@ fn effective_metadata_members_keep_topological_winner_and_source() {
         (Some("Нечитаемое".to_string()), roots[4].into()),
     ];
     db.set_workspace_configs_snapshot(WorkspaceConfigsSnapshot {
+        external_owners: Vec::new(),
+        compilation_overrides: Default::default(),
         extension_scopes: paths
             .iter()
             .map(|(label, _)| label.as_ref().map(|_| bsl_metadata::ExtensionScope::InfoBase))
@@ -6814,6 +6835,8 @@ fn effective_module_exports_cover_composition_matrix_for_all_module_roles() {
     ];
     let mut db = RootDatabaseImpl::new();
     db.set_workspace_configs_snapshot(WorkspaceConfigsSnapshot {
+        external_owners: Vec::new(),
+        compilation_overrides: Default::default(),
         extension_scopes: paths
             .iter()
             .map(|(label, _)| label.as_ref().map(|_| bsl_metadata::ExtensionScope::InfoBase))
@@ -6953,6 +6976,8 @@ fn ba010_effective_module_variables_resolve_for_object_and_manager_facets() {
     ];
     let mut db = RootDatabaseImpl::new();
     db.set_workspace_configs_snapshot(WorkspaceConfigsSnapshot {
+        external_owners: Vec::new(),
+        compilation_overrides: Default::default(),
         extension_scopes: paths
             .iter()
             .map(|(label, _)| label.as_ref().map(|_| bsl_metadata::ExtensionScope::InfoBase))
@@ -7075,6 +7100,8 @@ fn ba021_module_exports_follow_the_callers_extension_visibility_chain() {
     ];
     let mut db = RootDatabaseImpl::new();
     db.set_workspace_configs_snapshot(WorkspaceConfigsSnapshot {
+        external_owners: Vec::new(),
+        compilation_overrides: Default::default(),
         extension_scopes: paths
             .iter()
             .map(|(label, _)| label.as_ref().map(|_| bsl_metadata::ExtensionScope::InfoBase))
@@ -7183,6 +7210,60 @@ fn resolve_register_across_roots_finds_extension_register() {
     assert!(
         db.resolve_register_across_roots(MdoType::InformationRegister, "НетТакого").is_none(),
         "an absent register resolves to None",
+    );
+}
+
+#[test]
+fn resolve_register_card_uses_effective_document_movements() {
+    use crate::metadata::MdoEntry;
+    use bsl_metadata::{AttributeType, MdoType};
+
+    let mut db = RootDatabaseImpl::new();
+    db.set_all_config_paths(
+        vec![(None, "/base".into()), (Some("Extension".into()), "/ext".into())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
+    let mut files = FileSet::new();
+    let mut base = MetadataListingData::default();
+    let mut extension = MetadataListingData::default();
+    let rows = [
+        ("/base", MdoType::InformationRegister, "Prices", 1,
+         "<WriteMode>RecorderSubordinate</WriteMode><InformationRegisterPeriodicity>Day</InformationRegisterPeriodicity>"),
+        ("/base", MdoType::Document, "BaseWriter", 2,
+         "<RegisterRecords><Item>InformationRegister.Prices</Item></RegisterRecords>"),
+        ("/ext", MdoType::Document, "BaseWriter", 3,
+         "<ObjectBelonging>Adopted</ObjectBelonging><ExtendedConfigurationObject>00000000-0000-0000-0000-000000000002</ExtendedConfigurationObject><RegisterRecords><Item>InformationRegister.Other</Item></RegisterRecords>"),
+        ("/ext", MdoType::Document, "ExtensionWriter", 4,
+         "<RegisterRecords><Item>InformationRegister.prices</Item></RegisterRecords>"),
+        ("/base", MdoType::Document, "ShadowedWriter", 5,
+         "<RegisterRecords><Item>InformationRegister.Prices</Item></RegisterRecords>"),
+        ("/ext", MdoType::Document, "ShadowedWriter", 6, ""),
+    ];
+    for (root, kind, name, id, properties) in rows {
+        let file = FileId(id);
+        let element = kind.english_name();
+        files.insert(file, VfsPath::new(format!("{root}/{element}s/{name}.xml")));
+        db.set_file_source_root(file, SourceRootId(0));
+        db.set_file_text(file, &format!(
+            r#"<MetaDataObject><{element} uuid="00000000-0000-0000-0000-{id:012}"><Properties><Name>{name}</Name>{properties}</Properties></{element}></MetaDataObject>"#
+        ));
+        let listing = if root == "/base" { &mut base } else { &mut extension };
+        listing.entries.push(MdoEntry { kind, name: name.into(), main: file, predefined: None });
+    }
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(files));
+    db.set_metadata_listing("/base", base);
+    db.set_metadata_listing("/ext", extension);
+
+    let register =
+        db.resolve_register_across_roots(MdoType::InformationRegister, "Prices").unwrap();
+    let recorder = register.attributes().iter().find(|attr| attr.name() == "Регистратор").unwrap();
+    assert_eq!(
+        recorder.attr_type(),
+        Some(&AttributeType::Composite {
+            types: ["BaseWriter", "ExtensionWriter"]
+                .map(|name| AttributeType::Ref { mdo_type: MdoType::Document, name: name.into() })
+                .to_vec(),
+        }),
     );
 }
 
@@ -7804,6 +7885,8 @@ fn extension_metadata_dependency_chain_composes_only_visible_overlays() {
         (Some("Зависимое".to_string()), dependent.clone()),
     ];
     db.set_workspace_configs_snapshot(crate::metadata::WorkspaceConfigsSnapshot {
+        external_owners: Vec::new(),
+        compilation_overrides: Default::default(),
         extension_scopes: vec![
             None,
             Some(bsl_metadata::ExtensionScope::InfoBase),
@@ -7891,6 +7974,8 @@ fn extension_metadata_dependency_chain_composes_in_substrate() {
         (Some("Зависимое".to_string()), dependent.clone()),
     ];
     db.set_workspace_configs_snapshot(crate::metadata::WorkspaceConfigsSnapshot {
+        external_owners: Vec::new(),
+        compilation_overrides: Default::default(),
         extension_scopes: vec![
             None,
             Some(bsl_metadata::ExtensionScope::InfoBase),
@@ -8509,6 +8594,8 @@ fn an_external_root_binds_its_files_through_the_snapshot_not_the_disk() {
         (Some("EPF".to_owned()), epf.clone()),
     ];
     db.set_workspace_configs_snapshot(crate::metadata::WorkspaceConfigsSnapshot {
+        external_owners: Vec::new(),
+        compilation_overrides: Default::default(),
         extension_scopes: vec![None, Some(bsl_metadata::ExtensionScope::InfoBase), None],
         canonical_paths: paths.iter().map(|(_, path)| path.clone()).collect(),
         kinds: vec![
@@ -8528,7 +8615,7 @@ fn an_external_root_binds_its_files_through_the_snapshot_not_the_disk() {
         .expect("the file binds to a registered root");
     assert_eq!(
         bound.path(&db).as_str(),
-        epf.to_string_lossy().as_ref(),
+        crate::metadata::canonicalize_configuration_path(&epf.to_string_lossy()),
         "and that root is the external's"
     );
 
@@ -8576,6 +8663,8 @@ fn an_external_root_matches_its_canonical_spelling_and_keys_by_the_configured_on
     let mut db = RootDatabaseImpl::new();
     let paths = vec![(Some("EPF".to_owned()), epf_link.clone())];
     db.set_workspace_configs_snapshot(crate::metadata::WorkspaceConfigsSnapshot {
+        external_owners: Vec::new(),
+        compilation_overrides: Default::default(),
         extension_scopes: vec![None],
         canonical_paths: vec![epf_real.clone()],
         kinds: vec![RootKind::External(bsl_metadata::ExternalObjectKind::DataProcessor)],
@@ -8599,6 +8688,8 @@ fn an_external_root_matches_its_canonical_spelling_and_keys_by_the_configured_on
     std::fs::create_dir_all(cf_real.join("CommonModules/Foo/Ext")).unwrap();
     std::os::unix::fs::symlink(&cf_real, &cf_link).unwrap();
     db.set_workspace_configs_snapshot(crate::metadata::WorkspaceConfigsSnapshot {
+        external_owners: Vec::new(),
+        compilation_overrides: Default::default(),
         extension_scopes: vec![None],
         paths: vec![(None, cf_link.clone())],
         kinds: vec![RootKind::Base],
@@ -8694,6 +8785,8 @@ fn borrowed_form_db_with_registered_modules(
         .map(|(label, path, _)| (label.map(str::to_string), path.to_path_buf()))
         .collect();
     db.set_workspace_configs_snapshot(crate::metadata::WorkspaceConfigsSnapshot {
+        external_owners: Vec::new(),
+        compilation_overrides: Default::default(),
         extension_scopes: roots
             .iter()
             .map(|(_, _, kind)| {
@@ -9094,20 +9187,18 @@ fn borrowed_form_skips_an_ordinary_base_without_dialog() {
     let (_temp, base, extension) = borrowed_form_fixture_copy();
     let ext_module = borrowed_form_module(&extension, "Заказ", "ОбычнаяФорма");
     let base_module = borrowed_form_module(&base, "Заказ", "ОбычнаяФорма");
-    std::fs::copy(
-        base.join("Documents/Заказ/Forms/ОбычнаяФорма/Ext/Form.xml"),
-        extension.join("Documents/Заказ/Forms/ОбычнаяФорма/Ext/Form.xml"),
-    )
-    .unwrap();
-    let ext_dialog = extension.join("Documents/Заказ/Forms/ОбычнаяФорма/Ext/Form.xml");
-    let dialog = std::fs::read_to_string(&ext_dialog).unwrap();
-    std::fs::write(
-        &ext_dialog,
-        dialog
-            .replace("БазовыйРеквизитФормы", "РасшРеквизитФормы")
-            .replace("<MainAttribute>true</MainAttribute>", ""),
-    )
-    .unwrap();
+    for (module, dialog) in [
+        (
+            &base_module,
+            r#"{"schema":2,"form":{"handlers":{}},"attributes":[{"name":"Объект"},{"name":"БазовыйРеквизитФормы"}]}"#,
+        ),
+        (
+            &ext_module,
+            r#"{"schema":2,"form":{"handlers":{}},"attributes":[{"name":"Объект"},{"name":"РасшРеквизитФормы"}]}"#,
+        ),
+    ] {
+        std::fs::write(module.with_file_name("Form.json"), dialog).unwrap();
+    }
     let roots = [
         (None, base.as_path(), RootKind::Base),
         (Some("Расширение"), extension.as_path(), RootKind::Extension),
@@ -9120,13 +9211,41 @@ fn borrowed_form_skips_an_ordinary_base_without_dialog() {
         "readable dialogs on both sides merge"
     );
 
-    std::fs::remove_file(base.join("Documents/Заказ/Forms/ОбычнаяФорма/Ext/Form.xml")).unwrap();
+    std::fs::remove_file(base_module.with_file_name("Form.json")).unwrap();
     let db = borrowed_form_db(&roots, &[ext_module.clone(), base_module]);
     let base_form = borrowed_form(&db, FileId(1)).unwrap();
     assert!(base_form.is_ordinary() && base_form.is_handler("ПередОткрытием"));
     let merged = borrowed_form(&db, FileId(0)).unwrap();
     assert_eq!(*merged, borrowed_form_local(&ext_module));
     assert!(!merged.is_handler("ПередОткрытием"), "base default handlers do not leak");
+}
+
+#[test]
+fn borrowed_form_keeps_its_dialog_when_base_has_another_type() {
+    let (_temp, base, extension) = borrowed_form_fixture_copy();
+    let ext_module = borrowed_form_module(&extension, "Заказ", "ФормаДокумента");
+    let base_module = borrowed_form_module(&base, "Заказ", "ФормаДокумента");
+    let descriptor = base.join("Documents/Заказ/Forms/ФормаДокумента.xml");
+    let source = std::fs::read_to_string(&descriptor).unwrap();
+    assert!(source.contains("<FormType>Managed</FormType>"));
+    std::fs::write(
+        &descriptor,
+        source.replace("<FormType>Managed</FormType>", "<FormType>Ordinary</FormType>"),
+    )
+    .unwrap();
+    std::fs::write(
+        base_module.with_file_name("Form.json"),
+        r#"{"schema":2,"attributes":[{"name":"ТолькоОбычнаяФорма"}]}"#,
+    )
+    .unwrap();
+    let db = borrowed_form_db(
+        &[(None, &base, RootKind::Base), (Some("Расширение"), &extension, RootKind::Extension)],
+        &[ext_module.clone(), base_module],
+    );
+    let base_form = borrowed_form(&db, FileId(1)).unwrap();
+    assert!(base_form.is_ordinary() && base_form.ordinary_dialog_known());
+    assert!(base_form.find_attribute("ТолькоОбычнаяФорма").is_some());
+    assert_eq!(*borrowed_form(&db, FileId(0)).unwrap(), borrowed_form_local(&ext_module));
 }
 
 #[test]

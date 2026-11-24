@@ -7,6 +7,51 @@ use vfs::{file_set::FileSet, VfsPath};
 use super::*;
 use crate::mem_docs::MemDocs;
 
+fn disk_read() -> ide_host_core::WorkspaceDiskRead {
+    ide_host_core::WorkspaceDiskGate::default().try_read().unwrap()
+}
+
+#[test]
+fn workspace_disk_background_frozen_derivatives_retain_ticket_and_register_tokens() {
+    use salsa::Database as _;
+    use std::time::{Duration, Instant};
+    let gate = ide_host_core::WorkspaceDiskGate::default();
+    let mut db = RootDatabaseImpl::default();
+    let root = SourceRootId(0);
+    db.set_source_root(root, SourceRoot::new_local(FileSet::new()));
+    let frozen = CallHierarchyIndexFrozenSnapshot::capture(
+        &db,
+        root,
+        &MemDocs::default().freeze(),
+        1,
+        gate.try_read().unwrap(),
+    );
+    let materialized = frozen.materialize();
+    let refreshed = materialized.refresh(&MemDocs::default().freeze());
+    let batch = refreshed.open_batch(&[]);
+    let token = batch.cancellation_token();
+    let writing = gate.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        tx.send(writing.begin_write(Duration::from_secs(5), &|| false)).unwrap()
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !token.is_cancelled() {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert!(!refreshed.disk_read.is_current());
+    assert!(rx.try_recv().is_err());
+    drop(batch);
+    drop(frozen);
+    drop(materialized);
+    assert!(rx.try_recv().is_err());
+    drop(refreshed);
+    rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap().finish();
+    worker.join().unwrap();
+    assert!(gate.try_read().is_ok());
+}
+
 #[test]
 fn call_hierarchy_index_overlay_prefers_frozen_open_buffer_text() {
     // Given: a disk module with an unsaved editor buffer.
@@ -24,9 +69,14 @@ fn call_hierarchy_index_overlay_prefers_frozen_open_buffer_text() {
     let uri = Url::from_file_path(&path).expect("file URL");
     let mut mem_docs = MemDocs::default();
     mem_docs.insert(uri, "Процедура Буфер() КонецПроцедуры".to_owned(), 1);
-    let snapshot =
-        CallHierarchyIndexFrozenSnapshot::capture(&db, source_root_id, &mem_docs.freeze(), 7)
-            .materialize();
+    let snapshot = CallHierarchyIndexFrozenSnapshot::capture(
+        &db,
+        source_root_id,
+        &mem_docs.freeze(),
+        7,
+        disk_read(),
+    )
+    .materialize();
 
     // When: disk bytes change after the snapshot and a batch database is opened.
     std::fs::write(&path, "Процедура ПозжеНаДиске() КонецПроцедуры").expect("rewrite disk");
@@ -55,8 +105,13 @@ fn call_hierarchy_index_overlay_uses_captured_disk_revision_after_buffer_closes(
     let uri = Url::from_file_path(path).expect("file URL");
     let mut mem_docs = MemDocs::default();
     mem_docs.insert(uri, "Процедура ВБуфере() КонецПроцедуры".to_owned(), 1);
-    let snapshot =
-        CallHierarchyIndexFrozenSnapshot::capture(&db, source_root_id, &mem_docs.freeze(), 7);
+    let snapshot = CallHierarchyIndexFrozenSnapshot::capture(
+        &db,
+        source_root_id,
+        &mem_docs.freeze(),
+        7,
+        disk_read(),
+    );
 
     // When: the buffer closes before catch-up refreshes the snapshot.
     let refreshed = snapshot.refresh(&MemDocs::default().freeze());
@@ -86,6 +141,7 @@ fn call_hierarchy_index_overlay_materializes_captured_disk_revision() {
         source_root_id,
         &MemDocs::default().freeze(),
         7,
+        disk_read(),
     );
     std::fs::remove_file(path).expect("remove module after capture");
 
@@ -128,6 +184,7 @@ fn call_hierarchy_index_non_bsl_filter() {
         source_root_id,
         &MemDocs::default().freeze(),
         7,
+        disk_read(),
     )
     .materialize();
     let modules = snapshot.modules();
@@ -180,6 +237,8 @@ fn call_hierarchy_index_overlay_keeps_root_kinds_and_closures() {
     db.set_file_revision_from_disk(file_id, content_revision("Процедура П() КонецПроцедуры"));
     let paths = vec![(None, cf), (Some("EXT".to_owned()), ext), (Some("EPF".to_owned()), epf)];
     db.set_workspace_configs_snapshot(ide::WorkspaceConfigsSnapshot {
+        external_owners: Vec::new(),
+        compilation_overrides: Default::default(),
         extension_scopes: vec![None, Some(bsl_metadata::ExtensionScope::InfoBase), None],
         canonical_paths: paths.iter().map(|(_, path)| path.clone()).collect(),
         kinds: vec![
@@ -200,6 +259,7 @@ fn call_hierarchy_index_overlay_keeps_root_kinds_and_closures() {
         source_root_id,
         &MemDocs::default().freeze(),
         7,
+        disk_read(),
     );
     let batch = snapshot.open_batch(&[ModuleId::new(file_id)]);
 

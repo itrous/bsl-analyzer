@@ -79,6 +79,19 @@ mod tests {
     use expect_test::expect;
 
     #[test]
+    fn test_unary_minus_changes_the_value() {
+        let code = include_str!("fixtures/self_assign_unary.bsl");
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::SelfAssign,
+            expect![[r#"
+                SelfAssign @ 4:5..4:46
+                  message: Присваивание переменной самой себе
+                  severity: Major"#]],
+        );
+    }
+
+    #[test]
     fn test_fix_deletes_line_only_when_alone() {
         // Only the assignment that owns its line is deleted; the trailing comment and the
         // leading statement on the other two lines would be lost, so they get no fix.

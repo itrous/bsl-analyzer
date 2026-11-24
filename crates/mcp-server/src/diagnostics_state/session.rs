@@ -298,14 +298,27 @@ where
     F: FnOnce(&ResidentSession) -> T + Send + 'static,
     T: Send + 'static,
 {
-    let cancel = Arc::new(RequestCancel::default());
+    let Ok(disk_read) = diag.disk_gate.try_read() else {
+        return if diag.disk_gate.recovery_required() {
+            CallOutcome::Frozen(super::DISK_RECOVERY_REQUIRED.to_owned())
+        } else {
+            CallOutcome::Superseded
+        };
+    };
+    let cancel = Arc::new(RequestCancel::with_disk_read(disk_read));
     let session = ResidentSession { diag, cancel: Arc::clone(&cancel) };
 
     let join = tokio::task::spawn_blocking(move || {
         match salsa::Cancelled::catch(AssertUnwindSafe(|| body(&session))) {
+            Ok(_) if session.cancel.disk_superseded() => CallOutcome::Superseded,
             Ok(value) => CallOutcome::Ready(value),
             // This request's own token. Everything else that arrives as an unwind is
             // somebody else's event and must not be dressed up as the client's cancel.
+            Err(salsa::Cancelled::Local)
+                if !session.cancel.is_cancelled() && session.cancel.disk_superseded() =>
+            {
+                CallOutcome::Superseded
+            }
             Err(salsa::Cancelled::Local) => CallOutcome::Cancelled,
             // The retry comes from the client, and its poll must apply the disk even when
             // the watcher has not delivered the change yet. A frozen owner applies nothing,
@@ -361,6 +374,32 @@ mod tests {
     };
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn disk_transaction_supersedes_a_request_without_claiming_client_cancellation() {
+        let state = DiagnosticsState::disabled();
+        let gate = state.disk_gate.clone();
+        let waiting = gate.clone();
+        let observed = gate.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            waiting.begin_write(Duration::from_secs(5), &|| false).unwrap()
+        });
+        let result = resident_call(state, tokio_util::sync::CancellationToken::new(), move |_| {
+            tx.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !observed.is_frozen() {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            42
+        })
+        .await;
+        assert!(matches!(result, CallOutcome::Superseded));
+        writer.join().unwrap().finish();
+        assert!(gate.try_read().is_ok());
+    }
 
     /// Two answers a fabricated read can give the retry policy. Any two distinct values
     /// would do: the policy judges by the predicate it is handed, not by the type.
@@ -1107,6 +1146,7 @@ mod tests {
     fn a_state_the_storm_guard_is_protecting(root: &std::path::Path) -> DiagnosticsState {
         let state = DiagnosticsState::for_workspace(root.to_path_buf());
         *lock_recover(&state.scan) = Some(crate::diagnostics_state::drift::ScanCache {
+            dependency_fingerprint: None,
             at: Instant::now() + Duration::from_secs(3600),
             stats: Vec::new(),
             config_fp: 0,

@@ -444,14 +444,14 @@ class Incomparable(Judged):
     def test_any_field_of_the_profile_that_differs_names_itself(self):
         self.assertEqual(set(self.baseline_doc()["profile"]), PROFILE_KEYS)
         self.assertEqual(set(self.fingerprint()), PROFILE_KEYS)
-        for key in sorted(PROFILE_KEYS):
+        for key in sorted(PROFILE_KEYS - {"kernel"}):
             with self.subTest(field=key):
                 self.write_baseline()
                 self.edit_baseline(lambda doc: doc["profile"].update({key: changed(doc["profile"][key])}))
                 self.assert_not_compared(self.section(), f"record_profile_mismatch:{key}")
         self.write_baseline()
         self.edit_baseline(lambda doc: doc["profile"].update(nproc=64, kernel="other"))
-        self.assert_not_compared(self.section(), "record_profile_mismatch:kernel,nproc")
+        self.assert_not_compared(self.section(), "record_profile_mismatch:nproc")
 
     def test_any_field_of_the_protocol_that_differs_names_itself(self):
         self.assertEqual(set(self.baseline_doc()["protocol"]), PROTOCOL_KEYS)
@@ -484,20 +484,26 @@ class Incomparable(Judged):
                             for r in summary["record"]["rows"]))
         self.assertEqual(self.decided(summary), {"ok"}, "the old rule is judged all the same")
 
-    def test_a_kernel_changed_on_the_machine_compares_nothing_and_cannot_be_cured_by_raising_the_record(self):
+    def test_a_kernel_change_does_not_prevent_record_comparison_or_hide_a_regression(self):
         before = self.baseline_bytes()
         self.machine.print["kernel"] = "7.0"
-        self.script.values["elapsed"] = timed("graph_resolve", lambda run: 40.0 if run.role == "c" else 20.0)   # a loss the old rule blocks
+        self.script.values["elapsed"] = timed("graph_resolve", lambda run: 40.0 if run.role == "c" else 20.0)
         code, summary, _ = self.gate()
         self.assertEqual(summary["noise"]["status"], "current", "the kernel is not what stales the calibration")
         self.assertEqual(summary["record"]["profile"]["kernel"], "7.0")
         self.assertEqual(summary["record"]["baseline_profile"]["kernel"], "6.1")
-        self.assertTrue(all(r["delta"] is None and r["reason"] == "record_profile_mismatch:kernel"
-                            for r in summary["record"]["rows"]))
+        self.assertTrue(all(r["delta"] is not None for r in summary["record"]["rows"]))
         self.assertEqual(self.row(summary, "graph_resolve_s")["outcome"], "block")
-        self.assertEqual((code, summary["verdict"], summary["record"]["verdict"]), (1, "block", "incomplete"))
-        self.assertIn("record_profile_mismatch:kernel", summary["reasons"])
+        self.assertEqual((code, summary["verdict"], summary["record"]["verdict"]), (1, "block", "pass"))
+        self.assertFalse(any(reason.startswith("record_profile_mismatch:") for reason in summary["reasons"]))
         self.assertEqual(self.baseline_bytes(), before)
+
+    def test_a_memory_profile_mismatch_still_prevents_record_comparison(self):
+        self.machine.print["mem_total"] = "63 GiB"
+        code, summary, _ = self.gate()
+        self.assertEqual((code, summary["record"]["verdict"]), (2, "incomplete"))
+        self.assertIn("record_profile_mismatch:mem_total", summary["reasons"])
+        self.assertTrue(all(r["delta"] is None for r in summary["record"]["rows"]))
 
     def test_a_block_of_another_part_stays_beside_a_missing_tolerance(self):
         self.set_record("graph_resolve_s", noise=None)

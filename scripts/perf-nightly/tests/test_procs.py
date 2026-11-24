@@ -1,5 +1,6 @@
 """Process accounting (plan §6.4): marker, foreign check, RSS sum, stop."""
 
+import json
 import os
 import shutil
 import subprocess
@@ -192,14 +193,44 @@ class RealProcesses(unittest.TestCase):
 class LoadSnapshots(unittest.TestCase):
     """Consistent CPU snapshots (И6): own CPU, a reaped burner, a raced probe, a read error."""
 
+    def test_a_load_probe_trace_keeps_operands_and_accumulated_cpu(self):
+        trace_path = os.path.join(self.root, "resources.jsonl")
+        trace = procs.ResourceTrace(trace_path, {"run_id": "run-h"}, FakeClock())
+        fake_run_proc(self.root, 300, "run-h", 1000, cpu_ticks=(200, 100))
+        sampler = self.sampler(lambda: 11.0, trace)
+        _, own = sampler.ready_snapshot([], 4.0)
+        self.assertEqual(own, 7.0)
+        shutil.rmtree(os.path.join(self.root, "300"))
+        sampler.probe()
+        trace.finish()
+        with open(trace_path, encoding="utf-8") as fh:
+            probes = [line for line in map(json.loads, fh) if line.get("name") == "load_probe"]
+        self.assertEqual([(p["busy_s"], p["own_cpu_s"], p["error"]) for p in probes],
+                         [(11.0, 7.0, None), (11.0, 3.0, None)])
+        self.assertEqual(probes[0]["cpu_by_pid"], {"300": 3.0})
+        self.assertEqual(probes[1]["cpu_by_pid"], {"300": 3.0})
+
+    def test_a_load_probe_trace_keeps_a_busy_read_error(self):
+        trace_path = os.path.join(self.root, "resources.jsonl")
+        trace = procs.ResourceTrace(trace_path, {"run_id": "run-h"}, FakeClock())
+        sampler = self.sampler(lambda: (_ for _ in ()).throw(OSError("stat unreadable")), trace)
+        with self.assertRaises(OSError):
+            sampler.probe()
+        trace.finish()
+        with open(trace_path, encoding="utf-8") as fh:
+            probes = [line for line in map(json.loads, fh) if line.get("name") == "load_probe"]
+        self.assertEqual(probes[0]["busy_s"], None)
+        self.assertEqual(probes[0]["error"], "stat unreadable")
+        self.assertEqual(probes[0]["cpu_by_pid"], {})
+
     def setUp(self):
         event_driven_process_waits(self)
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.root = self._tmp.name
 
-    def sampler(self, busy):
-        sampler = procs.Sampler("run-h", proc_root=self.root)
+    def sampler(self, busy, sink=None):
+        sampler = procs.Sampler("run-h", proc_root=self.root, sink=sink)
         sampler.bind_load(FakeClock(), busy)
         self.addCleanup(sampler.stop)
         return sampler

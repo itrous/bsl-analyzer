@@ -31,7 +31,17 @@ pub fn lower_param_type_string_typeid(db: &dyn TypeKernelDb, raw: &str) -> TypeI
         return db.any();
     }
     if segments.len() == 1 {
-        return bare_name_to_typeid(db, segments[0]);
+        let builtin = bare_name_to_typeid(db, segments[0]);
+        return if builtin != db.unknown() {
+            builtin
+        } else if crate::platform_type_name::is_tabular_row_name(segments[0]) {
+            // A metadata row placeholder does not name one concrete nominal type.
+            db.unknown()
+        } else if let Some(platform) = PlatformData::instance().get_type(segments[0]) {
+            db.platform_object(platform.name.to_string())
+        } else {
+            db.unknown()
+        };
     }
     if segments.iter().all(|s| segment_is_valid_type(s)) {
         db.union(segments.iter().map(|s| lower_platform_type_name_typeid(db, s)).collect())
@@ -284,6 +294,18 @@ mod tests {
     fn lower_param_single_unknown_stays_unknown_for_gradual_typing() {
         let db = InMemoryDb::new();
         assert_eq!(lower_param_type_string_typeid(&db, "Строка табличной части"), db.unknown());
+        assert_eq!(lower_param_type_string_typeid(&db, "НеизвестныйТип"), db.unknown());
+    }
+
+    #[test]
+    fn lower_param_preserves_registered_nominal_type() {
+        let db = InMemoryDb::new();
+        let expected = db.platform_object("РежимТранзакцииЗаписиЖурналаРегистрации".to_owned());
+        assert_eq!(
+            lower_param_type_string_typeid(&db, "РежимТранзакцииЗаписиЖурналаРегистрации"),
+            expected
+        );
+        assert_eq!(lower_param_type_string_typeid(&db, "EventLogEntryTransactionMode"), expected);
     }
 
     #[test]

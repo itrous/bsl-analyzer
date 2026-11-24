@@ -1,0 +1,20 @@
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:app="http://v8.1c.ru/8.2/managed-application/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Events><Event name="OnCreateAtServer" callType="After">PrepareAfter</Event></Events>
+  <ChildItems>
+    <Table name="Rows" id="1"><DataPath>Object.Rows</DataPath>
+      <AutoCommandBar name="RowsBar" id="2"><ChildItems>
+        <ButtonGroup name="Actions" id="3"><ChildItems><Button name="Refresh" id="4"><CommandName>Form.Command.Refresh</CommandName></Button></ChildItems></ButtonGroup>
+      </ChildItems></AutoCommandBar>
+      <ChildItems><InputField name="Partner" id="5"><DataPath>Object.Rows.Partner</DataPath>
+        <Events><Event name="OnChange" callType="Before">PartnerBefore</Event><Event name="OnChange" callType="Override">PartnerInstead</Event></Events>
+        <ChoiceParameters><app:item name="Filter.Kind"><app:value xsi:type="xs:string">Buyer</app:value></app:item></ChoiceParameters>
+        <ChoiceParameterLinks/>
+        <FillChecking>ShowError</FillChecking>
+      </InputField></ChildItems>
+    </Table>
+  </ChildItems>
+  <Commands><Command name="Refresh" id="1"><Action>RefreshRows</Action></Command></Commands>
+  <Parameters><Parameter name="Kind"><Type><v8:Type>cfg:EnumRef.Kinds</v8:Type></Type><KeyParameter>true</KeyParameter></Parameter><Parameter name="UnreadType"/></Parameters>
+  <Attributes><Attribute name="Kind" id="1"><Type><v8:Type>xs:string</v8:Type></Type></Attribute></Attributes>
+  <BaseForm><Events><Event name="OnCreateAtServer">Historical</Event></Events><ChildItems><InputField name="HistoricalField" id="55"/></ChildItems></BaseForm>
+</Form>

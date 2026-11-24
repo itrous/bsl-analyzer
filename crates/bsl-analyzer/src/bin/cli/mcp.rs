@@ -30,7 +30,25 @@ struct OnecConnectionConfig {
     password_env: String,
     #[serde(default)]
     allow_execute: bool,
+    #[serde(default = "default_execute_timeout_ms")]
+    execute_timeout_ms: u64,
     check_executor: Option<CheckExecutorConfig>,
+    #[serde(default)]
+    epf_module_check: bool,
+}
+
+fn validate_epf_http(enabled: bool, url: Option<&str>) -> io::Result<()> {
+    if enabled && url.is_none_or(|value| value.trim().is_empty()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "epf_module_check requires an HTTP URL",
+        ));
+    }
+    Ok(())
+}
+
+fn default_execute_timeout_ms() -> u64 {
+    onec_client::DEFAULT_EXECUTE_TIMEOUT_MS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,6 +236,11 @@ pub struct McpServeArgs {
 }
 
 impl McpCommand {
+    /// Whether this command owns a detached broker's logging and lifetime.
+    pub fn is_daemon(&self) -> bool {
+        matches!(self, Self::Serve(args) if matches!(args.mode, Some(McpServeMode::Daemon)))
+    }
+
     /// Opt-in on-disk log destination for a daemon backend, enabled by
     /// `BSL_MCP_DAEMON_LOG` (`1`/`true`/`yes`/`on` → `bsl-analyzer-daemon.log`
     /// in the effective workspace cache; any other non-empty value is taken
@@ -229,19 +252,24 @@ impl McpCommand {
     /// report file next to the graph database when a build wedges, so that
     /// post-mortem survives even with logging off.
     ///
-    /// The file is APPENDED across runs (each run stamps a session-start line),
-    /// never truncated or renamed at startup: the broker's spawn race can start
-    /// several daemon candidates within seconds, and a start-time rotation by a
-    /// losing candidate would rename the winning daemon's live log out from
-    /// under it. Rotation to `.prev` happens only on size (a wedged-build trail
-    /// is kilobytes, so the rotation window and a spawn race cannot coincide).
+    /// The file is appended across runs. Its writer rotates during writes into
+    /// one bounded `.prev` segment; merely selecting a path never moves a live
+    /// daemon's file. A proxy-launched daemon otherwise uses its runtime log.
     ///
     /// Returns `None` for non-daemon modes (stdio/broker keep stderr: a direct
     /// client or terminal is attached), when the opt-in is absent, and when the
     /// directory cannot be prepared (logging then falls back to stderr rather
     /// than failing startup).
     pub fn default_daemon_log_file(&self) -> Option<PathBuf> {
-        self.daemon_log_file_for(std::env::var("BSL_MCP_DAEMON_LOG").ok().as_deref())
+        self.daemon_log_file_for(std::env::var("BSL_MCP_DAEMON_LOG").ok().as_deref()).or_else(
+            || {
+                self.is_daemon()
+                    .then(|| std::env::var_os(mcp_server::broker::DETACHED_LOG_PATH_ENV))
+                    .flatten()
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from)
+            },
+        )
     }
 
     fn daemon_log_file_for(&self, opt_in: Option<&str>) -> Option<PathBuf> {
@@ -300,24 +328,12 @@ impl McpCommand {
         };
         // Only the cache log's `.prev` is ours to delete: a caller-selected path
         // lives in a directory the caller owns, and a file there that happens to be
-        // named `<log>.prev` is theirs, however old. Swept BEFORE the rotation below,
-        // because a rename keeps the mtime, so a freshly rotated trail of a log last
-        // written days ago would look stale and be deleted the moment it was made.
+        // named `<log>.prev` is theirs, however old. Selecting the path never rotates
+        // the log itself: the bounded writer does that while writing, so a `.prev` it
+        // produced carries its rotation time and a fresh trail is never mistaken for
+        // a stale one.
         if is_cache_log {
             remove_stale_prev_log(&log_path, std::time::SystemTime::now());
-        }
-        let rotated = mcp_server::rotated_log_path(&log_path).filter(|_| {
-            std::fs::metadata(&log_path).is_ok_and(|m| m.len() > mcp_server::LOG_ROTATE_BYTES)
-        });
-        if let Some(rotated) = rotated {
-            if std::fs::rename(&log_path, &rotated).is_ok() && is_cache_log {
-                // A rename keeps the last write's mtime, and the stale-trail sweep reads the age
-                // from it: date the trail from its rotation so the next startup keeps it.
-                let _ = std::fs::File::options()
-                    .write(true)
-                    .open(&rotated)
-                    .and_then(|file| file.set_modified(std::time::SystemTime::now()));
-            }
         }
         Some(log_path)
     }
@@ -888,8 +904,8 @@ fn daemon_command(
     args: &McpServeArgs,
     topology_fp: u64,
     embedding_prefixes: &mcp_server::EmbeddingPrefixes,
-) -> std::process::Command {
-    let mut cmd = std::process::Command::new(executable);
+) -> mcp_server::broker::proxy::BrokerCommand {
+    let mut cmd = mcp_server::broker::proxy::BrokerCommand::new(executable);
     cmd.arg("mcp")
         .arg("serve")
         .arg("--profile")
@@ -1587,7 +1603,7 @@ fn build_server(
             )
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
             if let Some(ref url) = onec_url {
-                tracing::info!(%url, "Configuring 1C HTTP client");
+                tracing::info!("Configuring 1C HTTP client");
                 state.set_onec_client(onec_client::Client::new(url, &onec_user, &onec_password));
             }
             configure_named_onec_connections(&mut state)?;
@@ -1614,6 +1630,8 @@ fn configure_named_onec_connections(
     let text = std::fs::read_to_string(&path)?;
     let config: OnecConnectionsFile = serde_json::from_str(&text)?;
     for (name, connection) in config.connections {
+        onec_client::validate_execute_timeout_ms(connection.execute_timeout_ms)?;
+        validate_epf_http(connection.epf_module_check, connection.url.as_deref())?;
         if name.trim().is_empty()
             || connection.url.as_deref().is_some_and(|url| url.trim().is_empty())
             || (connection.url.is_none() && connection.check_executor.is_none())
@@ -1645,7 +1663,10 @@ fn configure_named_onec_connections(
                     )
                 })?
             };
-            Some(onec_client::Client::new(url, &user, &password))
+            Some(
+                onec_client::Client::new(url, &user, &password)
+                    .with_execute_timeout_ms(connection.execute_timeout_ms)?,
+            )
         } else {
             None
         };
@@ -1657,7 +1678,8 @@ fn configure_named_onec_connections(
                 client,
                 connection.allow_execute,
                 executor,
-            ),
+            )
+            .with_epf_module_check(connection.epf_module_check),
         );
     }
     Ok(())
@@ -1760,6 +1782,21 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn epf_module_check_profile_requires_explicit_http_opt_in() {
+        for (extra, enabled) in [("", false), (",\"epf_module_check\":true", true)] {
+            let config: super::OnecConnectionsFile = serde_json::from_str(&format!(
+                r#"{{"connections":{{"test":{{"url":"http://localhost/test"{extra}}}}}}}"#
+            ))
+            .unwrap();
+            assert_eq!(config.connections["test"].epf_module_check, enabled);
+        }
+        assert!(super::validate_epf_http(false, None).is_ok());
+        assert!(super::validate_epf_http(true, Some("http://localhost/test")).is_ok());
+        assert!(super::validate_epf_http(true, None).is_err());
+        assert!(super::validate_epf_http(true, Some(" ")).is_err());
+    }
     use super::{
         daemon_command, decode_password, frozen_embedding_prefixes, remove_stale_prev_log,
         resolve_embedding_prefix_values, resolve_onec_password, resolve_serve_mode_with_override,
@@ -3037,7 +3074,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_log_opt_in_lands_in_build_dir_and_rotates_only_by_size() {
+    fn daemon_log_path_selection_never_rotates_an_already_open_file() {
         let dir = tempfile::tempdir().unwrap();
 
         let path = serve_command(McpServeMode::Daemon, dir.path())
@@ -3065,11 +3102,11 @@ mod tests {
         let prev = path.with_file_name("bsl-analyzer-daemon.log.prev");
         assert!(!prev.exists());
 
-        // An oversized log rotates to `.prev` (sparse file keeps the test cheap).
+        // Only the writer rotates; a losing candidate must not alter a live file.
         std::fs::File::create(&path).unwrap().set_len(51 * 1024 * 1024).unwrap();
         serve_command(McpServeMode::Daemon, dir.path()).daemon_log_file_for(Some("1")).unwrap();
-        assert!(prev.exists());
-        assert!(!path.exists());
+        assert!(!prev.exists());
+        assert_eq!(path.metadata().unwrap().len(), 51 * 1024 * 1024);
     }
 
     #[test]
@@ -3280,38 +3317,25 @@ mod tests {
     }
 
     #[test]
-    fn a_trail_rotated_from_an_old_log_survives_the_next_startup() {
-        let dir = tempfile::tempdir().unwrap();
-        let start = || {
-            serve_command(McpServeMode::Daemon, dir.path()).daemon_log_file_for(Some("1")).unwrap()
-        };
-        let log = start();
-        std::fs::File::create(&log).unwrap().set_len(51 * 1024 * 1024).unwrap();
-        age_file(&log, 48 * HOUR);
-        start();
-        let prev = log.with_file_name("bsl-analyzer-daemon.log.prev");
-        assert!(prev.exists(), "the first startup rotates the oversized log");
-        start();
-        assert!(prev.exists(), "a trail is aged from its rotation, not from its last write");
-    }
-
-    #[test]
-    fn daemon_log_rotation_appends_prev_to_dotted_names() {
+    fn daemon_log_path_selection_preserves_dotted_names_and_existing_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let custom = dir.path().join("daemon.custom.log");
         std::fs::File::create(&custom).unwrap().set_len(51 * 1024 * 1024).unwrap();
         serve_command(McpServeMode::Daemon, dir.path())
             .daemon_log_file_for(Some(custom.to_str().unwrap()))
             .unwrap();
-        assert!(dir.path().join("daemon.custom.log.prev").exists());
-        assert!(!custom.exists());
+        assert!(!dir.path().join("daemon.custom.log.prev").exists());
+        assert_eq!(custom.metadata().unwrap().len(), 51 * 1024 * 1024);
     }
 
     #[test]
     fn stdio_and_broker_modes_keep_stderr_logging() {
         let dir = tempfile::tempdir().unwrap();
         for mode in [McpServeMode::Stdio, McpServeMode::Broker] {
-            assert!(serve_command(mode, dir.path()).daemon_log_file_for(Some("1")).is_none());
+            let command = serve_command(mode, dir.path());
+            assert!(!command.is_daemon());
+            assert!(command.daemon_log_file_for(Some("1")).is_none());
         }
+        assert!(serve_command(McpServeMode::Daemon, dir.path()).is_daemon());
     }
 }
