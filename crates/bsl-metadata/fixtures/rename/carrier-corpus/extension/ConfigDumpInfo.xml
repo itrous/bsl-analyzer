@@ -1,0 +1,20 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<ConfigDumpInfo xmlns="http://v8.1c.ru/8.3/xcf/dumpinfo" xmlns:xen="http://v8.1c.ru/8.3/xcf/enums" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" format="Hierarchical" version="2.20">
+	<ConfigVersions>
+		<Metadata name="Catalog.BA023Catalog" id="d8af1f38-c31d-408e-bd60-a88667772a4d" configVersion="250d9961cb468ae5fb56ac92dc158468467b8fb7">
+			<Metadata name="Catalog.BA023Catalog.Attribute.BA023_ExtraField" id="342e3498-e10f-4832-9daa-eec46ccd4ace"/>
+		</Metadata>
+		<Metadata name="Catalog.BA023Catalog.ManagerModule" id="d8af1f38-c31d-408e-bd60-a88667772a4d.3" configVersion="a3c4c088ee3acb8228ae2fce3ef86208eccb2c43"/>
+		<Metadata name="Catalog.BA023Catalog.ObjectModule" id="d8af1f38-c31d-408e-bd60-a88667772a4d.0" configVersion="ad71c1c9cd299b0a4b5ee2220914a97ff9b1664e"/>
+		<Metadata name="CommonForm.BA023_ExtManaged" id="b1a657a3-a3c9-481b-91a6-497ef84ccb2c" configVersion="6cececb0cf4a4ffe2293a3be23350da2a5bd4bc6"/>
+		<Metadata name="CommonForm.BA023_ExtManaged.Form" id="b1a657a3-a3c9-481b-91a6-497ef84ccb2c.0" configVersion="20b2757388149868d78fd37e0733cce0a0e1cea0"/>
+		<Metadata name="CommonForm.BA023_ExtOrdinary" id="0a44f970-2cd5-4cc2-9de1-e9c352554e49" configVersion="61f4886e5ab8ebe7d469e7663eabdf3cc48492da"/>
+		<Metadata name="CommonModule.BA023_Extra" id="5ee5053e-e164-4b11-8089-bfa675532f32" configVersion="d6171edb5ab5b8a563cfc09ac3d050485f16fe7b"/>
+		<Metadata name="CommonModule.BA023_Extra.Module" id="5ee5053e-e164-4b11-8089-bfa675532f32.0" configVersion="3ee1baa465e9e0cab443d742b0d485011307ddfd"/>
+		<Metadata name="Configuration.BA023Extension" id="cc5cc047-877f-4af4-be38-a589118b65ed" configVersion="b79444916740291a4dba17c52d36c3b386ba2c61"/>
+		<Metadata name="Document.BA095Document" id="ca370362-5f09-4142-a518-cc2a36f37c02" configVersion="00de4bd11a4df5180f50b139c1d68f7ea8b9e4c0"/>
+		<Metadata name="Document.BA095Document.ManagerModule" id="ca370362-5f09-4142-a518-cc2a36f37c02.2" configVersion="40a66692ab8802977cff486f029839d6f6ad258f"/>
+		<Metadata name="Document.BA095Document.ObjectModule" id="ca370362-5f09-4142-a518-cc2a36f37c02.0" configVersion="084f2af1618d406fc87917320d8206997f4bef9d"/>
+		<Metadata name="Role.ОсновнаяРоль" id="2b508b26-cb52-44c7-8ab6-46e2b99af4b1" configVersion="1c217cdf2f126726dee7c685e8ce69c4beddf2e1"/>
+	</ConfigVersions>
+</ConfigDumpInfo>

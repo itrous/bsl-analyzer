@@ -10,3 +10,5 @@ mod metadata_object_family_parameters;
 mod registry_surface_matches_platform_data;
 mod security_registry;
 mod type_member_surface;
+
+mod dom_node_type_surface;

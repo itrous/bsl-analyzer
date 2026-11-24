@@ -23,6 +23,12 @@ pub fn parse_scheduled_job_xml(xml: &str) -> Result<ScheduledJob> {
         method_name: child_text(props, "MethodName").unwrap_or("").to_string(),
         predefined: child_bool(props, "Predefined"),
         use_flag: child_bool(props, "Use"),
+        enabled: match child_text(props, "Use") {
+            Some("true" | "1") => Some(true),
+            Some("false" | "0") => Some(false),
+            _ => None,
+        },
+        schedule: find_child(props, "Schedule").map(super::read_properties::parse_value),
     };
 
     tracing::debug!(

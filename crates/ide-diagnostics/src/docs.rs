@@ -6,6 +6,23 @@ mod tests {
     use crate::DiagnosticCode;
 
     #[test]
+    fn method_declaration_diagnostics_have_default_metadata_and_bilingual_docs() {
+        for code in
+            [DiagnosticCode::DuplicateInterception, DiagnosticCode::DuplicateMethodDeclaration]
+        {
+            let metadata = crate::get_metadata(code).expect("registered diagnostic metadata");
+            assert!(metadata.activated_by_default);
+            assert!(!crate::DiagnosticsConfig::default().is_disabled(code));
+            assert!(DOCUMENTED_CODES.contains(&code), "{code:?}");
+            let docs = get_docs(code);
+            assert!(!docs.name_ru.is_empty(), "{code:?}");
+            assert!(!docs.name_en.is_empty(), "{code:?}");
+            assert!(!docs.description_ru.is_empty(), "{code:?}");
+            assert!(!docs.description_en.is_empty(), "{code:?}");
+        }
+    }
+
+    #[test]
     fn test_get_docs_line_length() {
         let docs = get_docs(DiagnosticCode::LineLength);
         assert!(!docs.name_ru.is_empty(), "LineLength should have Russian name");

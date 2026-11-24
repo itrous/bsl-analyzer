@@ -1236,10 +1236,17 @@ fn register_member_type(
     attr_type: Option<&bsl_metadata::AttributeType>,
     type_str: &str,
 ) -> Option<String> {
-    if let Some(t) = attr_type {
-        return Some(t.to_string());
+    match attr_type {
+        Some(AttributeType::Composite { types }) if !types.is_empty() => Some(
+            types
+                .iter()
+                .filter_map(|ty| register_member_type(Some(ty), ""))
+                .collect::<Vec<_>>()
+                .join(" | "),
+        ),
+        Some(ty) => Some(ty.to_string()),
+        None => (!type_str.is_empty()).then(|| type_str.to_string()),
     }
-    (!type_str.is_empty()).then(|| type_str.to_string())
 }
 
 fn register_symbol_member(
@@ -1251,7 +1258,13 @@ fn register_symbol_member(
 ) -> SymbolMember {
     attr_type.map_or_else(
         || SymbolMember::metadata(name, kind, "attribute", register_member_type(None, type_str)),
-        |attr_type| static_metadata_member(db, name, kind, "attribute", attr_type),
+        |attr_type| {
+            let mut member = static_metadata_member(db, name, kind, "attribute", attr_type);
+            if matches!(attr_type, AttributeType::Composite { .. }) {
+                member.ty = register_member_type(Some(attr_type), type_str);
+            }
+            member
+        },
     )
 }
 
@@ -1810,6 +1823,19 @@ mod applied_member_collector_tests {
             .technical_name
             .as_deref()
             .is_some_and(|name| name.contains("СправочникСсылка.Контрагенты")));
+    }
+
+    #[test]
+    fn register_member_type_shows_each_recorder_document() {
+        let ty = AttributeType::Composite {
+            types: ["BaseWriter", "ExtensionWriter"]
+                .map(|name| AttributeType::Ref { mdo_type: MdoType::Document, name: name.into() })
+                .to_vec(),
+        };
+        assert_eq!(
+            register_member_type(Some(&ty), "").as_deref(),
+            Some("Документ.BaseWriter | Документ.ExtensionWriter"),
+        );
     }
 
     #[test]

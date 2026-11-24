@@ -1,0 +1,43 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:app="http://v8.1c.ru/8.2/managed-application/core" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:cmi="http://v8.1c.ru/8.2/managed-application/cmi" xmlns:ent="http://v8.1c.ru/8.1/data/enterprise" xmlns:lf="http://v8.1c.ru/8.2/managed-application/logform" xmlns:style="http://v8.1c.ru/8.1/data/ui/style" xmlns:sys="http://v8.1c.ru/8.1/data/ui/fonts/system" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:v8ui="http://v8.1c.ru/8.1/data/ui" xmlns:web="http://v8.1c.ru/8.1/data/ui/colors/web" xmlns:win="http://v8.1c.ru/8.1/data/ui/colors/windows" xmlns:xen="http://v8.1c.ru/8.3/xcf/enums" xmlns:xpr="http://v8.1c.ru/8.3/xcf/predef" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="2.20">
+	<Document uuid="ca370362-5f09-4142-a518-cc2a36f37c02">
+		<InternalInfo>
+			<xr:GeneratedType name="DocumentObject.BA095Document" category="Object">
+				<xr:TypeId>1d9ba2e7-4d83-448f-93f2-a7a68118f5c2</xr:TypeId>
+				<xr:ValueId>b23292e6-6d81-4e71-94d0-fe1158a9eba3</xr:ValueId>
+			</xr:GeneratedType>
+			<xr:GeneratedType name="DocumentRef.BA095Document" category="Ref">
+				<xr:TypeId>28d412f2-79bd-4244-95fd-4e94079ff4de</xr:TypeId>
+				<xr:ValueId>59cc93d5-bd35-429a-b519-d9bddf5f14bb</xr:ValueId>
+			</xr:GeneratedType>
+			<xr:GeneratedType name="DocumentSelection.BA095Document" category="Selection">
+				<xr:TypeId>3295ed6d-a2e2-44b6-ac66-92c710759fb1</xr:TypeId>
+				<xr:ValueId>44ea4d22-199e-4da4-81ee-a3c27cb201fa</xr:ValueId>
+			</xr:GeneratedType>
+			<xr:GeneratedType name="DocumentList.BA095Document" category="List">
+				<xr:TypeId>191359a6-0b20-444c-85f6-d1e3a9396a98</xr:TypeId>
+				<xr:ValueId>03f8710e-5a77-413b-8529-6006a896c539</xr:ValueId>
+			</xr:GeneratedType>
+			<xr:GeneratedType name="DocumentManager.BA095Document" category="Manager">
+				<xr:TypeId>551d8368-70c0-4b11-a662-71a38be4ef29</xr:TypeId>
+				<xr:ValueId>e5e6b29c-9e6a-41e7-bae1-8606f3314c2b</xr:ValueId>
+			</xr:GeneratedType>
+			<xr:PropertyState>
+				<xr:Property>ObjectModule</xr:Property>
+				<xr:State>Extended</xr:State>
+			</xr:PropertyState>
+			<xr:PropertyState>
+				<xr:Property>ManagerModule</xr:Property>
+				<xr:State>Extended</xr:State>
+			</xr:PropertyState>
+		</InternalInfo>
+		<Properties>
+			<ObjectBelonging>Adopted</ObjectBelonging>
+			<Name>BA095Document</Name>
+			<Comment/>
+			<ExtendedConfigurationObject>7eff0bd8-3f15-42d3-a6eb-3ce1aa38c9ab</ExtendedConfigurationObject>
+			<RegisterRecords/>
+		</Properties>
+		<ChildObjects/>
+	</Document>
+</MetaDataObject>

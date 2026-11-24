@@ -54,6 +54,14 @@ pub(super) fn descriptor() -> io::Result<Descriptor> {
 }
 
 pub(crate) fn private_directory(path: &Path) -> io::Result<()> {
+    private_directory_impl(path, false)
+}
+
+pub(crate) fn new_private_directory(path: &Path) -> io::Result<()> {
+    private_directory_impl(path, true)
+}
+
+fn private_directory_impl(path: &Path, new: bool) -> io::Result<()> {
     let descriptor = descriptor()?;
     let security = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -63,7 +71,7 @@ pub(crate) fn private_directory(path: &Path) -> io::Result<()> {
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     if unsafe { CreateDirectoryW(wide.as_ptr(), &security) } == 0 {
         let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32) {
+        if new || error.raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32) {
             return Err(error);
         }
     }

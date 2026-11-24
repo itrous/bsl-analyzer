@@ -344,6 +344,8 @@ fn setup_applied_visibility() -> RootDatabaseImpl {
     ];
     let mut db = RootDatabaseImpl::new();
     db.set_workspace_configs_snapshot(WorkspaceConfigsSnapshot {
+        external_owners: Vec::new(),
+        compilation_overrides: Default::default(),
         extension_scopes: paths
             .iter()
             .map(|(label, _)| label.as_ref().map(|_| bsl_metadata::ExtensionScope::InfoBase))
@@ -415,6 +417,8 @@ fn setup_form_resolution_visibility() -> (RootDatabaseImpl, PathBuf) {
     ];
     let mut db = RootDatabaseImpl::new();
     db.set_workspace_configs_snapshot(WorkspaceConfigsSnapshot {
+        external_owners: Vec::new(),
+        compilation_overrides: Default::default(),
         extension_scopes: paths
             .iter()
             .map(|(label, _)| label.as_ref().map(|_| bsl_metadata::ExtensionScope::InfoBase))
@@ -961,12 +965,13 @@ fn symbol_info_whole_common_form_card_resolves_by_common_form_keyword() {
     assert_eq!(container.kind, "Форма");
     assert_eq!(container.name, "ТестоваяФорма");
     assert!(
-        card.members.iter().any(|m| m.name == "ПриСозданииНаСервере" && m.kind == "Обработчик"),
+        card.members.iter().any(|m| m.name == "ПередОткрытием" && m.kind == "Обработчик"),
         "members were {:?}",
         card.members
     );
     assert!(
-        card.members.iter().any(|m| m.name == "КомандаОК" && m.kind == "Обработчик"),
+        !card.members.iter().any(|m| (m.name == "КомандаОК" || m.name == "ПриСозданииНаСервере")
+            && m.kind == "Обработчик"),
         "members were {:?}",
         card.members
     );

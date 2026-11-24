@@ -22,6 +22,9 @@ rayon.workspace = true
 cap-std.workspace = true
 cap-fs-ext.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Wdk_Storage_FileSystem",

@@ -8,8 +8,16 @@
 //! multi-gigabyte rebuild.
 
 use std::fs::OpenOptions;
-use std::process::{Child, Command};
 use std::time::Duration;
+
+#[cfg(unix)]
+use std::process::Child as BrokerChild;
+#[cfg(unix)]
+pub use std::process::Command as BrokerCommand;
+#[cfg(windows)]
+use windows_spawn::BrokerChild;
+#[cfg(windows)]
+pub use windows_spawn::BrokerCommand;
 
 use interprocess::local_socket::tokio::prelude::*;
 use interprocess::local_socket::tokio::Stream as TokioStream;
@@ -18,6 +26,10 @@ use tokio::time::Instant;
 
 use crate::broker::name::{backend_name, shared_backend_name, BackendKey, SharedBackendKey};
 use crate::broker::transport::{connect_endpoint, HANDSHAKE_TIMEOUT};
+
+#[cfg(windows)]
+#[path = "proxy/windows_spawn.rs"]
+mod windows_spawn;
 
 /// Upper bound on waiting for a backend to become reachable. The backend binds
 /// before its heavy build, so this only needs to cover process startup — but we
@@ -28,10 +40,6 @@ const LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// startup) and launching another. Re-launches are safe: a redundant backend loses
 /// the bind race and exits immediately.
 const RESPAWN_INTERVAL: Duration = Duration::from_secs(3);
-
-/// Roll the per-backend log over once it passes this size, so it cannot grow without
-/// bound across many backend generations.
-const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Windows-only: how long to keep draining backend→client after the client closes
 /// stdin before dropping the connection outright. Windows named pipes have no
@@ -62,7 +70,7 @@ pub enum ProxyOutcome {
 /// the stdin pump has consumed bytes, so re-serving on the same stream would be wrong.
 pub async fn connect_or_launch(
     key: BackendKey,
-    daemon_cmd: Command,
+    daemon_cmd: BrokerCommand,
 ) -> anyhow::Result<ProxyOutcome> {
     let stream = match connect_with_launch(&key, daemon_cmd).await {
         Ok(stream) => stream,
@@ -85,7 +93,7 @@ pub async fn connect_required(key: BackendKey, expected_pid: u32) -> anyhow::Res
 /// platform peer-trust checks. The caller performs the private protocol handshake next.
 pub async fn connect_or_launch_stream(
     key: SharedBackendKey,
-    daemon_cmd: Command,
+    daemon_cmd: BrokerCommand,
 ) -> anyhow::Result<TokioStream> {
     connect_with_launch(&key, daemon_cmd).await
 }
@@ -179,7 +187,7 @@ async fn connect_existing_key<K: EndpointKey>(
 
 async fn connect_with_launch<K: EndpointKey>(
     key: &K,
-    mut daemon_cmd: Command,
+    mut daemon_cmd: BrokerCommand,
 ) -> anyhow::Result<TokioStream> {
     let deadline = Instant::now() + LAUNCH_TIMEOUT;
     let initial_budget = deadline.saturating_duration_since(Instant::now()).min(HANDSHAKE_TIMEOUT);
@@ -223,7 +231,7 @@ async fn connect_with_launch<K: EndpointKey>(
     // No backend yet: launch one detached, then poll-connect. If the backend never
     // becomes reachable (e.g. it crashed during startup), relaunch periodically —
     // bind-wins makes a redundant launch self-correcting.
-    let mut children: Vec<Child> = Vec::new();
+    let mut children: Vec<BrokerChild> = Vec::new();
     children.push(spawn_detached(key, &mut daemon_cmd)?);
 
     let mut next_respawn = Instant::now() + RESPAWN_INTERVAL;
@@ -297,7 +305,7 @@ fn verify_or_drop_peer(stream: TokioStream) -> Option<TokioStream> {
 /// Reap any spawned backend that has already exited (a race loser), clearing the
 /// zombie. The live winner reports `None` and keeps running; its handle is dropped
 /// without killing the process, which reparents to init when this proxy exits.
-fn reap(children: &mut Vec<Child>) {
+fn reap(children: &mut Vec<BrokerChild>) {
     children.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
 }
 
@@ -381,44 +389,36 @@ where
 }
 
 /// Spawn the backend so it outlives this proxy: a new process group (unix) /
-/// detached, new-group process (windows), with stdin closed and stdout+stderr
-/// redirected to a per-backend log file in the runtime dir. Returns the child
+/// detached, new-group process (windows), with stdio closed and a daemon-owned
+/// bounded log in the runtime dir. Returns the child
 /// handle so a fast-exiting race loser can be reaped.
-fn spawn_detached<K: EndpointKey>(key: &K, cmd: &mut Command) -> anyhow::Result<Child> {
+fn spawn_detached<K: EndpointKey>(key: &K, cmd: &mut BrokerCommand) -> anyhow::Result<BrokerChild> {
     let log_path = key.log_path()?;
-    // Bound the per-backend log instead of appending forever: roll it over when it
-    // passes the cap. A concurrent race-loser's truncate is harmless — losers exit
-    // immediately and write next to nothing.
-    let oversized = std::fs::metadata(&log_path).map(|m| m.len() > MAX_LOG_BYTES).unwrap_or(false);
-    let mut log_opts = OpenOptions::new();
-    log_opts.create(true);
-    if oversized {
-        log_opts.write(true).truncate(true);
-    } else {
-        log_opts.append(true);
-    }
-    let log = log_opts.open(&log_path)?;
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(log.try_clone()?))
-        .stderr(std::process::Stdio::from(log));
+    OpenOptions::new().create(true).append(true).open(&log_path)?;
+    // A raw inherited file bypasses rotation for the whole lifetime of the broker.
+    cmd.env(super::DETACHED_LOG_PATH_ENV, &log_path);
 
     #[cfg(unix)]
-    {
+    let child = {
         use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    }
+        use std::process::Stdio;
 
-    let child = cmd.spawn()?;
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()?
+    };
+    #[cfg(windows)]
+    let child = windows_spawn::spawn(cmd)?;
     tracing::info!(log = %log_path.display(), "launched broker backend");
     Ok(child)
 }
+
+#[cfg(test)]
+#[cfg(windows)]
+#[path = "proxy/windows_lifetime_tests.rs"]
+mod windows_lifetime_tests;
 
 #[cfg(all(test, any(unix, windows)))]
 mod tests {

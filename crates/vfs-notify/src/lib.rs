@@ -1179,21 +1179,28 @@ impl NotifyActor {
     }
 }
 
-/// Whether the registration already placed on `target` answers for `mode`.
+/// Whether an existing registration covers `target` in `mode`.
 ///
-/// A recursive one answers for both; a non-recursive one only for itself, because
-/// `notify` REPLACES the mode of a path it already watches — so a widening request
-/// has to go through.
+/// Re-registering physically covered descendants adds native directory handles
+/// without adding coverage. Preserve raw spelling through a child link: watching
+/// its resolved target instead would change the paths consumers receive.
 fn registration_stands(
     registered: &FxHashMap<PathBuf, RecursiveMode>,
     target: &Path,
     mode: RecursiveMode,
 ) -> bool {
     match registered.get(target) {
-        Some(RecursiveMode::Recursive) => true,
-        Some(RecursiveMode::NonRecursive) => mode == RecursiveMode::NonRecursive,
-        None => false,
+        Some(RecursiveMode::Recursive) => return true,
+        Some(RecursiveMode::NonRecursive) if mode == RecursiveMode::NonRecursive => return true,
+        _ => {}
     }
+    let Ok(canonical_target) = fs::canonicalize(target) else { return false };
+    target.ancestors().skip(1).any(|ancestor| {
+        registered.get(ancestor) == Some(&RecursiveMode::Recursive)
+            && fs::canonicalize(ancestor).is_ok_and(|canonical_ancestor| {
+                canonical_ancestor.join(target.strip_prefix(ancestor).unwrap()) == canonical_target
+            })
+    })
 }
 
 /// Drop the records for `path` and everything below it.
@@ -2075,29 +2082,199 @@ mod tests {
         assert!(chunks.is_empty(), "shutdown latch must suppress all sends, got {chunks:#?}");
     }
 
-    /// A repeat registration is not a harmless no-op on every backend, so the record
-    /// must answer for the target exactly — including the one case where it must NOT
-    /// suppress the call: widening a directory from non-recursive to recursive.
     #[test]
     fn a_standing_registration_answers_only_for_what_it_covers() {
+        let guard = tempfile::tempdir().unwrap();
+        let base = guard.path().canonicalize().unwrap();
+        let root = base.join("root");
+        let leaf = root.join("leaf");
+        let child = leaf.join("child");
+        let sibling = base.join("root-sibling");
+        let other = base.join("other");
+        for directory in [&child, &sibling, &other] {
+            fs::create_dir_all(directory).unwrap();
+        }
         let mut registered = FxHashMap::default();
-        registered.insert(PathBuf::from("/root"), RecursiveMode::Recursive);
-        registered.insert(PathBuf::from("/root/leaf"), RecursiveMode::NonRecursive);
+        registered.insert(root.clone(), RecursiveMode::Recursive);
+        for target in [&root, &leaf, &child] {
+            for mode in [RecursiveMode::Recursive, RecursiveMode::NonRecursive] {
+                assert!(registration_stands(&registered, target, mode));
+            }
+        }
+        for target in [&sibling, &other, &base] {
+            assert!(!registration_stands(&registered, target, RecursiveMode::NonRecursive));
+        }
+        assert!(!registration_stands(&registered, &root.join("missing"), RecursiveMode::Recursive));
 
-        assert!(registration_stands(&registered, Path::new("/root"), RecursiveMode::Recursive));
-        assert!(registration_stands(&registered, Path::new("/root"), RecursiveMode::NonRecursive));
-        assert!(registration_stands(
-            &registered,
-            Path::new("/root/leaf"),
-            RecursiveMode::NonRecursive
-        ));
+        registered.insert(root.clone(), RecursiveMode::NonRecursive);
+        assert!(registration_stands(&registered, &root, RecursiveMode::NonRecursive));
         assert!(
-            !registration_stands(&registered, Path::new("/root/leaf"), RecursiveMode::Recursive),
+            !registration_stands(&registered, &root, RecursiveMode::Recursive),
             "a narrower registration must not suppress the widening call",
         );
+        for mode in [RecursiveMode::Recursive, RecursiveMode::NonRecursive] {
+            assert!(!registration_stands(&registered, &leaf, mode));
+        }
+        registered.insert(leaf, RecursiveMode::Recursive);
+        assert!(registration_stands(&registered, &child, RecursiveMode::Recursive));
+    }
+
+    #[test]
+    fn a_standing_recursive_registration_covers_descendant_directory_events() {
+        let guard = tempfile::tempdir().unwrap();
+        let root = AbsPathBuf::assert_utf8(guard.path().canonicalize().unwrap().join("cf"));
+        let root_path: &Path = root.as_ref();
+        let partners = root_path.join("Catalogs/Partners");
+        let ext = partners.join("Ext");
+        fs::create_dir_all(&ext).unwrap();
+        let descriptor = root_path.join("Catalogs/Partners.xml");
+        let descriptor_bytes = b"\xef\xbb\xbf<Metadata>Partners</Metadata>\r\n";
+        let module_bytes = b"\xef\xbb\xbfProcedure Test()\r\nEndProcedure\r\n";
+        fs::write(&descriptor, descriptor_bytes).unwrap();
+        fs::write(ext.join("ObjectModule.bsl"), module_bytes).unwrap();
+        let mut actor = actor_with_watched_dirs(vec![dirs_for(&root, &["bsl"], &["xml"])]);
+        give_a_live_watcher(&mut actor);
+        actor.watch(root_path);
+        actor.watch(&partners);
+        actor.watch(&ext);
+
+        assert_eq!(
+            registered_of(&actor),
+            FxHashMap::from_iter([(root_path.to_path_buf(), RecursiveMode::Recursive)]),
+            "directory events below a recursive root must not open descendant watches"
+        );
+
+        #[cfg(windows)]
+        {
+            let buyers = root_path.join("Catalogs/Buyers");
+            let renamed_descriptor = root_path.join("Catalogs/Buyers.xml");
+            fs::rename(&descriptor, &renamed_descriptor).unwrap();
+            fs::rename(&partners, &buyers).unwrap();
+            assert!(!descriptor.exists());
+            assert!(!partners.exists());
+            assert_eq!(fs::read(renamed_descriptor).unwrap(), descriptor_bytes);
+            assert_eq!(fs::read(buyers.join("Ext/ObjectModule.bsl")).unwrap(), module_bytes);
+            assert_eq!(registered_of(&actor).len(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    fn directory_alias(target: &Path, alias: &Path) {
+        std::os::unix::fs::symlink(target, alias).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn directory_alias(target: &Path, alias: &Path) {
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            #[link_name = "DeviceIoControl"]
+            fn device_io_control(
+                handle: *mut std::ffi::c_void,
+                code: u32,
+                input: *const std::ffi::c_void,
+                input_len: u32,
+                output: *mut std::ffi::c_void,
+                output_len: u32,
+                returned: *mut u32,
+                overlapped: *mut std::ffi::c_void,
+            ) -> i32;
+        }
+
+        fs::create_dir(alias).unwrap();
+        let target_text = target.canonicalize().unwrap().to_string_lossy().into_owned();
+        let print = target_text.strip_prefix(r"\\?\").unwrap_or(&target_text);
+        let substitute: Vec<u16> = format!(r"\??\{print}").encode_utf16().collect();
+        let print: Vec<u16> = print.encode_utf16().collect();
+        let mut data = Vec::new();
+        data.extend_from_slice(&0xA0000003u32.to_le_bytes());
+        let path_bytes = (substitute.len() + print.len() + 2) * 2;
+        data.extend_from_slice(&((8 + path_bytes) as u16).to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        for value in [0, substitute.len() * 2, (substitute.len() + 1) * 2, print.len() * 2] {
+            data.extend_from_slice(&(value as u16).to_le_bytes());
+        }
+        for value in substitute.into_iter().chain(Some(0)).chain(print).chain(Some(0)) {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        let handle = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(0x02000000 | 0x00200000)
+            .open(alias)
+            .unwrap();
+        let mut returned = 0;
+        // SAFETY: the owned directory handle and initialized mount-point buffer stay
+        // alive through FSCTL_SET_REPARSE_POINT; no symbolic-link privilege is needed.
+        let result = unsafe {
+            device_io_control(
+                handle.as_raw_handle(),
+                0x000900A4,
+                data.as_ptr().cast(),
+                data.len() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(result, 0, "{}", std::io::Error::last_os_error());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn recursive_watch_coverage_preserves_raw_directory_aliases() {
+        let guard = tempfile::tempdir().unwrap();
+        let base = guard.path().canonicalize().unwrap();
+        let physical_root = base.join("cf");
+        let external = base.join("external");
+        fs::create_dir_all(physical_root.join("normal/Ext")).unwrap();
+        fs::create_dir_all(physical_root.join("other")).unwrap();
+        fs::create_dir(&external).unwrap();
+        let raw_root = base.join("root-alias");
+        directory_alias(&physical_root, &raw_root);
+        let root = AbsPathBuf::assert_utf8(raw_root.clone());
+        let mut actor = actor_with_watched_dirs(vec![dirs_for(&root, &["bsl"], &["xml"])]);
+        give_a_live_watcher(&mut actor);
+        actor.watch(&raw_root);
+        actor.watch(&raw_root.join("normal/Ext"));
+        assert_eq!(registered_of(&actor).len(), 1, "a root alias still covers its ordinary child");
+
+        let external_alias = raw_root.join("external-alias");
+        let internal_alias = raw_root.join("internal-alias");
+        directory_alias(&external, &external_alias);
+        directory_alias(&physical_root.join("other"), &internal_alias);
+        for alias in [&external_alias, &internal_alias] {
+            assert_eq!(
+                actor.classify_event_path(&AbsPathBuf::assert_utf8(alias.clone())),
+                EventPathAction::WatchDir
+            );
+            actor.watch(alias);
+        }
+        let expected_paths =
+            [external_alias.join("External.bsl"), internal_alias.join("Internal.bsl")];
+        let expected = [raw_root, external_alias, internal_alias]
+            .into_iter()
+            .map(|path| (path, RecursiveMode::Recursive))
+            .collect::<FxHashMap<_, _>>();
+        assert_eq!(registered_of(&actor), expected, "each alias needs its own raw watch path");
+
+        fs::write(external.join("External.bsl"), b"external").unwrap();
+        fs::write(physical_root.join("other/Internal.bsl"), b"internal").unwrap();
+        let (_, receiver) = actor.watcher.as_ref().unwrap();
+        let deadline = Instant::now() + HANG_WATCHDOG;
+        let mut delivered = FxHashSet::default();
+        while Instant::now() < deadline
+            && !expected_paths.iter().all(|path| delivered.contains(path))
+        {
+            if let Ok(Ok(event)) = receiver.recv_timeout(Duration::from_millis(50)) {
+                delivered.extend(event.paths);
+            }
+        }
         assert!(
-            !registration_stands(&registered, Path::new("/other"), RecursiveMode::Recursive),
-            "an unknown target has nothing standing on it",
+            expected_paths.iter().all(|path| delivered.contains(path)),
+            "explicit directory watches must deliver each alias spelling: {delivered:?}"
         );
     }
 

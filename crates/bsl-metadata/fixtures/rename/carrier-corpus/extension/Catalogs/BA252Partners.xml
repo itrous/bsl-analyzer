@@ -1,0 +1,34 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:app="http://v8.1c.ru/8.2/managed-application/core" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:cmi="http://v8.1c.ru/8.2/managed-application/cmi" xmlns:ent="http://v8.1c.ru/8.1/data/enterprise" xmlns:lf="http://v8.1c.ru/8.2/managed-application/logform" xmlns:style="http://v8.1c.ru/8.1/data/ui/style" xmlns:sys="http://v8.1c.ru/8.1/data/ui/fonts/system" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:v8ui="http://v8.1c.ru/8.1/data/ui" xmlns:web="http://v8.1c.ru/8.1/data/ui/colors/web" xmlns:win="http://v8.1c.ru/8.1/data/ui/colors/windows" xmlns:xen="http://v8.1c.ru/8.3/xcf/enums" xmlns:xpr="http://v8.1c.ru/8.3/xcf/predef" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="2.20">
+	<Catalog uuid="d2bc3045-c354-57dd-9e65-d6584d429f06">
+		<InternalInfo>
+			<xr:GeneratedType name="CatalogObject.BA252Partners" category="Object">
+				<xr:TypeId>7dd29d6a-80e9-5eb8-928e-9d38f7c04552</xr:TypeId>
+				<xr:ValueId>0729b611-40dc-5260-a5ee-47173ecc280a</xr:ValueId>
+			</xr:GeneratedType>
+			<xr:GeneratedType name="CatalogRef.BA252Partners" category="Ref">
+				<xr:TypeId>2e3ec2fc-c8c1-5e53-a0ce-a7d38e99278e</xr:TypeId>
+				<xr:ValueId>2b155f58-b849-5bb7-9397-5d5f06629052</xr:ValueId>
+			</xr:GeneratedType>
+			<xr:GeneratedType name="CatalogSelection.BA252Partners" category="Selection">
+				<xr:TypeId>3db7f303-7b74-52ce-b59c-b6958ed017ce</xr:TypeId>
+				<xr:ValueId>1fc7a4f2-0481-56b6-9cd0-98dd65614e6e</xr:ValueId>
+			</xr:GeneratedType>
+			<xr:GeneratedType name="CatalogList.BA252Partners" category="List">
+				<xr:TypeId>26885d88-a814-5d61-8f7d-ad8ea1a799f4</xr:TypeId>
+				<xr:ValueId>52a51926-9547-51bf-b08c-f2b9ab9a0b6e</xr:ValueId>
+			</xr:GeneratedType>
+			<xr:GeneratedType name="CatalogManager.BA252Partners" category="Manager">
+				<xr:TypeId>9bea8106-4af0-538e-84e6-3a06d428da64</xr:TypeId>
+				<xr:ValueId>d90486d4-7e13-59f3-810a-c2876c7e76e7</xr:ValueId>
+			</xr:GeneratedType>
+		</InternalInfo>
+		<Properties>
+			<ObjectBelonging>Adopted</ObjectBelonging>
+			<Name>BA252Partners</Name>
+			<Comment/>
+			<ExtendedConfigurationObject>eab8225f-86c8-514a-bc84-923379c3c295</ExtendedConfigurationObject>
+		</Properties>
+		<ChildObjects/>
+	</Catalog>
+</MetaDataObject>
