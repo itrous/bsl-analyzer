@@ -18,6 +18,8 @@ pub mod lower;
 pub mod manager_lookup;
 mod map_keys;
 pub mod metadata_path;
+pub mod metadata_symbol;
+pub mod method_declarations;
 mod method_environment;
 pub mod method_graph;
 pub mod method_lookup;
@@ -69,11 +71,11 @@ pub use hir_def::ty::{
 pub use hir_def::type_ref::{BuiltinTypeRef, TypeRef};
 pub use hir_def::ConfigsDatabase;
 pub use infer::{
-    ArgCountVersionLimit, BareNameGap, BareNameOrigin, BareNameResolution, BareNameUse,
-    BodyInferenceResult, CallArgBinding, CandidateCallBinding, EnvCalleeKind, EnvMemberKind,
-    ImplicitDatabaseReadKind, ImplicitLocalAssignment, ImplicitLocalInfo, InferOwnerResult,
-    InferenceContext, InferenceDiagnostic, InferenceResult, ModuleCodeInferenceResult,
-    RefPresentationCause, UninitializedPath, UnresolvedMethodKind,
+    unshadowed_platform_global_calls, ArgCountVersionLimit, BareNameGap, BareNameOrigin,
+    BareNameResolution, BareNameUse, BodyInferenceResult, CallArgBinding, CandidateCallBinding,
+    EnvCalleeKind, EnvMemberKind, ImplicitDatabaseReadKind, ImplicitLocalAssignment,
+    ImplicitLocalInfo, InferOwnerResult, InferenceContext, InferenceDiagnostic, InferenceResult,
+    ModuleCodeInferenceResult, RefPresentationCause, UninitializedPath, UnresolvedMethodKind,
 };
 pub use lower::TyLoweringContext;
 pub use manager_lookup::{lookup_manager_field, ManagerMemberInfo};

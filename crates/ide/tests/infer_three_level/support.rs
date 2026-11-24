@@ -19,7 +19,7 @@ pub(super) fn setup(fixture_text: &str) -> (RootDatabaseImpl, FileId) {
     let test_file = fixture
         .files
         .iter()
-        .find(|(_, file)| file.path.as_path().to_string_lossy().ends_with("/test.bsl"))
+        .find(|(_, file)| file.path.as_path().ends_with("test.bsl"))
         .map(|(file_id, _)| *file_id)
         .expect("fixture must contain /test.bsl");
     let _ = db.module_bodies(ModuleId::new(test_file));
@@ -57,7 +57,7 @@ pub(super) fn setup_with_designer_config(
     db.set_all_config_paths(vec![(None, designer)], None);
     let target_file = mapped
         .iter()
-        .find(|(_, path)| path.as_path().to_string_lossy().ends_with(target_path))
+        .find(|(_, path)| path.as_path().ends_with(target_path.trim_start_matches('/')))
         .map(|(file_id, _)| *file_id)
         .unwrap_or_else(|| panic!("fixture must contain {target_path}"));
     let _ = db.module_bodies(ModuleId::new(target_file));

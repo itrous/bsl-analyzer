@@ -46,6 +46,18 @@ reporting: a block that only formats the error stays "silent".
 Proper recovery paths — re-raise, logging, or a combination — do not
 trigger the diagnostic.
 
+An observable result also counts as recovery: an error structure returned to
+the caller, an output counter of skipped items, a local counter returned after
+the loop, or accumulated errors used by a later escaping `Raise`. The analysis
+tracks a reachable value flow to a return, output parameter, or escaping
+exception. An assignment inside a catch alone does not suppress the warning.
+
+Overwrite, collection clearing, mutation through a known alias, and an unknown
+call with a by-reference argument invalidate the proof. Unreachable returns do
+not count. Supported formatter calls must resolve to a platform callable;
+a same-named application function does not prove propagation. Incomplete
+analysis or unproven value preservation keeps the diagnostic. Platform ownership also requires a complete global callable surface; an isolated file without a configuration index does not establish it.
+
 There is one configuration nuance:
 
 - `commentAsCode = true` changes the behavior so that a comment-only `Exception` block is not reported.

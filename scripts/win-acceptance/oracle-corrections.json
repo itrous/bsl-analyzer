@@ -1,0 +1,15 @@
+{
+ "_comment": "Expected outcomes that the prepared manifest got wrong. Each entry names the confirmed reason; the manifest itself stays unchanged.",
+ "windows-L-unknown-directive": {
+  "expected": {"status": "valid"},
+  "basis": "Platform 8.3.27.1989 in compatibility Version8_2_16 accepts the unknown annotation in all six contexts (native verdict, confirmed in unknown-annotation-oracle-correction.json). M (Version8_3_27) stays invalid."
+ },
+ "windows-L-snippet-wrapper-escape": {
+  "expected": {"status": "context_required", "failure_code": "context_required", "backend": "caller/1"},
+  "basis": "crates/mcp-server/src/tools/check_executor.rs refuses a snippet with module declarations before any executor starts (snippet-wrapper-escape-oracle-correction.json)."
+ },
+ "windows-M-snippet-wrapper-escape": {
+  "expected": {"status": "context_required", "failure_code": "context_required", "backend": "caller/1"},
+  "basis": "Same caller policy as L; it does not depend on the fixture (confirmed for linux-M in M-linux-wrapper-escape-oracle-correction.json)."
+ }
+}

@@ -70,6 +70,133 @@ where
     }
 }
 
+/// Why a variant cannot be resolved within the caller's metadata scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeResolutionIssueKind {
+    UnresolvedDefinedType,
+    ReferencedTypeUnavailable,
+    TechnicalNameUnavailable,
+    LimitExceeded,
+}
+
+/// An unresolved leaf in the flattened type description.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TypeResolutionIssue {
+    /// Zero-based position in the resolved composite, or zero for a scalar description.
+    pub variant_index: usize,
+    pub kind: TypeResolutionIssueKind,
+}
+
+/// Resolve declared variants through the supplied visibility scope, preserving qualifiers.
+/// Unavailable variants remain unknown; the caller chooses the expansion budget.
+pub fn resolve_type_description<R: QueryMetadataResolver + ?Sized>(
+    declared: &AttributeType,
+    resolver: &R,
+    max_nodes: usize,
+) -> (AttributeType, Vec<TypeResolutionIssue>) {
+    if max_nodes == 0 {
+        return (
+            AttributeType::Unknown,
+            vec![TypeResolutionIssue {
+                variant_index: 0,
+                kind: TypeResolutionIssueKind::LimitExceeded,
+            }],
+        );
+    }
+    enum Pending {
+        Type(AttributeType),
+        Leave(String),
+    }
+    let limit = max_nodes;
+    let mut admitted = 1usize;
+    let mut pending = vec![Pending::Type(declared.clone())];
+    let mut active = std::collections::HashSet::new();
+    let mut values = Vec::new();
+    let mut failures = Vec::new();
+    let mut truncated = false;
+    while let Some(next) = pending.pop() {
+        let ty = match next {
+            Pending::Type(ty) => ty,
+            Pending::Leave(name) => {
+                active.remove(&name);
+                continue;
+            }
+        };
+        match ty {
+            AttributeType::Composite { types } => {
+                let keep = types.len().min(limit.saturating_sub(admitted));
+                truncated |= keep < types.len();
+                admitted += keep;
+                pending.extend(types.into_iter().take(keep).rev().map(Pending::Type));
+            }
+            AttributeType::DefinedType { name } => {
+                let key = name.fold_lower();
+                if active.contains(&key) {
+                    failures.push((values.len(), TypeResolutionIssueKind::UnresolvedDefinedType));
+                    values.push(AttributeType::Unknown);
+                    continue;
+                }
+                let Some(underlying) = resolver.resolve_defined_type(&name) else {
+                    failures.push((values.len(), TypeResolutionIssueKind::UnresolvedDefinedType));
+                    values.push(AttributeType::Unknown);
+                    continue;
+                };
+                if admitted >= limit {
+                    truncated = true;
+                    continue;
+                }
+                admitted += 1;
+                active.insert(key.clone());
+                pending.push(Pending::Leave(key));
+                pending.push(Pending::Type(underlying));
+            }
+            AttributeType::Ref { mdo_type, ref name } => {
+                if resolver.resolve_metadata_object(mdo_type, name).is_some()
+                    || resolver.resolve_register(mdo_type, name).is_some()
+                {
+                    values.push(ty);
+                } else {
+                    failures
+                        .push((values.len(), TypeResolutionIssueKind::ReferencedTypeUnavailable));
+                    values.push(AttributeType::Unknown);
+                }
+            }
+            AttributeType::InformationRegisterRecordManager { ref name } => {
+                if resolver.resolve_register(MdoType::InformationRegister, name).is_some() {
+                    values.push(ty);
+                } else {
+                    failures
+                        .push((values.len(), TypeResolutionIssueKind::ReferencedTypeUnavailable));
+                    values.push(AttributeType::Unknown);
+                }
+            }
+            AttributeType::Unknown | AttributeType::UnknownNamed(_) => {
+                failures.push((values.len(), TypeResolutionIssueKind::TechnicalNameUnavailable));
+                values.push(AttributeType::Unknown);
+            }
+            _ => values.push(ty),
+        }
+    }
+    if truncated {
+        failures.push((values.len(), TypeResolutionIssueKind::LimitExceeded));
+        values.push(AttributeType::Unknown);
+    }
+    if values.is_empty() {
+        failures.push((0, TypeResolutionIssueKind::TechnicalNameUnavailable));
+        values.push(AttributeType::Unknown);
+    }
+    let issues = failures
+        .into_iter()
+        .map(|(variant_index, kind)| TypeResolutionIssue { variant_index, kind })
+        .collect();
+    let resolved = if values.len() > 1 {
+        AttributeType::Composite { types: values }
+    } else {
+        values.pop().unwrap()
+    };
+    (resolved, issues)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +276,59 @@ mod tests {
         let underlying = resolve_defined_type_terminal(&cfg, "денежнаясумма", &mut visited)
             .expect("case-insensitive lookup");
         assert_eq!(underlying, AttributeType::Boolean);
+    }
+    #[test]
+    fn type_description_resolution_preserves_nested_aliases_and_reports_cycle_reference_and_limit()
+    {
+        let cfg = cfg_with(vec![
+            dt(
+                "A",
+                AttributeType::Composite {
+                    types: vec![
+                        AttributeType::DefinedType { name: "B".into() },
+                        AttributeType::DefinedType { name: "Loop".into() },
+                        AttributeType::Ref { mdo_type: MdoType::Catalog, name: "Missing".into() },
+                    ],
+                },
+            ),
+            dt("B", AttributeType::Number { precision: 9, scale: 2 }),
+            dt("Loop", AttributeType::DefinedType { name: "LOOP".into() }),
+        ]);
+        let declared = AttributeType::DefinedType { name: "A".into() };
+        let (resolved, issues) = resolve_type_description(&declared, &cfg, 64);
+        assert_eq!(
+            resolved,
+            AttributeType::Composite {
+                types: vec![
+                    AttributeType::Number { precision: 9, scale: 2 },
+                    AttributeType::Unknown,
+                    AttributeType::Unknown
+                ]
+            }
+        );
+        assert_eq!(
+            issues,
+            vec![
+                TypeResolutionIssue {
+                    variant_index: 1,
+                    kind: TypeResolutionIssueKind::UnresolvedDefinedType
+                },
+                TypeResolutionIssue {
+                    variant_index: 2,
+                    kind: TypeResolutionIssueKind::ReferencedTypeUnavailable
+                }
+            ]
+        );
+        for limit in [0, 1] {
+            let (resolved, issues) = resolve_type_description(&declared, &cfg, limit);
+            assert_eq!(resolved, AttributeType::Unknown);
+            assert_eq!(
+                issues,
+                vec![TypeResolutionIssue {
+                    variant_index: 0,
+                    kind: TypeResolutionIssueKind::LimitExceeded
+                }]
+            );
+        }
     }
 }

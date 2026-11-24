@@ -304,7 +304,7 @@ impl Owner {
         let mut invalidations = 0u32;
         let mut next_allowed = self.now();
         let mut seen_epoch = 0u64;
-        let mut held: Option<bsl_search::PreparedPointBatch> = None;
+        let mut held: Option<(bsl_search::PreparedPointBatch, u64)> = None;
         let mut progressed = false;
         // Read where the owner decides to leave, not where it says so: a stop landing after a
         // terminal lease has already sent the owner away renames an exit it had no part in.
@@ -484,7 +484,11 @@ impl Owner {
     }
 
     /// One batch: capture and prepare it if none is held, then publish it.
-    fn round(&self, held: &mut Option<bsl_search::PreparedPointBatch>) -> Round {
+    fn round(&self, held: &mut Option<(bsl_search::PreparedPointBatch, u64)>) -> Round {
+        let Ok(disk_read) = self.engine.disk_gate.try_read() else { return Round::Refused };
+        if held.as_ref().is_some_and(|(_, epoch)| *epoch != disk_read.epoch()) {
+            *held = None;
+        }
         if held.is_none() {
             let capture = {
                 let guard = match self.engine.acquire_for_owner(&self.stop) {
@@ -515,21 +519,19 @@ impl Owner {
             };
             let cancelled = || self.must_leave();
             match capture.prepare(&reader, &cancelled) {
-                Ok(batch) => *held = Some(batch),
+                Ok(batch) => *held = Some((batch, disk_read.epoch())),
                 Err(error) => {
                     tracing::warn!("overlay backlog preparation failed: {error}");
                     return Round::Failed;
                 }
             }
             #[cfg(test)]
-            self.handle
-                .probe
-                .prepared(held.as_ref().map_or(0, bsl_search::PreparedPointBatch::len));
+            self.handle.probe.prepared(held.as_ref().map_or(0, |(batch, _)| batch.len()));
             if self.must_leave() {
                 return Round::Terminal;
             }
         }
-        let Some(batch) = held.as_mut() else { return Round::Idle };
+        let Some((batch, _)) = held.as_mut() else { return Round::Idle };
         #[cfg(test)]
         self.handle.probe.publishing();
         let outcome =

@@ -17,7 +17,7 @@ use vfs::FileId;
 
 use crate::call_resolution::CallCandidateSet;
 use crate::db::HirDatabase;
-use crate::lower::type_string::{lower_param_type_string_typeid, lower_return_type_string_typeid};
+use crate::lower::type_string::lower_return_type_string_typeid;
 use crate::platform_type_name::{
     is_form_data_collection_item_type_name, is_row_like_platform_type_name,
 };
@@ -622,27 +622,6 @@ pub(crate) fn to_method_info(db: &dyn TypeKernelDb, method: &PlatformMethod) -> 
         candidates,
         env: EnvFlags::from_platform_context(method.context.as_ref()),
     }
-}
-
-pub(crate) fn lower_overloads_typeid(
-    db: &dyn TypeKernelDb,
-    method: &PlatformMethod,
-) -> Vec<Vec<TypeId>> {
-    method
-        .variants
-        .iter()
-        .map(|v| {
-            v.parameters
-                .iter()
-                .map(|p| {
-                    p.param_type
-                        .as_ref()
-                        .map(|t| lower_param_type_string_typeid(db, t))
-                        .unwrap_or(db.unknown())
-                })
-                .collect()
-        })
-        .collect()
 }
 
 pub(crate) fn build_tabular_section_method_info(

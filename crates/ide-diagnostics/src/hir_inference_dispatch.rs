@@ -115,7 +115,8 @@ fn diagnostic_expr(diag: &InferenceDiagnostic) -> ExprId {
         InferenceDiagnostic::UnresolvedMethodCall { expr, .. } => *expr,
         InferenceDiagnostic::UnresolvedBareCall { expr, .. } => *expr,
         InferenceDiagnostic::MismatchedArgCount { call_expr, .. } => *call_expr,
-        InferenceDiagnostic::TypeMismatch { expr, .. } => *expr,
+        InferenceDiagnostic::TypeMismatch { expr, .. }
+        | InferenceDiagnostic::PropertyAssignmentTypeMismatch { expr, .. } => *expr,
         InferenceDiagnostic::UnresolvedField { expr, .. } => *expr,
         InferenceDiagnostic::UnresolvedMetadataPath { expr, .. } => *expr,
         InferenceDiagnostic::ReadOnlyPropertyAssignment { lhs, .. } => *lhs,
@@ -191,6 +192,9 @@ fn dispatch_inference_diagnostic(
                     handlers::possibly_undefined_value::from_hir(*expected, *actual, range, ctx)
                 })
             }
+        }
+        InferenceDiagnostic::PropertyAssignmentTypeMismatch { expected, actual, .. } => {
+            handlers::type_mismatch::from_property_assignment_hir(*expected, *actual, range, ctx)
         }
         InferenceDiagnostic::UnresolvedField { receiver_ty, field_name, .. } => {
             handlers::unresolved_field::from_hir(*receiver_ty, field_name, range, ctx)

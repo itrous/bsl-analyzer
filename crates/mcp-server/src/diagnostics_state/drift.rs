@@ -37,6 +37,7 @@ pub(super) fn clamp_reconcile_interval(secs: Option<u64>) -> Duration {
 }
 
 pub(super) struct ScanCache {
+    pub(super) dependency_fingerprint: Option<[u8; 32]>,
     pub(super) at: Instant,
     pub(super) stats: Vec<FileStat>,
     pub(super) config_fp: u64,
@@ -53,6 +54,7 @@ impl DiagnosticsState {
     /// The event kind is re-derived by the hub from current disk state; callers cannot tell
     /// the owner that a path was deleted merely by naming a watched-file event type.
     pub(crate) fn notify_changed_path(&self, requested: &Path) -> bool {
+        let Ok(_disk_read) = self.disk_gate.try_read() else { return false };
         let frozen = self.freeze_if_invalid_or_frozen();
         self.mark_in_use();
         let Some(root) = self.workspace_root.as_deref() else { return false };
@@ -67,7 +69,11 @@ impl DiagnosticsState {
                 return false;
             }
             let project = resident.project();
-            let in_source_root = resident.workspace_roots().root_of(&path, &canonical).is_some();
+            let in_source_root = resident.workspace_roots().root_of(&path, &canonical).is_some()
+                || project
+                    .semantic_dependency_roots()
+                    .iter()
+                    .any(|root| path.starts_with(root) || canonical.starts_with(root));
             let project_input = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -108,6 +114,8 @@ impl DiagnosticsState {
         requested: &Path,
     ) -> crate::workspace_handle::WorkspaceRead<ide_host_core::WorkspaceSnapshot> {
         use crate::workspace_handle::WorkspaceRead;
+
+        let Ok(_disk_read) = self.disk_gate.try_read() else { return WorkspaceRead::Busy };
 
         if self.freeze_if_invalid_or_frozen() {
             return WorkspaceRead::Failed(super::lifecycle::LAST_GOOD_INVALID_PROJECT.to_owned());
@@ -407,6 +415,7 @@ impl DiagnosticsState {
     }
 
     pub(super) fn poll_drift(&self) {
+        let Ok(_disk_read) = self.disk_gate.try_read() else { return };
         if self.freeze_if_invalid_or_frozen() {
             return;
         }
@@ -822,6 +831,20 @@ impl DiagnosticsState {
 
     pub(super) fn apply_drained_entries(&self, entries: &[ChangeEntry]) {
         if self.freeze_if_invalid_or_frozen() {
+            return;
+        }
+        let dependency_changed = {
+            let inner = lock_inner(&self.inner);
+            inner.resident.as_ref().is_some_and(|resident| {
+                resident.project().semantic_dependency_roots().iter().any(|root| {
+                    entries.iter().any(|entry| {
+                        entry.raw.starts_with(root) || entry.canonical.starts_with(root)
+                    })
+                })
+            })
+        };
+        if dependency_changed {
+            self.kick_full_reload();
             return;
         }
         let baseline: HashMap<String, u64> = lock_inner(&self.inner).stats.clone();
@@ -1366,6 +1389,7 @@ impl DiagnosticsState {
     }
 
     pub(super) fn reconcile_tick(&self) {
+        let Ok(_disk_read) = self.disk_gate.try_read() else { return };
         let Some(root) = self.workspace_root.clone() else {
             return;
         };
@@ -1492,10 +1516,12 @@ impl DiagnosticsState {
     }
 
     pub(super) fn throttled_scan(&self, root: &Path) -> Option<OwnedScan> {
+        let _disk_read = self.disk_gate.try_read().ok()?;
         let mut cache = lock_recover(&self.scan);
         if let Some(c) = cache.as_ref() {
             if c.at.elapsed() < self.drift_interval {
                 return Some(OwnedScan {
+                    dependency_fingerprint: c.dependency_fingerprint,
                     stats: c.stats.clone(),
                     config_fp: c.config_fp,
                     baseline_epoch: c.baseline_epoch,
@@ -1520,6 +1546,9 @@ impl DiagnosticsState {
         // another's topology and mask (or fabricate) drift.
         let config_files_fp = config_files_fingerprint(root);
         let project = crate::graph::input::ProjectSnapshot::load_excluding(root, &self.excluded);
+        let dependency_fingerprint = (!project.semantic_dependency_roots().is_empty())
+            .then(|| crate::graph::scan::semantic_dependency_fingerprint(&project))
+            .flatten();
         let (stats, verdict) = crate::graph::scan::scan_stats_over_project(&project);
         let config_fp = config_identity(config_files_fp, &project.configs);
         if armed_before_the_walk {
@@ -1529,13 +1558,14 @@ impl DiagnosticsState {
             self.hub_armed.store(true, Ordering::SeqCst);
         }
         *cache = Some(ScanCache {
+            dependency_fingerprint,
             at: Instant::now(),
             stats: stats.clone(),
             config_fp,
             baseline_epoch,
             verdict,
         });
-        Some(OwnedScan { stats, config_fp, baseline_epoch, verdict })
+        Some(OwnedScan { dependency_fingerprint, stats, config_fp, baseline_epoch, verdict })
     }
 }
 
@@ -1615,6 +1645,7 @@ fn has_undelivered_drift(changes: &WorkspaceDiff, delivered: &DeliveredPaths) ->
 }
 
 pub(super) struct OwnedScan {
+    pub(super) dependency_fingerprint: Option<[u8; 32]>,
     pub(super) stats: Vec<FileStat>,
     pub(super) config_fp: u64,
     pub(super) baseline_epoch: u64,
@@ -1630,7 +1661,14 @@ pub(super) struct OwnedScan {
 /// for the same reason: it is answered from the same snapshot, never re-sampled.
 fn scan_drift(inner: &Inner, scan: &OwnedScan) -> (WorkspaceDiff, bool) {
     let changes = classify_changes(&inner.stats, &scan.stats);
-    (drift_the_scan_may_assert(changes, scan.verdict), inner.config_fp != scan.config_fp)
+    let dependency_changed = inner
+        .resident
+        .as_ref()
+        .is_some_and(|resident| resident.dependency_fingerprint != scan.dependency_fingerprint);
+    (
+        drift_the_scan_may_assert(changes, scan.verdict),
+        inner.config_fp != scan.config_fp || dependency_changed,
+    )
 }
 
 /// Narrow a scan's drift to what its walk can actually vouch for.
@@ -2240,6 +2278,14 @@ mod tests {
             "the branch that KNOWS the file is a hole must say so: {}",
             findings.1.to_value(),
         );
+
+        let partial_generation = state.generation();
+        for _ in 0..5 {
+            state.poll_drift();
+            assert!(matches!(state.status(), DiagnosticsStatus::Ready { .. }));
+            assert!(!state.reload_running(), "the same unreadable body must not cause a reload");
+            assert_eq!(state.generation(), partial_generation);
+        }
 
         // Positive control: the same tree with a readable body answers the opposite.
         // The generation is sampled BEFORE the write — `generation()` polls a window
@@ -3536,6 +3582,7 @@ mod tests {
 
         // A fresh scan (just now) must NOT be force-cleared — the storm guard.
         *lock_recover(&state.scan) = Some(ScanCache {
+            dependency_fingerprint: None,
             at: Instant::now(),
             stats: Vec::new(),
             config_fp: 0,
@@ -3560,6 +3607,7 @@ mod tests {
             .checked_sub(FORCE_RESCAN_FLOOR + Duration::from_millis(50))
             .expect("a valid past instant");
         *lock_recover(&state.scan) = Some(ScanCache {
+            dependency_fingerprint: None,
             at: stale_at,
             stats: Vec::new(),
             config_fp: 0,
@@ -4539,6 +4587,7 @@ mod tests {
         // A walk that began before the move finishing after it: its snapshot is cached
         // carrying the older epoch.
         *lock_recover(&state.scan) = Some(ScanCache {
+            dependency_fingerprint: None,
             at: Instant::now(),
             stats: snapshot.stats.clone(),
             config_fp: snapshot.config_fp,
@@ -4654,6 +4703,7 @@ mod tests {
         // A walk that began before the move finishing after it: its snapshot is cached
         // carrying the older epoch, exactly as `throttled_scan` caches unconditionally.
         *lock_recover(&state.scan) = Some(ScanCache {
+            dependency_fingerprint: None,
             at: Instant::now(),
             stats: snapshot.stats.clone(),
             config_fp: snapshot.config_fp,
