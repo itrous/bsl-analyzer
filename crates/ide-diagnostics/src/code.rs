@@ -36,6 +36,8 @@ pub enum DiagnosticCode {
     BadWords,
     DuplicateStringLiteral,
     DuplicateRegion,
+    DuplicateInterception,
+    DuplicateMethodDeclaration,
     NonStandardRegion,
     DuplicatedInsertionIntoCollection,
     ExcessiveAutoTestCheck,

@@ -1,0 +1,13 @@
+{
+ "domain": "win10",
+ "host_share": "/path/to/libvirt/shared/<domain>-share  (mounted in the guest as Z:)",
+ "guest_python": "C:\\...\\python.exe",
+ "registry": "C:\\...\\profiles-windows.json  (executor profiles L and M)",
+ "fixture_root": "C:\\...\\fixtures  (contains L\\ib and M\\ib)",
+ "sentinels": "C:\\...\\sentinels\\windows",
+ "vcvars": "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvarsall.bat",
+ "rustup_home": "C:\\...\\rustup",
+ "cargo_home": "C:\\...\\cargo-home",
+ "cargo_bin": "C:\\...\\cargo\\bin",
+ "toolchain": "1.98.0-x86_64-pc-windows-msvc"
+}

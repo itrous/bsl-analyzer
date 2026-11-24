@@ -1,0 +1,24 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<DataCompositionSchema xmlns="http://v8.1c.ru/8.1/data-composition-system/schema" xmlns:dcscom="http://v8.1c.ru/8.1/data-composition-system/common" xmlns:dcscor="http://v8.1c.ru/8.1/data-composition-system/core" xmlns:dcsset="http://v8.1c.ru/8.1/data-composition-system/settings" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:v8ui="http://v8.1c.ru/8.1/data/ui" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+	<dataSource>
+		<name>Local</name>
+		<dataSourceType>Local</dataSourceType>
+	</dataSource>
+	<dataSet xsi:type="DataSetQuery">
+		<name>Main</name>
+		<field xsi:type="DataSetFieldField">
+			<dataPath>StableCaption</dataPath>
+			<field>StableCaption</field>
+		</field>
+		<field xsi:type="DataSetFieldField">
+			<dataPath>Partner.Caption</dataPath>
+			<field>Partner.Caption</field>
+		</field>
+		<field xsi:type="DataSetFieldField">
+			<dataPath>Other.Caption</dataPath>
+			<field>Other.Caption</field>
+		</field>
+		<dataSource>Local</dataSource>
+		<query>SELECT P.Caption AS StableCaption, P.Ref AS Partner, O.Ref AS Other FROM Catalog.BA252Partners AS P INNER JOIN Catalog.BA252Other AS O ON FALSE</query>
+	</dataSet>
+</DataCompositionSchema>

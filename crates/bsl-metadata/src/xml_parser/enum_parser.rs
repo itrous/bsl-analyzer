@@ -36,6 +36,7 @@ pub fn parse_enum_xml(xml: &str) -> Result<MetadataObject> {
     }
 
     let mut mdo_obj = MetadataObject::new(MdoType::Enum, name);
+    mdo_obj.read_properties = super::read_properties::parse_read_properties(mdo);
     if let Some(uuid_str) = mdo.attribute("uuid") {
         match parse_uuid(uuid_str, "Enum root") {
             Ok(uuid) => mdo_obj.set_uuid(uuid),

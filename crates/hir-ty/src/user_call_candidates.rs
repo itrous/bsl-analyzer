@@ -9,7 +9,7 @@ pub(crate) fn for_resolved_method(
     primary_method: MethodId,
     primary_return: TypeId,
 ) -> Result<CallCandidateSet, DuplicateCandidateId> {
-    let options = db.env_options();
+    let options = db.env_options_for_file(primary_method.module.file_id);
     let candidates: Vec<CallSignature> = db
         .interface_method(primary_method)
         .into_iter()

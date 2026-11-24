@@ -17,6 +17,8 @@ The current implementation checks these object types:
 
 For `InternetMailProfile`, the check can be disabled through configuration because the platform already has a default timeout value.
 
+For `WSProxy`, the timeout is the sixth argument. Omitted slots preserve argument positions; an Internet proxy in the fifth slot or a secure connection in the seventh does not supply a timeout. An omitted argument or `Undefined` does not set an explicit limit.
+
 ## Examples
 
 Incorrect:
