@@ -43,6 +43,7 @@
 			<InformationRegister>РегистрСведений1</InformationRegister>
 			<AccumulationRegister>РегистрНакопления1</AccumulationRegister>
 			<DataProcessor>ТестоваяОбработка</DataProcessor>
+			<DataProcessor>ОбработкаСКоллизиями</DataProcessor>
 			<Report>ТестовыйОтчёт</Report>
 			<Task>ТестоваяЗадача</Task>
 			<WebService>WebСервис1</WebService>

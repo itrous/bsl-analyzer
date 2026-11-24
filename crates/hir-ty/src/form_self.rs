@@ -56,6 +56,56 @@ pub(crate) fn managed_form_self_types(form: &Form) -> Vec<&'static str> {
     types
 }
 
+/// The catalog name of the ordinary (thick-client) form type, `Form` in English.
+const ORDINARY_FORM_TYPE_NAME: &str = "Форма";
+
+/// Every extension the platform can mix into an ORDINARY form. The form's kind
+/// (item, list, choice) lives in the unread `Form.bin` dialog, so the extension
+/// cannot be named and their union is the honest upper bound of what a form adds.
+const ORDINARY_FORM_EXTENSION_TYPE_NAMES: &[&str] = &[
+    "Расширение формы элемента справочника",
+    "Расширение формы списка справочника",
+    "Расширение формы списка перечисления",
+    "Расширение формы констант",
+    "Расширение формы обработки",
+    "Расширение формы документа",
+    "Расширение формы списка документов",
+    "Расширение формы журнала документов",
+    "Расширение формы записи регистра сведений",
+    "Расширение формы списка записей регистра сведений",
+    "Расширение формы набора записей регистра сведений",
+    "Расширение формы критерия отбора",
+    "Расширение формы списка записей регистра накопления",
+    "Расширение формы набора записей регистра накопления",
+    "Расширение формы отчета",
+    "Расширение формы элемента вида характеристик",
+    "Расширение формы списка видов характеристик",
+    "Расширение формы элемента плана счетов",
+    "Расширение формы списка плана счетов",
+    "Расширение формы списка записей регистра бухгалтерии",
+    "Расширение формы набора записей регистра бухгалтерии",
+    "Расширение формы вида расчета",
+    "Расширение формы списка видов расчета",
+    "Расширение формы списка записей регистра расчета",
+    "Расширение формы набора записей регистра расчета",
+    "Расширение формы узла",
+    "Расширение формы списка узлов",
+    "Расширение формы списка бизнес-процессов",
+    "Расширение формы объекта бизнес-процесс",
+    "Расширение формы задачи",
+    "Расширение формы списка задач",
+];
+
+/// The platform types whose methods an ordinary form module reaches without a
+/// receiver: the form itself plus the union of the extensions a form can carry.
+/// Controls, form attributes and the exports of the owner's object module are
+/// other surfaces and are not listed here.
+pub(crate) fn ordinary_form_self_types() -> Vec<&'static str> {
+    let mut types = vec![ORDINARY_FORM_TYPE_NAME];
+    types.extend_from_slice(ORDINARY_FORM_EXTENSION_TYPE_NAMES);
+    types
+}
+
 /// Scalars and the platform collections never carry a form extension; anything
 /// else may stand for an object the parser did not classify.
 fn main_attribute_type_is_opaque(attr_type: &AttributeType) -> bool {
@@ -193,6 +243,34 @@ mod tests {
             MANAGED_FORM_EXTENSION_TYPE_NAMES.iter().map(|name| name.to_string()).collect();
         listed.sort();
         assert_eq!(listed, catalog);
+    }
+
+    /// The ordinary-form list must stay equal to what the catalog carries: the form
+    /// type itself, and every `Расширение формы ...` that is not a managed
+    /// (`клиентского приложения`) or a form-item extension.
+    #[test]
+    fn the_ordinary_form_types_are_the_catalog_ones() {
+        let data = PlatformDataInner::instance();
+        let names: Vec<String> = data.all_types().iter().map(|ty| ty.name.to_string()).collect();
+        assert!(
+            names.iter().any(|name| name == ORDINARY_FORM_TYPE_NAME),
+            "the catalog has no ordinary form type {ORDINARY_FORM_TYPE_NAME:?}"
+        );
+        let mut catalog: Vec<String> = names
+            .into_iter()
+            .filter(|name| {
+                name.starts_with("Расширение формы ")
+                    && !name.contains("клиентского приложения")
+                    && !name.contains("тестируем")
+            })
+            .collect();
+        catalog.sort();
+        let mut listed: Vec<String> =
+            ORDINARY_FORM_EXTENSION_TYPE_NAMES.iter().map(|name| name.to_string()).collect();
+        listed.sort();
+        assert_eq!(listed, catalog);
+        assert!(data.get_method(ORDINARY_FORM_TYPE_NAME, "Закрыть").is_some());
+        assert_eq!(ordinary_form_self_types().len(), 1 + ORDINARY_FORM_EXTENSION_TYPE_NAMES.len());
     }
 
     #[test]
