@@ -179,12 +179,20 @@ mod tests {
     }
 
     #[test]
-    fn negative_standard_register_fields() {
-        // Information-register standard fields (ВидДвижения is accumulation-only
-        // and is intentionally absent here — see the positive test below).
+    fn positive_recorder_fields_on_independent_information_register() {
+        // This register explicitly declares Independent; recorder-only fields are absent.
         check_with_designer(
             "ВЫБРАТЬ Т.Период, Т.Регистратор, Т.Активность, Т.НомерСтроки, Т.МоментВремени ИЗ РегистрСведений.РегистрСведений1 КАК Т",
-            expect![[r#""#]],
+            expect![[r#"
+                UnknownFieldInQuery @ 3:41..3:52
+                  message: Поле "Регистратор" не найдено в таблице "РегистрСведений.РегистрСведений1" запроса
+                  severity: Blocker
+                UnknownFieldInQuery @ 3:56..3:66
+                  message: Поле "Активность" не найдено в таблице "РегистрСведений.РегистрСведений1" запроса
+                  severity: Blocker
+                UnknownFieldInQuery @ 3:70..3:81
+                  message: Поле "НомерСтроки" не найдено в таблице "РегистрСведений.РегистрСведений1" запроса
+                  severity: Blocker"#]],
         );
     }
 

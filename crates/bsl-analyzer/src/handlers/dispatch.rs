@@ -166,8 +166,16 @@ impl RequestDispatcher<'_> {
 
         tracing::debug!("Handling {} (id: {})", R::METHOD, req.id);
 
-        let snapshot = self.global_state.snapshot();
-        let result = f(snapshot, params);
+        let result = self
+            .global_state
+            .prepare_disk_read()
+            .and_then(|_read| self.global_state.snapshot())
+            .and_then(|snapshot| {
+                let read = snapshot.disk_read.clone();
+                let result = f(snapshot, params);
+                anyhow::ensure!(read.is_current(), "metadata workspace changed during request");
+                result
+            });
         let response = result_to_response::<R>(req.id, result);
 
         self.global_state.respond(response);
@@ -250,6 +258,17 @@ impl RequestDispatcher<'_> {
             LatencyExecutor::DedicatedThread => "dedicated thread",
         };
         tracing::debug!("Handling {} on {} (id: {})", R::METHOD, executor_name, req.id);
+        let disk_read = match self.global_state.prepare_disk_read() {
+            Ok(read) => read,
+            Err(error) => {
+                self.global_state.respond(Response::new_err(
+                    req.id,
+                    ErrorCode::ContentModified as i32,
+                    error.to_string(),
+                ));
+                return self;
+            }
+        };
 
         // While the workspace is still loading, analysis would run over a
         // half-loaded source root (wrong results), and its db clone is exactly
@@ -303,7 +322,7 @@ impl RequestDispatcher<'_> {
                     // No cancellation token is registered: a `$/cancelRequest` is read by
                     // this same loop, so it cannot arrive while the handler runs.
                     let (ctx, _token) =
-                        self.latency_context(self.global_state.analysis_host.analysis());
+                        self.latency_context(self.global_state.analysis_host.analysis(), disk_read);
                     let response = run_latency_handler::<R>(req.id, ctx, params, f);
                     self.global_state.respond(response);
                 }
@@ -389,7 +408,7 @@ impl RequestDispatcher<'_> {
             RequestAttemptKey { id: req.id.clone(), generation, attempt: 1 }
         };
 
-        let (ctx, token) = self.latency_context(analysis);
+        let (ctx, token) = self.latency_context(analysis, disk_read);
         if self.global_state.analysis_host.is_shared() {
             self.global_state.shared_request_stamps.insert(
                 req.id.clone(),
@@ -435,9 +454,11 @@ impl RequestDispatcher<'_> {
     fn latency_context(
         &self,
         analysis: ide::Analysis,
+        disk_read: ide_host_core::WorkspaceDiskRead,
     ) -> (LatencyRequestContext, salsa::CancellationToken) {
         let state = &*self.global_state;
         let token = analysis.database().cancellation_token();
+        disk_read.register_cancel(token.clone());
         let file_paths = if state.analysis_host.is_shared() {
             let bindings = state.open_file_uri_ids.iter().filter_map(|(uri, &file_id)| {
                 if !state.open_files.contains(&file_id) || !state.mem_docs.contains(uri) {
@@ -461,6 +482,7 @@ impl RequestDispatcher<'_> {
         let file_paths = file_paths.with_source_exclusions(Arc::clone(&state.source_exclusions));
         let ctx = LatencyRequestContext {
             analysis,
+            disk_read,
             workspace_root: state.workspace_root.clone(),
             project: state.project.clone(),
             diagnostics_baseline: Arc::clone(&state.diagnostics_baseline),
@@ -691,7 +713,15 @@ where
         #[cfg(test)]
         g1_wait_for_test_writer(&run_key, &ctx);
         let attached = || ctx.analysis.attached(|_| f(&ctx, params));
-        match salsa::Cancelled::catch(AssertUnwindSafe(attached)) {
+        let result = salsa::Cancelled::catch(AssertUnwindSafe(attached));
+        if !ctx.disk_read.is_current() {
+            return LatencyAttemptOutcome::Response(Response::new_err(
+                run_key.id,
+                ErrorCode::ContentModified as i32,
+                "metadata workspace changed during request".into(),
+            ));
+        }
+        match result {
             Ok(result) => {
                 LatencyAttemptOutcome::Response(result_to_response::<R>(run_key.id.clone(), result))
             }
@@ -770,6 +800,35 @@ mod tests {
     /// Bound of a wait for a task that a regression would never deliver; a hang watchdog,
     /// not a latency measure.
     const HANG_WATCHDOG: Duration = test_utils::wait::hang_guard(Duration::from_secs(60));
+
+    #[test]
+    fn disk_transaction_supersedes_a_reader_without_reporting_client_cancel() {
+        let (sender, _receiver) = unbounded();
+        let mut state = GlobalState::new(sender);
+        state.init_empty_source_root();
+        let (ctx, _token) = latency_ctx_with_token(&state);
+        let worker = std::thread::spawn(move || {
+            run_latency_attempt::<Shutdown>(
+                RequestAttemptKey { id: 98.into(), generation: 1, attempt: 1 },
+                ctx,
+                (),
+                |ctx, ()| {
+                    let deadline = std::time::Instant::now() + HANG_WATCHDOG;
+                    while !ctx.analysis.database().cancellation_token().is_cancelled() {
+                        assert!(std::time::Instant::now() < deadline);
+                        std::thread::yield_now();
+                    }
+                    Ok(())
+                },
+            )
+        });
+        let writer = state.workspace_disk_gate().begin_write(HANG_WATCHDOG, &|| false).unwrap();
+        let LatencyAttemptOutcome::Response(response) = worker.join().unwrap() else {
+            panic!("superseded reader must return a protocol response")
+        };
+        assert_eq!(response.error.unwrap().code, ErrorCode::ContentModified as i32);
+        writer.finish();
+    }
 
     fn response_task(task: Task) -> Response {
         match task {
@@ -1004,11 +1063,14 @@ mod tests {
     ) -> (crate::frozen_context::LatencyRequestContext, salsa::CancellationToken) {
         use salsa::Database as _;
 
+        let disk_read = state.try_disk_read().unwrap();
         let db = state.analysis_host.raw_database().clone();
         let token = db.cancellation_token();
+        disk_read.register_cancel(token.clone());
         let analysis = ide::Analysis::from_database(db);
         let ctx = crate::frozen_context::LatencyRequestContext {
             analysis,
+            disk_read,
             workspace_root: state.workspace_root.clone(),
             project: state.project.clone(),
             diagnostics_baseline: Arc::clone(&state.diagnostics_baseline),

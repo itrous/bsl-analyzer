@@ -7,14 +7,31 @@
 #![allow(dead_code)]
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
 pub const BROKEN: &str = "Процедура Тест(\n";
+
+/// Selects an explicitly qualified app only for callers that opt in to this helper.
+pub fn qualified_app() -> &'static Path {
+    static APP: OnceLock<PathBuf> = OnceLock::new();
+    APP.get_or_init(|| {
+        let Some(value) = std::env::var_os("BSL_ANALYZER_TEST_APP") else {
+            return PathBuf::from(env!("CARGO_BIN_EXE_bsl-analyzer-app"));
+        };
+        assert!(!value.is_empty(), "BSL_ANALYZER_TEST_APP must not be empty");
+        let path = PathBuf::from(value);
+        assert!(path.is_absolute(), "BSL_ANALYZER_TEST_APP must be absolute");
+        assert!(path.is_file(), "BSL_ANALYZER_TEST_APP must be an existing file");
+        path.canonicalize().expect("resolve BSL_ANALYZER_TEST_APP")
+    })
+    .as_path()
+}
 
 /// How much of an LSP child's stderr [`Lsp::stderr_text`] keeps: the most recent bytes.
 pub const STDERR_TAIL: usize = 64 * 1024;

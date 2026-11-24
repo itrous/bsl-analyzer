@@ -10,6 +10,8 @@ The current implementation is narrow and HIR-based:
 - matching is case-insensitive, because BSL identifiers are case-insensitive;
 - simple property self-assignments such as `Object.Field = Object.Field` are also reported.
 
+Unary operators are preserved during comparison: `Amount = -Amount` and `Row.Amount = -Row.Amount` compute a new value and are not reported as self-assignments.
+
 ## Examples
 
 ### Incorrect

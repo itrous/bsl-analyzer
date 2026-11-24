@@ -167,6 +167,18 @@ pub fn dispatch_simple(
     });
 }
 
+/// Join query packages to source positions by identity: a query without an AST has no package.
+pub(crate) fn sdbl_query_pairs<'a>(
+    packages: &'a [(hir::SdblExprId, std::sync::Arc<sdbl_hir::SdblPackage>)],
+    queries: &'a [(hir::SdblExprId, syntax::SdblQueryInfo)],
+) -> impl Iterator<Item = (&'a sdbl_hir::SdblPackage, &'a syntax::SdblQueryInfo)> {
+    let queries_by_id: rustc_hash::FxHashMap<_, _> =
+        queries.iter().map(|(id, query)| (*id, query)).collect();
+    packages.iter().filter_map(move |(id, package)| {
+        queries_by_id.get(id).map(|query| (package.as_ref(), *query))
+    })
+}
+
 pub fn collect_sdbl_via_dispatch(
     ctx: &DiagnosticsContext,
     code: DiagnosticCode,
@@ -183,9 +195,7 @@ pub fn collect_sdbl_via_dispatch(
 
     let mut diagnostics = Vec::new();
 
-    for ((_expr_id, sdbl_package), (_query_expr_id, query_info)) in
-        sdbl_hirs.iter().zip(sdbl_queries.iter())
-    {
+    for (sdbl_package, query_info) in sdbl_query_pairs(&sdbl_hirs, &sdbl_queries) {
         let mapper = SdblPositionMapper::from_query_info(query_info, &bsl_source, &line_starts);
 
         for hir_diag in sdbl_package.all_diagnostics() {
@@ -597,7 +607,36 @@ pub(crate) fn for_each_executed_query(
 
 #[cfg(test)]
 mod dialect_tests {
-    use super::sdbl_dialect_attested;
+    use super::{sdbl_dialect_attested, sdbl_query_pairs};
+
+    #[test]
+    fn query_packages_keep_their_positions_when_a_query_has_no_ast() {
+        let parse = parser::parse_sdbl_with_shared_cache("ВЫБРАТЬ 1");
+        let package = std::sync::Arc::new(sdbl_hir::lower_sdbl_to_hir_with_resolver(&parse, None));
+        let id =
+            |value: u32| hir::SdblExprId::from_module_code(hir::ExprId::from_raw(value.into()));
+        let info = |start: u32, text: &str, ast| {
+            syntax::SdblQueryInfo::new(
+                syntax::TextRange::new(start.into(), (start + 10).into()),
+                text.to_owned(),
+                ast,
+                vec![],
+                vec![],
+            )
+        };
+        let queries = vec![
+            (id(0), info(0u32, "unusable", None)),
+            (id(1), info(20u32, "first", Some(parse.clone()))),
+            (id(2), info(100u32, "second", Some(parse))),
+        ];
+        let packages = vec![(id(2), package.clone()), (id(1), package)];
+        let positions: Vec<_> = sdbl_query_pairs(&packages, &queries)
+            .map(|(_, query)| {
+                (query.query_text.as_str(), u32::from(query.bsl_literal_range.start()))
+            })
+            .collect();
+        assert_eq!(positions, [("second", 100), ("first", 20)]);
+    }
 
     #[test]
     fn a_cyrillic_keyword_attests() {

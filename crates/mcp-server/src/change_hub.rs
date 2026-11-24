@@ -1292,6 +1292,8 @@ impl Scope {
 }
 
 struct HubInner {
+    disk_gate: ide_host_core::WorkspaceDiskGate,
+    deferred_disk_epoch: AtomicU64,
     acc: Mutex<Accumulator>,
     /// Signalled when there is new work to drain, or setup has settled.
     wake: Condvar,
@@ -1371,6 +1373,16 @@ struct HubInner {
 }
 
 impl HubInner {
+    fn defer_disk_classification(&self) {
+        let epoch = self.disk_gate.epoch();
+        if self.deferred_disk_epoch.swap(epoch, Ordering::SeqCst) == epoch {
+            return;
+        }
+        if self.lock_acc().enter_rescan_for_listeners(DegradeReason::Rearmed) {
+            self.notify();
+        }
+    }
+
     /// Publish the armed targets' `(resolved-at-arm, recursive)` pairs for cheap
     /// comparisons by [`WorkspaceChangeHub::ensure_roots`]. Targets whose
     /// `watch()` failed are not included, so a retry re-arms them.
@@ -1454,6 +1466,10 @@ impl HubInner {
     /// never held across filesystem I/O: every path is stat'd (and new subtrees
     /// walked) before the lock is taken.
     fn ingest_event(&self, res: Result<Event, notify::Error>) -> Vec<PathBuf> {
+        let Ok(_disk_read) = self.disk_gate.try_read() else {
+            self.defer_disk_classification();
+            return Vec::new();
+        };
         let event = match res {
             Ok(event) => event,
             Err(error) => {
@@ -1960,6 +1976,17 @@ impl Drop for HubThread {
 }
 
 impl WorkspaceChangeHub {
+    pub(crate) fn disk_gate(&self) -> ide_host_core::WorkspaceDiskGate {
+        self.inner.disk_gate.clone()
+    }
+
+    pub(crate) fn reconcile_after_disk_transaction(&self) {
+        // A pre-write reader may have settled the paused hints before source mutations began.
+        if self.inner.lock_acc().enter_rescan_for_listeners(DegradeReason::Rearmed) {
+            self.inner.notify();
+        }
+    }
+
     /// The control channel. One sender for the whole hub, owned by the thread's own record:
     /// a second copy on the handle would be a second thing to keep in step with it.
     fn control(&self) -> &std::sync::mpsc::SyncSender<HubMsg> {
@@ -1970,6 +1997,10 @@ impl WorkspaceChangeHub {
     /// events. The synthetic event kind is intentionally generic: `ingest_event` re-stats
     /// the path and derives changed/removed from current filesystem state.
     pub(crate) fn notify_path_changed(&self, path: &Path) -> bool {
+        let Ok(_disk_read) = self.inner.disk_gate.try_read() else {
+            self.inner.defer_disk_classification();
+            return true;
+        };
         if !self.inner.scope().may_record(path) {
             return false;
         }
@@ -2409,6 +2440,8 @@ impl HubInner {
         #[cfg(test)] blind_poll_seam: BlindPollSeam,
     ) -> Arc<Self> {
         Arc::new(HubInner {
+            disk_gate: Default::default(),
+            deferred_disk_epoch: AtomicU64::new(u64::MAX),
             acc: Mutex::new(Accumulator::new(cap)),
             wake: Condvar::new(),
             notifications: AtomicU64::new(0),
@@ -2592,6 +2625,7 @@ impl WorkspaceChangeHub {
         user_excluded: &ExcludedPaths,
         epoch: u64,
     ) -> bool {
+        let Ok(_disk_read) = self.inner.disk_gate.try_read() else { return false };
         #[cfg(test)]
         if self.inner.manual {
             return self.ensure_manual_scope(targets, user_excluded);
@@ -4115,7 +4149,6 @@ impl StopFlag {
         self.wake.notify_all();
     }
 
-    #[cfg(test)]
     fn is_raised(&self) -> bool {
         *self.raised.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -4360,6 +4393,7 @@ impl BlindPoll {
     /// Poll `targets` from now on. Roots joining the set are mapped here, on the calling
     /// (hub) thread; roots leaving it take their files with them.
     fn retarget(inner: &Arc<HubInner>, targets: Vec<WatchTarget>) {
+        let Ok(_disk_read) = inner.disk_gate.try_read() else { return };
         let scope = inner.scope();
         {
             let mut state = inner.blind_poll.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -4480,6 +4514,7 @@ impl BlindPoll {
     ) {
         while !stop.wait(period) {
             let Some(inner) = inner.upgrade() else { return };
+            let Ok(_disk_read) = inner.disk_gate.try_read() else { continue };
             let (targets, epoch) = {
                 let state = inner.blind_poll.state.lock().unwrap_or_else(PoisonError::into_inner);
                 (state.targets.clone(), state.epoch)
@@ -4567,6 +4602,11 @@ fn run_polling(
     mut declared: Vec<WatchTarget>,
     rx: &std::sync::mpsc::Receiver<HubMsg>,
 ) {
+    let Some(setup_read) =
+        inner.disk_gate.read_until_cancelled(&|| inner.blind_poll.stop.is_raised())
+    else {
+        return;
+    };
     // Raised by the fallback's callers too: `mark_polling_setup_failed` raises it BEFORE the
     // failure is announced, so a waiter that sees `Failed` never reads "no watch and no poll"
     // in the instant between the two. Idempotent, and kept here for any future direct caller.
@@ -4577,6 +4617,10 @@ fn run_polling(
     inner.expect_poll_from(Some(Instant::now()));
     let mut poller = Poller::default();
     let map = |poller: &mut Poller, declared: &[WatchTarget], reason: DegradeReason| {
+        let Ok(_disk_read) = inner.disk_gate.try_read() else {
+            inner.defer_disk_classification();
+            return;
+        };
         poller.poll(declared, &inner.scope(), inner.poll.verify_bytes, true);
         inner.note_poll(poller);
         inner.lock_acc().enter_rescan_for_listeners(reason);
@@ -4588,6 +4632,7 @@ fn run_polling(
     // startup, so anything a message carries is newer than it.
     let mut applied_epoch: u64 = 0;
     let mut due = Instant::now() + inner.poll.period;
+    drop(setup_read);
     loop {
         let now = Instant::now();
         if now >= due {
@@ -4600,6 +4645,10 @@ fn run_polling(
                 return;
             }
             Ok(HubMsg::Rearm { targets, epoch, ack }) => {
+                let Ok(_disk_read) = inner.disk_gate.try_read() else {
+                    let _ = ack.try_send(false);
+                    continue;
+                };
                 if epoch < applied_epoch {
                     tracing::info!(
                         epoch,
@@ -4625,6 +4674,10 @@ fn run_polling(
                 let _ = ack.try_send(false);
             }
             Ok(HubMsg::Rescope { user_excluded, epoch, ack }) => {
+                let Ok(_disk_read) = inner.disk_gate.try_read() else {
+                    let _ = ack.try_send(false);
+                    continue;
+                };
                 if epoch < applied_epoch {
                     tracing::info!(
                         epoch,
@@ -4660,6 +4713,10 @@ fn repoint_polling(inner: &HubInner, resolved: ResolvedTargets) -> Vec<WatchTarg
 }
 
 fn poll_once(inner: &HubInner, poller: &mut Poller, declared: &[WatchTarget]) {
+    let Ok(_disk_read) = inner.disk_gate.try_read() else {
+        inner.defer_disk_classification();
+        return;
+    };
     let records = poller.poll(declared, &inner.scope(), inner.poll.verify_bytes, false);
     if !records.is_empty() {
         let mut acc = inner.lock_acc();
@@ -4683,6 +4740,11 @@ fn run_hub_thread(
     before_arm: Option<BeforeArm>,
     watch_refusal: Option<WatchRefusal>,
 ) {
+    let Some(setup_read) =
+        inner.disk_gate.read_until_cancelled(&|| inner.blind_poll.stop.is_raised())
+    else {
+        return;
+    };
     let callback_inner = Arc::clone(&inner);
     let watcher = RecommendedWatcher::new(
         move |res| {
@@ -4702,6 +4764,7 @@ fn run_hub_thread(
             let targets = ResolvedTargets::here(targets);
             inner.set_scope(inner.scope_from(&targets));
             inner.mark_polling_setup_failed();
+            drop(setup_read);
             run_polling(&inner, targets.into_inner(), &rx);
             return;
         }
@@ -4760,6 +4823,7 @@ fn run_hub_thread(
     if armed.is_empty() {
         drop(watcher);
         inner.mark_polling_setup_failed();
+        drop(setup_read);
         run_polling(&inner, declared, &rx);
         return;
     }
@@ -4780,6 +4844,7 @@ fn run_hub_thread(
     // The age of the stand this thread holds: the set it started on is the world as of
     // startup, so anything a message carries is newer than it.
     let mut applied_epoch: u64 = 0;
+    drop(setup_read);
     loop {
         inner.drain_channel_overflow();
         let now = Instant::now();
@@ -4795,6 +4860,10 @@ fn run_hub_thread(
         };
         match msg {
             HubMsg::Event(res) => {
+                let Ok(_disk_read) = inner.disk_gate.try_read() else {
+                    inner.defer_disk_classification();
+                    continue;
+                };
                 for dir in inner.ingest_event(res) {
                     // Placed first, so the directory is resolved ONCE and by the one rule:
                     // three decisions turn on where it lies, and they must not answer
@@ -4888,6 +4957,10 @@ fn run_hub_thread(
                 }
             }
             HubMsg::Rescope { user_excluded, epoch, ack } => {
+                let Ok(_disk_read) = inner.disk_gate.try_read() else {
+                    let _ = ack.try_send(false);
+                    continue;
+                };
                 if epoch < applied_epoch {
                     tracing::info!(
                         epoch,
@@ -4909,6 +4982,10 @@ fn run_hub_thread(
                 let _ = ack.try_send(covered);
             }
             HubMsg::Rearm { targets, epoch, ack } => {
+                let Ok(_disk_read) = inner.disk_gate.try_read() else {
+                    let _ = ack.try_send(false);
+                    continue;
+                };
                 if epoch < applied_epoch {
                     // A slow build finishing after a newer one: its composition is older
                     // than the one in force, and applying it would roll the hub back onto
@@ -4968,6 +5045,7 @@ fn coverage_tick(
     declared: &[WatchTarget],
     snapshot: &mut Snapshot,
 ) {
+    let Ok(_disk_read) = inner.disk_gate.try_read() else { return };
     // First, before a single arm in this tick: a watch dropped after one would take, on
     // inotify, the registrations that arm had just placed beneath it. Counted as movement,
     // so the re-arm below pays for the window the unwatch cost and puts back whatever it
@@ -6091,6 +6169,45 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn disk_transaction_coalesces_hints_without_classifying_intermediate_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("Module.bsl");
+        std::fs::write(&path, "before").unwrap();
+        let hub = WorkspaceChangeHub::start_manual(
+            vec![WatchTarget::recursive(directory.path().to_path_buf())],
+            Vec::new(),
+            ExcludedPaths::default(),
+        );
+        let cursor = hub.subscribe();
+        let gate = hub.disk_gate();
+        let mut writer = gate.begin_write(Duration::from_secs(1), &|| false).unwrap();
+        writer.mark_writing();
+        std::fs::remove_file(&path).unwrap();
+        hub.inner
+            .ingest_event(Ok(Event::new(EventKind::Remove(notify::event::RemoveKind::File))
+                .add_path(path.clone())));
+        let generation = hub.generation();
+        for _ in 0..3 {
+            assert!(hub.notify_path_changed(&path));
+        }
+        assert_eq!(hub.generation(), generation);
+        let pending = hub.materialize(cursor);
+        assert!(pending.rescan_required);
+        assert!(pending.entries.is_empty(), "an intermediate removal must not be classified");
+        std::fs::write(&path, "terminal").unwrap();
+        writer.finish();
+        hub.inner.ingest_event(Ok(
+            Event::new(EventKind::Modify(notify::event::ModifyKind::Any)).add_path(path)
+        ));
+        assert!(hub
+            .materialize(cursor)
+            .entries
+            .iter()
+            .all(|entry| entry.kind == ChangeKind::MaybeChanged));
+        hub.unsubscribe(cursor);
+    }
+
     #[test]
     fn poll_telemetry_is_bounded_and_matches_the_owner_sample() {
         let hub = WorkspaceChangeHub::start(vec![]);

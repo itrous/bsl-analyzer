@@ -125,6 +125,7 @@ fn main() {
     fs::write(&dest_path, generated).unwrap();
 
     println!("cargo:rerun-if-changed=docs/");
+    println!("cargo:rerun-if-changed=src/code.rs");
     println!("cargo:rerun-if-changed=build.rs");
 }
 

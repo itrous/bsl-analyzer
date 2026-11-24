@@ -1,0 +1,18 @@
+{
+  "producer": "1C:Enterprise 8.3.27.2130",
+  "representation": "SpreadsheetDocument XDTO XML, new in-memory object",
+  "source_sha256": "ddf58e481284597afd3dc3b4e3f5098d2e09975837203449ac196e00306849e1",
+  "probe_sha256": "db3586542a359be107b88f93615017b41df21adf5c76ed7dc97004eb2524e21b",
+  "execution_receipt": ".artifacts/resolve-outstanding-implementation-20261107/content-card-followup/spreadsheet-native-receipt.json",
+  "roundtrip": {
+    "Header": "R1:R2",
+    "Title": "R1C4",
+    "template": "R1C5 [Partner]: [Amount]"
+  },
+  "database_data_configuration_writes": false,
+  "server_filesystem_writes": false,
+  "limits": [
+    "in-memory XDTO export, not Designer-exported MXL",
+    "no MXL binary decoding claim"
+  ]
+}

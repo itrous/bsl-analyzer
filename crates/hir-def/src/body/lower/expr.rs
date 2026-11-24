@@ -4,7 +4,7 @@ use stdx::case::CaseExt;
 use syntax::ast_utils::{
     active_children, active_children_with_tokens, field_tail_name_token, significant_tokens,
 };
-use syntax::{SyntaxKind, SyntaxNode, SyntaxToken, TextSize};
+use syntax::{SyntaxKind, SyntaxNode, SyntaxToken, TextRange, TextSize};
 
 use crate::body::{
     Body, BodyDiagnostic, ExternalRef, MagicNumberContext, ManagerType, RedundantAccessKind,
@@ -22,13 +22,27 @@ fn field_name_token(node: &SyntaxNode) -> Option<SyntaxToken> {
 }
 
 pub(crate) fn lower_expr_node(ctx: &mut LoweringCtx, node: &SyntaxNode) -> ExprIdx {
-    let actual_node = if node.kind() == SyntaxKind::EXPR {
-        active_children(node).next().unwrap_or_else(|| node.clone())
-    } else {
-        node.clone()
-    };
+    if node.kind() != SyntaxKind::EXPR {
+        return lower_expr(ctx, node);
+    }
+    let Some(actual_node) = active_children(node).next() else { return ctx.missing_expr() };
+    let mut expr = lower_expr(ctx, &actual_node);
+    // Numeric literals already fold the signs of their enclosing wrappers.
+    if matches!(ctx.body.expr_idx(expr), Expr::Literal(Literal::Number(_))) {
+        return expr;
+    }
+    let signs: Vec<_> = node
+        .children_with_tokens()
+        .filter_map(|element| element.into_token())
+        .filter(|token| matches!(token.kind(), SyntaxKind::MINUS | SyntaxKind::PLUS))
+        .collect();
+    for sign in signs.into_iter().rev() {
+        let op = if sign.kind() == SyntaxKind::MINUS { UnaryOp::Neg } else { UnaryOp::Plus };
+        let range = TextRange::new(sign.text_range().start(), node.text_range().end());
+        expr = ctx.alloc_expr(Expr::UnaryOp { expr, op }, range);
+    }
 
-    lower_expr(ctx, &actual_node)
+    expr
 }
 
 fn lower_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> ExprIdx {
@@ -72,10 +86,7 @@ fn lower_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> ExprIdx {
             Expr::Path(Name::new(&text))
         }
         SyntaxKind::EXPR => {
-            return active_children(node)
-                .next()
-                .map(|n| lower_expr(ctx, &n))
-                .unwrap_or_else(|| ctx.missing_expr());
+            return lower_expr_node(ctx, node);
         }
         _ => {
             if let Some(ident) = node

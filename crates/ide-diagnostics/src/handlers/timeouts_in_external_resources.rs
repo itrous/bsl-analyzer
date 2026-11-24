@@ -69,7 +69,7 @@ impl ResourceType {
             Self::FTPConnection => 6,
             Self::HTTPConnection => 5,
             Self::WSDefinitions => 4,
-            Self::WSProxy => 4,
+            Self::WSProxy => 5,
             Self::InternetMailProfile => 5,
         }
     }
@@ -179,23 +179,7 @@ fn has_timeout_in_constructor(
         return false;
     }
 
-    let timeout_arg = body.expr_idx(args[timeout_pos]);
-
-    match timeout_arg {
-        Expr::Literal(Literal::Undefined) => {
-            if args.len() > timeout_pos + 1 {
-                for &arg_idx in args.iter().skip(timeout_pos + 1) {
-                    let arg = body.expr_idx(arg_idx);
-                    if !matches!(arg, Expr::Literal(Literal::Undefined) | Expr::Missing) {
-                        return true;
-                    }
-                }
-            }
-            false
-        }
-        Expr::Missing => false,
-        _ => true,
-    }
+    !matches!(body.expr_idx(args[timeout_pos]), Expr::Literal(Literal::Undefined) | Expr::Missing)
 }
 
 fn find_timeout_assignments(body: &hir::Body) -> FxHashMap<Name, ()> {
@@ -244,9 +228,26 @@ fn create_diagnostic(
 
 #[cfg(test)]
 mod tests {
-    use crate::test_utils::check_diagnostics_snapshot_for;
+    use crate::test_utils::{check_diagnostics_for, check_diagnostics_snapshot_for};
     use crate::DiagnosticCode;
     use expect_test::expect;
+
+    #[test]
+    fn wsproxy_timeout_uses_only_the_sixth_slot() {
+        let code = include_str!("fixtures/wsproxy_timeout_slots.bsl");
+        let diagnostics = check_diagnostics_for(code, DiagnosticCode::TimeoutsInExternalResources);
+        let lines: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| {
+                code[..usize::from(diagnostic.range.start())]
+                    .bytes()
+                    .filter(|&b| b == b'\n')
+                    .count()
+                    + 1
+            })
+            .collect();
+        assert_eq!(lines, [4, 5, 6]);
+    }
     #[test]
     fn test_comprehensive() {
         let code = r#"

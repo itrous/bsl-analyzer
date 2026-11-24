@@ -13,10 +13,8 @@
 //! needs a different file name), so any valid version is read. What the reader will
 //! not do is guess: an invalid version, an unparsable file, or one older than
 //! `Form.bin` is left unread, and the form falls back to what its descriptor alone
-//! says (see [`Form::ordinary_without_dialog`]). Freshness is judged by modification
-//! times alone, since the format carries no fingerprint of the dialog: a `Form.bin`
-//! replaced by a copy that keeps an older time (an unpacked archive, `cp -p`) is not
-//! recognised, and the producer has to rewrite the sidecar after such a copy.
+//! says (see [`Form::ordinary_without_dialog`]). A fingerprinted sidecar must match
+//! the container's bytes. Legacy sidecars retain their modification-time check.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -44,6 +42,7 @@ pub enum SidecarRejection {
     InvalidSchema(String),
     /// `Ext/Form.bin` was modified after the sidecar was written.
     Stale,
+    Fingerprint(String),
 }
 
 impl std::fmt::Display for SidecarRejection {
@@ -55,6 +54,7 @@ impl std::fmt::Display for SidecarRejection {
                 write!(f, "schema {v} is not a version (an integer from 1)")
             }
             SidecarRejection::Stale => write!(f, "Form.bin is newer than the sidecar"),
+            SidecarRejection::Fingerprint(reason) => write!(f, "source fingerprint: {reason}"),
         }
     }
 }
@@ -69,6 +69,8 @@ struct Sidecar {
     form: SidecarForm,
     attributes: Vec<SidecarAttribute>,
     controls: Vec<SidecarControl>,
+    #[serde(rename = "inspectionLimitations")]
+    inspection_limitations: Vec<String>,
 }
 
 // A present null is an invalid version, not the absent version's default.
@@ -104,6 +106,12 @@ struct SidecarAttribute {
     type_name: Option<String>,
     /// Set on the form's main attribute only, schema 14+.
     main: bool,
+    /// The type already structured by the producer, where it emits one. Preferred
+    /// over `type_name`: it needs no mapping, so it cannot lose a case the mapping
+    /// does not know.
+    attr_type: Option<AttributeType>,
+    /// The producer's own spelling of `main`. Either spelling marks the main attribute.
+    is_main: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -131,11 +139,28 @@ pub fn read_ordinary_form_sidecar(
     sidecar_path: &Path,
     form_name: &str,
 ) -> std::result::Result<Form, SidecarRejection> {
-    if is_stale(sidecar_path) {
-        return Err(SidecarRejection::Stale);
-    }
     let json = std::fs::read_to_string(sidecar_path)
         .map_err(|e| SidecarRejection::Unreadable(e.to_string()))?;
+    let source: serde_json::Value = serde_json::from_str(json.trim_start_matches('\u{feff}'))
+        .map_err(|e| SidecarRejection::Malformed(e.to_string()))?;
+    if source.pointer("/source/sha256").is_some() {
+        let binary = sidecar_path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(|ext| {
+                bsl_conventions::find_child_ci(
+                    ext,
+                    bsl_conventions::ConventionalName::FormBin.canonical(),
+                )
+            })
+            .ok_or_else(|| SidecarRejection::Fingerprint("Form.bin unavailable".into()))?;
+        let fingerprint = crate::inspection_sources::binary_fingerprint(&binary)
+            .map_err(|e| SidecarRejection::Fingerprint(e.to_string()))?;
+        super::form_inspection::validate_sidecar_fingerprint(&source, Some(&fingerprint.sha256))
+            .map_err(|e| SidecarRejection::Fingerprint(e.to_string()))?;
+    } else if is_stale(sidecar_path) {
+        return Err(SidecarRejection::Stale);
+    }
     parse_sidecar(&json, form_name)
 }
 
@@ -181,6 +206,8 @@ fn parse_sidecar(json: &str, form_name: &str) -> std::result::Result<Form, Sidec
     let name = if sidecar.form.name.is_empty() { form_name.to_string() } else { sidecar.form.name };
     let mut form = Form::new(name, FormType::Ordinary, uuid::Uuid::nil());
     form.ordinary_dialog_known = true;
+    form.ordinary_bindings_known =
+        !sidecar.inspection_limitations.iter().any(|reason| reason == "event_bindings_unread");
 
     form.attributes = sidecar
         .attributes
@@ -188,12 +215,11 @@ fn parse_sidecar(json: &str, form_name: &str) -> std::result::Result<Form, Sidec
         .filter(|attr| !attr.name.is_empty())
         .map(|attr| {
             let attr_type = attr
-                .type_name
-                .as_deref()
-                .and_then(sidecar_type_of)
+                .attr_type
+                .or_else(|| attr.type_name.as_deref().and_then(sidecar_type_of))
                 .unwrap_or(AttributeType::Unknown);
             let mut attribute = FormAttribute::new(attr.name, attr_type);
-            attribute.is_main = attr.main;
+            attribute.is_main = attr.is_main || attr.main;
             attribute
         })
         .collect();
@@ -404,10 +430,10 @@ fn kind_of(kind: &str) -> FormElementKind {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    const SIDECAR: &str = r#"{
+    pub(crate) const SIDECAR: &str = r#"{
  "schema": 2,
  "form": {
   "name": "ФормаСписка",
@@ -473,6 +499,44 @@ mod tests {
             .filter(|h| stdx::case::eq_ignore_case(&h.handler_name, "ПередОткрытием"))
             .count();
         assert_eq!(opens, 1);
+    }
+
+    #[test]
+    fn preserves_declared_ordinary_attribute_types_and_legacy_unknowns() {
+        let json = r#"{"attributes":[
+            {"name":"ОбработкаОбъект","is_main":true,
+             "attr_type":{"Ref":{"mdo_type":"ExternalDataProcessor","name":"Проба"}}},
+            {"name":"БезТипа"}
+        ]}"#;
+        let form = parse_ordinary_form_sidecar(json, "Форма").unwrap();
+        let main = form.find_attribute("ОбработкаОбъект").unwrap();
+        assert!(main.is_main);
+        assert_eq!(
+            main.attr_type,
+            AttributeType::Ref {
+                mdo_type: crate::MdoType::ExternalDataProcessor,
+                name: "Проба".into()
+            }
+        );
+        let legacy = form.find_attribute("БезТипа").unwrap();
+        assert!(!legacy.is_main);
+        assert_eq!(legacy.attr_type, AttributeType::Unknown);
+        let inspection = crate::xml_parser::form_inspection::parse_ordinary_form_inspection(
+            json,
+            "Форма",
+            None,
+            "base",
+        )
+        .unwrap();
+        let attributes = inspection.attributes.unwrap();
+        assert_eq!(attributes[0].attr_type.as_ref(), Some(&main.attr_type));
+        assert_eq!(attributes[0].type_origin.as_deref(), Some("base"));
+        assert_eq!(attributes[1].attr_type, None);
+        assert!(parse_ordinary_form_sidecar(
+            r#"{"attributes":[{"name":"Объект","attr_type":"InvalidType"}]}"#,
+            "Форма"
+        )
+        .is_err());
     }
 
     #[test]
@@ -657,6 +721,53 @@ mod tests {
         // Only an information register has a record manager.
         assert_eq!(main_type_of("РегистрНакопленияМенеджерЗаписи.Имя"), AttributeType::Unknown);
         assert_eq!(main_type_of("РегистрСведенийМенеджер.Имя"), AttributeType::Unknown);
+    }
+
+    #[test]
+    fn a_structured_attr_type_alone_gives_the_attribute_type() {
+        let json = r#"{"attributes": [
+            {"name": "Объект",
+             "attr_type": {"Ref": {"mdo_type": "Catalog", "name": "Валюты"}}}
+        ]}"#;
+        let form = parse_ordinary_form_sidecar(json, "Ф").unwrap();
+        assert_eq!(
+            form.find_attribute("Объект").unwrap().attr_type,
+            AttributeType::Ref { mdo_type: MdoType::Catalog, name: "Валюты".to_string() }
+        );
+    }
+
+    #[test]
+    fn the_structured_attr_type_wins_over_the_type_name_when_both_are_present() {
+        // The name maps to a Report, the structured field says Catalog: Catalog must win.
+        let json = r#"{"schema": 14, "attributes": [
+            {"name": "А", "type": "ОтчетОбъект.ОтчетДиаграмма",
+             "attr_type": {"Ref": {"mdo_type": "Catalog", "name": "Валюты"}}}
+        ]}"#;
+        let form = parse_ordinary_form_sidecar(json, "Ф").unwrap();
+        let attr_type = &form.find_attribute("А").unwrap().attr_type;
+        assert_eq!(
+            attr_type,
+            &AttributeType::Ref { mdo_type: MdoType::Catalog, name: "Валюты".to_string() }
+        );
+        assert_ne!(
+            attr_type,
+            &AttributeType::Ref {
+                mdo_type: MdoType::Report, name: "ОтчетДиаграмма".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn either_spelling_of_main_marks_the_main_attribute() {
+        let json = r#"{"attributes": [
+            {"name": "ПоИмени", "main": true},
+            {"name": "ПоСтруктуре", "is_main": true},
+            {"name": "Обычный"}
+        ]}"#;
+        let form = parse_ordinary_form_sidecar(json, "Ф").unwrap();
+        assert!(form.find_attribute("ПоИмени").unwrap().is_main);
+        assert!(form.find_attribute("ПоСтруктуре").unwrap().is_main);
+        assert!(!form.find_attribute("Обычный").unwrap().is_main);
     }
 
     #[test]

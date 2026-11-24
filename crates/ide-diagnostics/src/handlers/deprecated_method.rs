@@ -1,4 +1,4 @@
-use crate::AnalysisContext;
+use crate::BodyContext;
 use crate::{Diagnostic, DiagnosticCode};
 use bsl_platform::deprecation::DeprecationEntry;
 use hir::LocalRange;
@@ -10,7 +10,7 @@ use super::deprecated_platform_facts::{deprecated_method_fact, replacement_for_n
 pub fn from_hir(
     name: &str,
     range: LocalRange,
-    ctx: &AnalysisContext,
+    ctx: &BodyContext,
 ) -> Option<Diagnostic<LocalRange>> {
     let (code, replacement) = get_diagnostic_code_and_replacement(name)?;
 
@@ -21,7 +21,9 @@ pub fn from_hir(
         return None;
     }
 
-    let message = get_message(name, replacement);
+    let applicable =
+        ctx.replacement_applicability(replacement) == hir::ReplacementApplicability::Applicable;
+    let message = get_message(name, applicable.then_some(replacement));
 
     Some(Diagnostic {
         code,
@@ -42,14 +44,19 @@ fn replacement_for_method(entry: &DeprecationEntry, name: &str) -> Option<&'stat
     replacement_for_name(entry, name)
 }
 
-fn get_message(method_name: &str, replacement: &str) -> String {
+fn get_message(method_name: &str, replacement: Option<&str>) -> String {
     let lower = method_name.fold_lower();
     let is_russian = lower.chars().any(|c| c as u32 > 127);
 
-    if is_russian {
-        format!("Метод \"{}\" устарел. Следует использовать \"{}\".", method_name, replacement)
-    } else {
-        format!("Method \"{}\" is deprecated. You should use \"{}\".", method_name, replacement)
+    match (is_russian, replacement) {
+        (true, Some(replacement)) => {
+            format!("Метод \"{}\" устарел. Следует использовать \"{}\".", method_name, replacement)
+        }
+        (false, Some(replacement)) => {
+            format!("Method \"{}\" is deprecated. You should use \"{}\".", method_name, replacement)
+        }
+        (true, None) => format!("Метод \"{}\" устарел.", method_name),
+        (false, None) => format!("Method \"{}\" is deprecated.", method_name),
     }
 }
 

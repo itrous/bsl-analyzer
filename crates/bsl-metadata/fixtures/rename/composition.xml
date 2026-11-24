@@ -1,0 +1,8 @@
+<DataCompositionSchema xmlns="http://v8.1c.ru/8.1/data-composition-system/schema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:c="http://v8.1c.ru/8.1/data/core" xmlns:d="http://v8.1c.ru/8.1/data/enterprise/current-config">
+  <dataSource><name>Local</name><dataSourceType>Local</dataSourceType></dataSource>
+  <dataSet xsi:type="DataSetQuery"><name>Main</name><dataSource>Local</dataSource>
+    <query>SELECT P.Cap&#116;ion AS Stable, P.Ref FROM Catalog.Partners AS P WHERE P.Code = &amp;Code</query>
+    <field xsi:type="DataSetFieldField"><dataPath>Stable</dataPath><field>Stable</field><title>Caption</title></field>
+  </dataSet>
+  <parameter><name>Partner</name><valueType><c:Type>d:CatalogRef.Partners</c:Type></valueType></parameter>
+</DataCompositionSchema>
