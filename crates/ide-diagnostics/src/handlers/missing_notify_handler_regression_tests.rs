@@ -393,6 +393,78 @@ fn common_module_handler_selection_matches_the_graph() {
     }
 }
 
+#[test]
+fn adopted_cav_module_callback_uses_base_and_extension_declarations() {
+    const CALLER: &str = "CommonModules/ОбщийМодуль/Ext/Module.bsl";
+    const BASE: &str = "&НаКлиенте\nПроцедура Проверить()\nКонецПроцедуры\n\
+        &НаКлиенте\nПроцедура Callback() Экспорт\nКонецПроцедуры\n";
+    let extension_source = |handler: &str| {
+        format!(
+            "&ИзменениеИКонтроль(\"Проверить\")\nПроцедура Расш1_Проверить()\n\
+             #Вставка\n    Значение = 1;\n#КонецВставки\n\
+             О = Новый ОписаниеОповещения(\"{handler}\", ОбщийМодуль);\nКонецПроцедуры\n"
+        )
+    };
+
+    for (handler, expected) in [("Callback", 0), ("Callbak", 1)] {
+        let mut builder = CfeFixtureBuilder::new("");
+        builder
+            .add_base_module("ОбщийМодуль", BASE)
+            .add_extension("Расш", "")
+            .add_extension_module("Расш", "ОбщийМодуль", &extension_source(handler));
+        let fixture = builder.build();
+        let source = extension_source(handler);
+        let diagnostics = crate::test_utils::check_cfe_at_with_db(
+            CALLER,
+            &source,
+            fixture,
+            &[],
+            DiagnosticsConfig::all_enabled(),
+            |fixture| {
+                for (_, root) in fixture.config_paths() {
+                    let path = root.join("CommonModules/ОбщийМодуль.xml");
+                    let xml = std::fs::read_to_string(&path).unwrap();
+                    let xml = xml.replace(
+                        "<ClientManagedApplication>false</ClientManagedApplication>",
+                        "<ClientManagedApplication>true</ClientManagedApplication>",
+                    );
+                    assert_ne!(xml, std::fs::read_to_string(&path).unwrap());
+                    std::fs::write(path, xml).unwrap();
+                }
+            },
+            |db, ctx| {
+                assert!(ide_db::effective_target(db, ctx.file_id).is_some());
+                assert!(ide_db::weaving_target(db, ctx.file_id).is_some());
+                let candidates = ctx.notify_candidates();
+                let candidate = candidates
+                    .iter()
+                    .find(|candidate| candidate.callback_name.as_str() == handler)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "CAV insertion must preserve its notify candidate; candidates={candidates:#?}; summary={:#?}",
+                            db.module_call_summary(ModuleId::new(ctx.file_id))
+                        )
+                    });
+                assert_eq!(candidate.receiver, hir::NotifyCandidateReceiver::ThisObject);
+                assert!(matches!(
+                    candidate.registration.as_ref().map(|reg| &reg.target),
+                    Some(hir::call_graph::NotifyTarget::Module(name))
+                        if name.as_str() == "ОбщийМодуль"
+                ));
+                crate::file_diagnostics(db, ctx.file_id, ctx.config)
+            },
+        );
+        let missing = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == crate::DiagnosticCode::MissingNotifyHandler)
+            .collect::<Vec<_>>();
+        assert_eq!(missing.len(), expected, "handler={handler}: {diagnostics:#?}");
+        if expected == 1 {
+            assert!(missing[0].message.contains("Callbak"), "{missing:#?}");
+        }
+    }
+}
+
 /// The main and the error-handler slot naming the same procedure on the same receiver
 /// describe one platform invocation: one registration, one verdict. Different names or
 /// different receivers stay separate registrations — those are the dedup controls.

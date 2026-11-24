@@ -53,7 +53,20 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     let mut module_verdicts = FxHashMap::default();
     for candidate in notify_candidates.iter() {
         let Some(reg) = candidate.registration.as_ref() else { continue };
+        // Weaving can normalize a current module receiver to ThisObject; keep the
+        // registration target's module identity for base/extension lookup.
         let verdict = match &candidate.receiver {
+            hir::NotifyCandidateReceiver::ThisObject
+                if let hir::call_graph::NotifyTarget::Module(module_name) = &reg.target =>
+            {
+                let key = (module_name.clone(), reg.callback_name.clone(), reg.environments);
+                let verdict = *module_verdicts
+                    .entry(key)
+                    .or_insert_with(|| module_verdict(ctx, module_name, &reg.callback_name, reg));
+                verdict.map(|v| {
+                    (v, format!("{}.{}", module_name.as_str(), reg.callback_name.as_str()))
+                })
+            }
             hir::NotifyCandidateReceiver::ThisObject if local_unprovable => None,
             hir::NotifyCandidateReceiver::ThisObject => local_verdict(ctx, &reg.callback_name, reg)
                 .map(|v| (v, reg.callback_name.to_string())),
@@ -72,8 +85,12 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         };
         let Some((verdict, detail)) = verdict else { continue };
         let message = message(verdict, &detail);
-        let module = match &candidate.receiver {
-            hir::NotifyCandidateReceiver::ForeignModule(module) => Some(module.clone()),
+        let module = match (&candidate.receiver, &reg.target) {
+            (
+                hir::NotifyCandidateReceiver::ThisObject
+                | hir::NotifyCandidateReceiver::ForeignModule(_),
+                hir::call_graph::NotifyTarget::Module(module),
+            ) => Some(module.clone()),
             _ => None,
         };
         if reported_slots.iter().any(|(range, previous_module, previous_name)| {
