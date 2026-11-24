@@ -319,6 +319,15 @@ enum ImplicitSelfSurface {
     /// A receiver whose methods the platform catalog files under a per-object
     /// prefix (`КонстантаМенеджерЗначения.<Имя>`), the same for every object.
     PlatformPrefix(&'static str),
+    /// The module of an ORDINARY form: the form type and its extensions, then the
+    /// platform type of the object the form's MAIN ATTRIBUTE holds and the methods
+    /// that object's module declares. The owner comes from the attribute, not from
+    /// the form's path: a universal-report form lives under one report while its
+    /// main attribute is an object of another.
+    OrdinaryForm {
+        types: Vec<&'static str>,
+        owner: (bsl_metadata::MdoType, Name),
+    },
     /// An implicit receiver exists but its surface cannot be produced — a gap, not
     /// an absence.
     Unreadable,
@@ -6368,7 +6377,37 @@ impl<'db> InferenceContext<'db> {
             ImplicitSelfSurface::PlatformPrefix(prefix) => {
                 !bsl_platform::find_prefixed_methods(prefix, name.as_str()).is_empty()
             }
+            ImplicitSelfSurface::OrdinaryForm { types, owner } => {
+                let data = bsl_platform::PlatformData::instance();
+                types.iter().any(|ty| data.get_method(ty, name.as_str()).is_some())
+                    || self.form_owner_owns_method(owner.0, &owner.1, name)
+            }
             ImplicitSelfSurface::None | ImplicitSelfSurface::Unreadable => false,
+        }
+    }
+
+    /// Whether the object an ordinary form belongs to provides `name` to the form's
+    /// module: a method of the object's platform type, or one the object module
+    /// declares. An unread object module answers `true`: nothing can be concluded.
+    fn form_owner_owns_method(
+        &self,
+        mdo_type: bsl_metadata::MdoType,
+        owner_name: &Name,
+        name: &Name,
+    ) -> bool {
+        let receiver = self.db.mk_this_object(
+            ConfigId::Root,
+            MdoRefFacet::new(mdo_type, owner_name.as_str().to_string()),
+        );
+        if crate::method_lookup::lookup_method_with_refinement(self.db, receiver, name, None)
+            .is_some()
+        {
+            return true;
+        }
+        match self.get_resolver().resolve_object_module_method(self.db, mdo_type, owner_name, name)
+        {
+            Ok(_) | Err(hir_def::resolver::QualifiedMethodError::BodyUnread) => true,
+            Err(_) => false,
         }
     }
 
@@ -6456,6 +6495,20 @@ impl<'db> InferenceContext<'db> {
                 Some(form) if form.is_managed() => ImplicitSelfSurface::PlatformTypes(
                     crate::form_self::managed_form_self_types(form),
                 ),
+                // Without a typed main attribute (no sidecar, schema below 14, a type the
+                // reader does not know) nothing is known about the owner: no guess.
+                Some(form) if form.is_ordinary() => match form.main_attribute() {
+                    Some(bsl_metadata::FormAttribute {
+                        attr_type: bsl_metadata::AttributeType::Ref { mdo_type, name },
+                        ..
+                    }) if hir_def::ty::MetadataKind::object_kind_for(*mdo_type).is_some() => {
+                        ImplicitSelfSurface::OrdinaryForm {
+                            types: crate::form_self::ordinary_form_self_types(),
+                            owner: (*mdo_type, Name::new(name)),
+                        }
+                    }
+                    _ => ImplicitSelfSurface::Unreadable,
+                },
                 _ => ImplicitSelfSurface::Unreadable,
             },
 

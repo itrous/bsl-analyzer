@@ -26,6 +26,15 @@ const GLOBAL_SURFACE: &[&str] = &[
 ];
 
 fn setup_at(relative: &str, text: &str) -> (RootDatabaseImpl, FileId) {
+    setup_at_with(relative, text, &[])
+}
+
+/// Like [`setup_at`], with more fixture files in the workspace under the given text.
+fn setup_at_with(
+    relative: &str,
+    text: &str,
+    siblings: &[(&str, &str)],
+) -> (RootDatabaseImpl, FileId) {
     let path = designer_fixture_path().join(relative);
     let file_id = FileId::from_raw(1);
     let mut db = RootDatabaseImpl::new();
@@ -42,6 +51,13 @@ fn setup_at(relative: &str, text: &str) -> (RootDatabaseImpl, FileId) {
         let global_id = FileId::from_raw(100 + index as u32);
         file_set.insert(global_id, VfsPath::new(global_path.to_string_lossy().to_string()));
         extra.push((global_id, text));
+    }
+
+    for (index, (sibling, sibling_text)) in siblings.iter().enumerate() {
+        let sibling_path = designer_fixture_path().join(sibling);
+        let sibling_id = FileId::from_raw(200 + index as u32);
+        file_set.insert(sibling_id, VfsPath::new(sibling_path.to_string_lossy().to_string()));
+        extra.push((sibling_id, (*sibling_text).to_string()));
     }
 
     db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
@@ -323,17 +339,85 @@ fn a_branch_no_environment_compiles_stays_silent() {
     assert_eq!(absent_bare_calls(&db, file_id), vec!["ЕстьНаКлиенте".to_string()]);
 }
 
-/// An ordinary form's module also sees the exports of the main attribute's object
-/// module, and its dialog is not read — no absence can be proven inside one.
+/// The bare calls an ordinary form module reaches: the form type (`Закрыть`,
+/// `Обновить`), its extensions (`ЗаписатьВФорме`), the platform type of the object its
+/// MAIN ATTRIBUTE holds (`ПолучитьМакет`) and the exports of that object's module.
+/// Only the name none of them owns is absent.
+const ORDINARY_FORM_CALLS: &str = "Процедура Тест()
+    СовсемНеизвестныйВызов();
+        Закрыть();
+    Обновить();
+    ЗаписатьВФорме();
+    ПолучитьМакет();
+        ЭкспортнаяПроцедураОбъекта();
+КонецПроцедуры
+";
+
+const DATA_PROCESSOR_OBJECT_MODULE: &str = "DataProcessors/ТестоваяОбработка/Ext/ObjectModule.bsl";
+/// Both forms live under `Справочник1`; the sidecar of the first one names the data
+/// processor as the main attribute's type, the second one's is identical without the
+/// `type` and `main` keys.
+const TYPED_ORDINARY_FORM_MODULE: &str =
+    "Catalogs/Справочник1/Forms/ФормаОбычнаяСТипом/Ext/Form/Module.bsl";
+const UNTYPED_ORDINARY_FORM_MODULE: &str =
+    "Catalogs/Справочник1/Forms/ФормаОбычнаяБезТипа/Ext/Form/Module.bsl";
+
+const DATA_PROCESSOR_EXPORT: &str = "Процедура ЭкспортнаяПроцедураОбъекта() Экспорт
+КонецПроцедуры
+";
+
 #[test]
-fn an_ordinary_form_module_stays_silent() {
-    let text = "Процедура Тест()\n    СовсемНеизвестныйВызов();\nКонецПроцедуры\n";
-    let (db, file_id) = setup_at(ORDINARY_FORM_MODULE, text);
+fn an_ordinary_form_is_judged_against_its_main_attributes_object() {
+    let (db, file_id) = setup_at_with(
+        TYPED_ORDINARY_FORM_MODULE,
+        ORDINARY_FORM_CALLS,
+        &[(DATA_PROCESSOR_OBJECT_MODULE, DATA_PROCESSOR_EXPORT)],
+    );
+    assert_eq!(absent_bare_calls(&db, file_id), vec!["СовсемНеизвестныйВызов".to_string()]);
+}
+
+/// The same form without `type`/`main` in its sidecar: nothing is known about the
+/// owner, so nothing is reported - a guess here is a false finding per call.
+#[test]
+fn an_ordinary_form_without_a_typed_main_attribute_stays_silent() {
+    let (db, file_id) = setup_at_with(
+        UNTYPED_ORDINARY_FORM_MODULE,
+        ORDINARY_FORM_CALLS,
+        &[(DATA_PROCESSOR_OBJECT_MODULE, DATA_PROCESSOR_EXPORT)],
+    );
     assert!(
         absent_bare_calls(&db, file_id).is_empty(),
-        "ordinary form modules keep their silence: {:?}",
+        "unknown owner must keep the silence: {:?}",
         absent_bare_calls(&db, file_id)
     );
+}
+
+/// The export lives in the module of the path owner, not of the main attribute's
+/// object: the owner of the path must not be consulted.
+#[test]
+fn the_path_owner_is_not_the_form_owner() {
+    let text = "Процедура Тест()
+    ЭкспортПутевогоВладельца();
+КонецПроцедуры
+";
+    let (db, file_id) = setup_at_with(
+        TYPED_ORDINARY_FORM_MODULE,
+        text,
+        &[(
+            CATALOG_OBJECT_MODULE,
+            "Процедура ЭкспортПутевогоВладельца() Экспорт
+КонецПроцедуры
+",
+        )],
+    );
+    assert_eq!(absent_bare_calls(&db, file_id), vec!["ЭкспортПутевогоВладельца".to_string()]);
+}
+
+/// A form with no sidecar at all keeps its silence as well.
+#[test]
+fn an_ordinary_form_without_a_sidecar_stays_silent() {
+    let (db, file_id) = setup_at(ORDINARY_FORM_MODULE, ORDINARY_FORM_CALLS);
+    assert!(absent_bare_calls(&db, file_id).is_empty());
 }
 
 /// A constant's value-manager module hangs off `КонстантаМенеджерЗначения`:
