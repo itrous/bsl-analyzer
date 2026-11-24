@@ -89,6 +89,82 @@ async fn session_finished(task: JoinHandle<anyhow::Result<()>>) {
         .expect("session closes cleanly");
 }
 
+#[tokio::test]
+async fn cancelled_query_execute_does_not_start_native_request() {
+    let server = McpServer::new(McpProfile::Workspace, SharedState::shared());
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let params = serde_json::from_value(serde_json::json!({
+        "action": "execute",
+        "query": "ВЫБРАТЬ 1 КАК Значение"
+    }))
+    .unwrap();
+
+    let error = server.query(crate::Parameters(params), cancel).await.unwrap_err();
+
+    assert_eq!(error.message, "Request cancelled");
+}
+
+#[tokio::test]
+async fn cancelled_query_execute_finishes_its_handler_without_retry() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let requests = Arc::new(AtomicUsize::new(0));
+    let app = Router::new().route(
+        "/query",
+        post({
+            let entered = Arc::clone(&entered);
+            let requests = Arc::clone(&requests);
+            move || {
+                let entered = Arc::clone(&entered);
+                let requests = Arc::clone(&requests);
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    entered.notify_one();
+                    std::future::pending::<Json<serde_json::Value>>().await
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let native = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut config = SessionConfig::default();
+    config.add_onec_connection(
+        "current".to_owned(),
+        OnecConnection::new(onec_client::Client::new(&url, "", ""), false),
+    );
+    let server = McpServer::new(McpProfile::Workspace, SharedState::shared()).for_session(config);
+    let cancel = CancellationToken::new();
+    let cancellation = tokio::spawn({
+        let cancel = cancel.clone();
+        async move {
+            entered.notified().await;
+            cancel.cancel();
+        }
+    });
+    let params = serde_json::from_value(serde_json::json!({
+        "action": "execute",
+        "query": "ВЫБРАТЬ 1 КАК Значение",
+        "connection": "current"
+    }))
+    .unwrap();
+
+    // Calling the handler directly distinguishes its completion from the SDK's cancel reply.
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        server.query(crate::Parameters(params), cancel),
+    )
+    .await;
+    cancellation.abort();
+    native.abort();
+
+    let error = result.expect("cancellation ends the HTTP wait").unwrap_err();
+    assert_eq!(error.message, "Request cancelled");
+    assert_eq!(requests.load(Ordering::SeqCst), 1, "cancellation never retries a query");
+}
+
 #[derive(Clone)]
 struct MockNativeContext {
     label: &'static str,
@@ -267,6 +343,29 @@ async fn stream_shutdown_closes_uninitialized_transport() {
         .expect("silent transport closes without hanging")
         .expect("read observes transport closure");
     assert_eq!(read, 0, "the silent peer receives EOF");
+}
+
+#[tokio::test]
+async fn silent_mcp_initialization_has_a_deadline_and_preserves_another_client() {
+    let shutdown = CancellationToken::new();
+    let (healthy, healthy_task) = initialized_session(&shutdown).await;
+    let (mut silent, stream) = tokio::io::duplex(4096);
+    let server = McpServer::new(McpProfile::Reference, SharedState::shared());
+    tokio::time::pause();
+    let task = tokio::spawn(serve_stream_with_shutdown(server, stream, shutdown.clone()));
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(6)).await;
+    let result = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("a client that never initializes must release its session budget")
+        .expect("the session task joins");
+    let error = result.expect_err("the missing initialize is an explicit refusal");
+    assert!(error.to_string().contains("initialize"), "{error}");
+    let mut byte = [0];
+    assert_eq!(silent.read(&mut byte).await.unwrap(), 0);
+    healthy.send_request(ClientRequest::PingRequest(PingRequest::default())).await.unwrap();
+    shutdown.cancel();
+    session_finished(healthy_task).await;
 }
 
 /// A cache-scope failure closes every session of that backend without relying on the daemon's
@@ -849,4 +948,170 @@ async fn workspace_references_cancel_unwinds_first_walk_span_before_a_writer() {
         .expect("sibling client disconnects");
     session_finished(sibling_task).await;
     state.shutdown();
+}
+
+#[tokio::test]
+async fn wire_cancel_before_epf_delegate_has_no_http_or_response() -> anyhow::Result<()> {
+    use rmcp::model::{CallToolResponse, ServerConfig, Tool};
+    use rmcp::service::RequestContext;
+    use rmcp::{ErrorData, RoleServer, ServerHandler};
+    use serde_json::{json, Value};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::sync::{oneshot, Notify};
+
+    struct BeforeDelegate {
+        inner: McpServer,
+        entered: Arc<Notify>,
+        completed: Mutex<Option<oneshot::Sender<Option<String>>>>,
+    }
+    impl ServerHandler for BeforeDelegate {
+        fn get_info(&self) -> ServerConfig {
+            self.inner.get_info()
+        }
+
+        fn get_tool(&self, name: &str) -> Option<Tool> {
+            self.inner.get_tool(name)
+        }
+
+        async fn call_tool(
+            &self,
+            request: CallToolRequestParams,
+            context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResponse, ErrorData> {
+            assert_eq!(request.name, "execute");
+            assert!(!context.ct.is_cancelled());
+            self.entered.notify_one();
+            context.ct.cancelled().await;
+            // The SDK owns this registered request's token; preserve it across delegation.
+            assert!(context.ct.is_cancelled());
+            let result = self.inner.call_tool(request, context).await;
+            self.completed
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(result.as_ref().err().map(|error| error.message.to_string()))
+                .unwrap();
+            result
+        }
+    }
+
+    async fn send(
+        writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+        value: Value,
+    ) -> anyhow::Result<()> {
+        writer.write_all(serde_json::to_string(&value)?.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        Ok(())
+    }
+
+    async fn through_id(
+        reader: &mut BufReader<impl tokio::io::AsyncRead + Unpin>,
+        frames: &mut Vec<Value>,
+        id: u64,
+    ) -> anyhow::Result<()> {
+        tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+            loop {
+                let mut line = String::new();
+                anyhow::ensure!(reader.read_line(&mut line).await? != 0, "EOF before id {id}");
+                let frame: Value = serde_json::from_str(&line)?;
+                let reached = frame["id"] == id;
+                frames.push(frame);
+                if reached {
+                    return Ok(());
+                }
+            }
+        })
+        .await?
+    }
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let mut state = SharedState::shared();
+    state.add_onec_connection(
+        "bp30_exchange_work".to_owned(),
+        OnecConnection::with_optional_http(
+            Some(onec_client::Client::new(&format!("http://{}", listener.local_addr()?), "", "")),
+            false,
+            None,
+        )
+        .with_epf_module_check(true),
+    );
+    let entered = Arc::new(Notify::new());
+    let (completed, completion) = oneshot::channel();
+    let wrapper = BeforeDelegate {
+        inner: McpServer::new(McpProfile::Workspace, state),
+        entered: entered.clone(),
+        completed: Mutex::new(Some(completed)),
+    };
+    let stop = CancellationToken::new();
+    let _stop_on_drop = stop.clone().drop_guard();
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let service = wrapper.serve_with_ct(server_io, stop).await?;
+        service.waiting().await?;
+        Ok::<(), anyhow::Error>(())
+    });
+    let (reader, mut writer) = tokio::io::split(client_io);
+    let mut reader = BufReader::new(reader);
+    let mut frames = Vec::new();
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
+                "protocolVersion":"2025-06-18", "capabilities":{},
+                "clientInfo":{"name":"epf-cancel-before", "version":"0"}
+            }
+        }),
+    )
+    .await?;
+    through_id(&mut reader, &mut frames, 1).await?;
+    assert!(frames.last().unwrap().get("error").is_none());
+    send(&mut writer, json!({"jsonrpc":"2.0", "method":"notifications/initialized"})).await?;
+    send(&mut writer, json!({
+        "jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{
+            "name":"execute", "arguments":{
+                "action":"check", "connection":"bp30_exchange_work",
+                "input_kind":"module", "module_type":"object",
+                "context":{"kind":"synthetic", "module_type":"object"},
+                "code":"﻿Перем Итог;\r\n#Область Методы\r\nФункция Сложить(Первое, Второе = 0) Экспорт\r\n    Сумма = Первое + Второе;\r\n    Итог = Сумма;\r\n    Возврат Итог;\r\nКонецФункции\r\n\r\nПроцедура Пройти(Элементы)\r\n    Для Каждого Элемент Из Элементы Цикл\r\n        Локальная = Сложить(Элемент, 1);\r\n    КонецЦикла;\r\nКонецПроцедуры\r\n\r\nФункция Представить(Строка)\r\n    Возврат Строка(Строка);\r\nКонецФункции\r\n\r\nПроцедура Sentinel() Экспорт\r\n    ВызватьИсключение \"Не вызывать 😀\";\r\nКонецПроцедуры\r\n#КонецОбласти\r\n"
+            }
+        }
+    })).await?;
+    tokio::time::timeout(SHUTDOWN_TIMEOUT, entered.notified()).await?;
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc":"2.0", "method":"notifications/cancelled",
+            "params":{"requestId":2, "reason":"cancel before EPF delegate"}
+        }),
+    )
+    .await?;
+    let observed = tokio::time::timeout(SHUTDOWN_TIMEOUT, completion).await??;
+    assert_eq!(observed.as_deref(), Some("Request cancelled"));
+    send(&mut writer, json!({"jsonrpc":"2.0", "id":3, "method":"ping"})).await?;
+    through_id(&mut reader, &mut frames, 3).await?;
+    assert!(frames.last().unwrap().get("error").is_none());
+    writer.shutdown().await?;
+    let mut tail = String::new();
+    tokio::time::timeout(SHUTDOWN_TIMEOUT, reader.read_to_string(&mut tail)).await??;
+    for line in tail.lines() {
+        frames.push(serde_json::from_str(line)?);
+    }
+    tokio::time::timeout(SHUTDOWN_TIMEOUT, server).await???;
+    assert!(
+        frames.iter().all(|frame| frame.get("id") != Some(&json!(2))),
+        "cancelled request has no response through EOF: {frames:?}"
+    );
+    let mut http_connections = 0;
+    loop {
+        match listener.accept() {
+            Ok((_socket, _peer)) => http_connections += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    assert_eq!(http_connections, 0, "cancelled EPF delegate never connects to HTTP");
+    Ok(())
 }

@@ -116,6 +116,8 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
     (DiagnosticCode::BadWords, "lexical dictionary diagnostic"),
     (DiagnosticCode::DuplicateStringLiteral, "literal duplication diagnostic"),
     (DiagnosticCode::DuplicateRegion, "region-name duplication diagnostic"),
+    (DiagnosticCode::DuplicateInterception, "physical annotation kind and target identity; no platform identifier lookup"),
+    (DiagnosticCode::DuplicateMethodDeclaration, "physical user-defined declaration identity; no platform identifier lookup"),
     (DiagnosticCode::NonStandardRegion, "region-name policy diagnostic"),
     (
         DiagnosticCode::DuplicatedInsertionIntoCollection,
@@ -495,7 +497,7 @@ EndProcedure"#,
     ),
     (
         DiagnosticCode::LocalCallWithQueryInCycle,
-        r#"Функция НайтиПоЗначению(Значение)
+        r#"Функция FindByValue(Значение)
 	Запрос = Новый Запрос("ВЫБРАТЬ 1 КАК Поле");
 	Запрос.УстановитьПараметр("Значение", Значение);
 	Выборка = Запрос.Выполнить().Выбрать();
@@ -505,7 +507,7 @@ EndProcedure"#,
 Процедура ЗаполнитьСтроки(Таблица, Чтение)
 	Пока Чтение.Прочитать() Цикл
 		НоваяСтрока = Таблица.Добавить();
-		НоваяСтрока.Поле = НайтиПоЗначению(Чтение.Значение);
+		НоваяСтрока.Поле = FindByValue(Чтение.Значение);
 	КонецЦикла;
 КонецПроцедуры"#,
         r#"Function FindByValue(Value)
@@ -842,7 +844,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 229, "update the bilingual inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 231, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]

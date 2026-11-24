@@ -302,6 +302,7 @@ impl SourceSetArgs {
             }
             claimed.insert(canonical, format!("--external {value}"));
             decls.push(ExternalDecl {
+                configuration_root: None,
                 name: name.to_string(),
                 path: path.to_string(),
                 depends_on: None,
@@ -701,6 +702,7 @@ mod tests {
         assert_eq!(
             resolved.externals,
             Some(vec![ExternalDecl {
+                configuration_root: None,
                 name: "АРМ".into(),
                 path: "src/epf/АРМ".into(),
                 depends_on: None
@@ -739,7 +741,12 @@ mod tests {
         assert!(!none.is_empty());
         assert_eq!(none.to_args(), ["--no-externals"]);
         assert_eq!(externals_provider(&none, None), SourceProvider::Cli);
-        let declared = vec![ExternalDecl { name: "X".into(), path: "x".into(), depends_on: None }];
+        let declared = vec![ExternalDecl {
+            configuration_root: None,
+            name: "X".into(),
+            path: "x".into(),
+            depends_on: None,
+        }];
         assert_eq!(externals_provider(&args(&[]), Some(&declared)), SourceProvider::ConfigFile);
         assert_eq!(externals_provider(&args(&[]), Some(&vec![])), SourceProvider::ConfigFile);
         assert_eq!(externals_provider(&args(&[]), None), SourceProvider::AutoDiscovery);
@@ -797,7 +804,9 @@ mod tests {
         );
         let repeated = repeated.resolve(dir.path()).unwrap();
         let external = &repeated.externals.as_ref().unwrap()[0];
-        let ExternalDecl { depends_on: Some(dependencies), .. } = external else {
+        let ExternalDecl { configuration_root: None, depends_on: Some(dependencies), .. } =
+            external
+        else {
             panic!("external E must retain its selected extension dependencies: {external:?}");
         };
         assert_eq!(dependencies, &["A".to_owned(), "b".to_owned()]);

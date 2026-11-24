@@ -1,0 +1,93 @@
+{
+  "status": "SANITIZED_NATIVE_EXPORT_DONORS_NOT_NEW_NATIVE_VALIDATION",
+  "fixtures": [
+    {
+      "fixture": "document.xml",
+      "source": ".artifacts/resolve-outstanding-implementation-20261107/final-acceptance/duplicate-interception-native-preparation-20261111/run/absent-applied-continuation/base-export/Documents/BA095Document.xml",
+      "source_sha256": "545afc3e9fb6827d12c304fdee2409d3d1b20c4c89521aec4b860abb2bef6823",
+      "fixture_sha256": "0d471b44ab0f7af9c352199134da114311230c4751268d4bf5548a8e6993ad05",
+      "replacements": [
+        [
+          "BA095Document",
+          "Partners"
+        ]
+      ],
+      "preserved": "all other bytes including UUIDs, GeneratedType opaque IDs, namespaces, full Properties, BOM/CRLF"
+    },
+    {
+      "fixture": "document-tables.xml",
+      "source": ".artifacts/ba023/executor-platform-acceptance/work/D-base-canonical-probe-20261008/captured-hierarchical/Documents/ПриходТовара.xml",
+      "source_sha256": "79cef41783f2fd5de9bdcfcd02d7b609ebfa9c02c9d4c650b15161e988cd57be",
+      "fixture_sha256": "5a5eaaa175458c6d09c76d7b3b6c4725bb9232ab4168c8dbefe8992f0ada5bd1",
+      "replacements": [
+        [
+          "ПриходТовара",
+          "NativeReceipt"
+        ],
+        [
+          "DocumentTabularSection.NativeReceipt.Товары",
+          "DocumentTabularSection.NativeReceipt.Rows"
+        ],
+        [
+          "DocumentTabularSectionRow.NativeReceipt.Товары",
+          "DocumentTabularSectionRow.NativeReceipt.Rows"
+        ],
+        [
+          "<Name>Товары</Name>",
+          "<Name>Rows</Name>"
+        ]
+      ],
+      "preserved": "all other bytes including UUIDs, GeneratedType opaque IDs, namespaces, full Properties, BOM/CRLF"
+    },
+    {
+      "fixture": "catalog-tables.xml",
+      "source": ".artifacts/resolve-outstanding-implementation-20261107/final-acceptance/native-cycle-preparation/own-schema-review/native-packaging/corrected-v2/baseline-export/Catalogs/BSLAnalyzerAcceptanceSchema_20261109.xml",
+      "source_sha256": "39e1c0bde46f44aa36fce3679be50ba6d3790693aa6bffc712a32a95c78eb317",
+      "fixture_sha256": "b52a98e8587daa04e4329c6ba97240201fb5a017b8269ace8f690532eeb6ac98",
+      "replacements": [
+        [
+          "BSLAnalyzerAcceptanceSchema_20261109",
+          "NativeCatalog"
+        ]
+      ],
+      "preserved": "all other bytes including UUIDs, GeneratedType opaque IDs, namespaces, full Properties, BOM/CRLF"
+    },
+    {
+      "fixture": "exchange-plan.xml",
+      "source": ".artifacts/ba023/executor-platform-acceptance/work/D-base-canonical-probe-20261008/captured-hierarchical/ExchangePlans/Мобильные.xml",
+      "source_sha256": "37e0577c67916468e37be8b79187add75d6789c51377cfd4d7975bcddabcaa08",
+      "fixture_sha256": "a6decaf124e111789195d46a6bc06ea5cae7ccc65c01f25f0c4149539583c6af",
+      "replacements": [
+        [
+          "Мобильные",
+          "NativeExchange"
+        ]
+      ],
+      "preserved": "all other bytes including UUIDs, GeneratedType opaque IDs, namespaces, full Properties, BOM/CRLF"
+    },
+    {
+      "fixture": "report.xml",
+      "source": ".artifacts/ba023/executor-platform-acceptance/work/D-base-canonical-probe-20261008/captured-hierarchical/Reports/ПрайсЛист.xml",
+      "source_sha256": "2476703f6763867010dc1a9a0d1c08bde2e0de9ed95052880617b21af1e458e8",
+      "fixture_sha256": "90d18300cfe91b99b0f640815713247ec96496bed7c80ab699b51ecb2aa0cdb6",
+      "replacements": [
+        [
+          "ПрайсЛист",
+          "NativeReport"
+        ]
+      ],
+      "preserved": "all other bytes including UUIDs, GeneratedType opaque IDs, namespaces, full Properties, BOM/CRLF"
+    }
+  ],
+  "evidence": [
+    ".artifacts/ba023/executor-platform-acceptance/work/D-base-canonical-probe-20261008/canonical-metadata-receipt.json",
+    ".artifacts/resolve-outstanding-implementation-20261107/final-acceptance/native-cycle-preparation/own-schema-review/native-packaging/corrected-v2/final-receipt.json",
+    ".artifacts/resolve-outstanding-implementation-20261107/final-acceptance/duplicate-interception-native-preparation-20261111/run/absent-applied-continuation/receipt.json"
+  ],
+  "second_shape_examples": [
+    "Documents/РасходТовара.xml (D native capture)",
+    "Reports/ОстаткиТоваровНаСкладах.xml (D native capture)",
+    "corrected-v2/delta-export Catalog (same accepted native roundtrip)"
+  ],
+  "limits": "source substitutions are infrastructure fixture sanitation, not native load acceptance or BSL semantic parsing"
+}

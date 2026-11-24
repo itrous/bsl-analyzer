@@ -3,6 +3,8 @@
 ## Description
 When using virtual tables in queries, relevant filters should be passed through the virtual table parameters.
 
+Virtual tables are classified by their full path and register family. `Catalog.Subconto` is not virtual merely because of its final name. The stored table `AccountingRegister.Name.ExtDimensions` also takes no parameters and does not require them.
+
 The current implementation reports calls where no argument is passed to the virtual table at all, for example:
 
 - no parentheses at all

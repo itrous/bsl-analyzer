@@ -1,0 +1,8 @@
+<DataCompositionSchema xmlns="http://v8.1c.ru/8.1/data-composition-system/schema" xmlns:set="http://v8.1c.ru/8.1/data-composition-system/settings" xmlns:core="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <dataSource><name>LocalSource</name><dataSourceType>Local</dataSourceType></dataSource>
+  <dataSet xsi:type="DataSetUnion"><name>All</name><dataSet xsi:type="DataSetQuery"><name>Partners</name><dataSource>LocalSource</dataSource><query>SELECT Ref
+FROM Catalog.Partners WHERE Code = &amp;Code</query><field><dataPath>Ref</dataPath><field>Ref</field></field><parameter><name>Code</name><expression>&amp;Code</expression></parameter></dataSet></dataSet>
+  <parameter><name>Code</name><valueType><core:Type>xs:string</core:Type></valueType><value xsi:type="xs:string"/></parameter>
+  <calculatedField><dataPath>Display</dataPath><expression>Ref</expression></calculatedField>
+  <settingsVariant><set:name>Main</set:name><set:settings><set:selection/></set:settings></settingsVariant>
+</DataCompositionSchema>

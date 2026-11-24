@@ -7,6 +7,42 @@ use tokio_util::sync::CancellationToken;
 
 const MAX_REQUEST_FRAME: usize = 6 * 8 * 1024 * 1024 + 64 * 1024;
 
+fn file_extension_diagnostic_subscriber<W>(writer: W) -> impl tracing::Subscriber + Send + Sync
+where
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
+    use tracing_subscriber::{layer::SubscriberExt, Layer};
+
+    tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer)
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                metadata.is_event()
+                    && metadata.target() == "native_check::file_extensions"
+                    && *metadata.level() == tracing::Level::WARN
+                    && metadata.fields().iter().all(|field| {
+                        matches!(
+                            field.name(),
+                            "message"
+                                | "stage"
+                                | "failure"
+                                | "termination"
+                                | "exit_code"
+                                | "process_error"
+                                | "stdout_bytes"
+                                | "stderr_bytes"
+                                | "streams_truncated"
+                                | "log_bytes"
+                                | "log_truncated"
+                        )
+                    })
+            })),
+    )
+}
+
 #[derive(Parser)]
 struct Args {
     #[arg(long)]
@@ -23,6 +59,13 @@ struct Registry {
 
 #[tokio::main]
 async fn main() {
+    if tracing::subscriber::set_global_default(file_extension_diagnostic_subscriber(
+        std::io::stderr,
+    ))
+    .is_err()
+    {
+        std::process::exit(2);
+    }
     let result = std::panic::catch_unwind(Args::parse);
     let args = match result {
         Ok(args) => args,
@@ -300,6 +343,61 @@ fn validate_stop_event(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_subscriber_filters_private_fields_targets_levels_and_spans() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        test_utils::with_subscriber(
+            file_extension_diagnostic_subscriber(Sink(bytes.clone())),
+            || {
+                tracing::warn!(target: "unrelated", raw_error = "secret-other-target", "private event");
+                tracing::warn!(target: "native_check::file_extensions::other", "secret-prefix-target");
+                tracing::info!(target: "native_check::file_extensions", "secret-info-event");
+                tracing::warn!(target: "native_check::file_extensions", raw_stdout = "secret-stdout", "private field");
+                let _span = tracing::warn_span!(target: "native_check::file_extensions", "secret-span", stage = "secret-span-field").entered();
+                tracing::warn!(
+                    target: "native_check::file_extensions",
+                    stage = "inspect_file_extensions",
+                    failure = "streams",
+                    termination = "completed",
+                    exit_code = 7_i32,
+                    stdout_bytes = 13_u64,
+                    stderr_bytes = 9_u64,
+                    streams_truncated = false,
+                    "File extension probe failed"
+                );
+            },
+        );
+        let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(text.trim_start().starts_with("WARN "));
+        assert!(text.contains("stage=\"inspect_file_extensions\""));
+        assert!(text.contains("exit_code=7"));
+        assert!(text.contains("stdout_bytes=13"));
+        assert!(text.contains("stderr_bytes=9"));
+        assert!(!text.contains("secret-"));
+        assert!(!text.contains('\u{1b}'));
+    }
 
     #[tokio::test]
     async fn request_frame_is_read_through_eof_and_rejects_one_byte_over_limit() {
