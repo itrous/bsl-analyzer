@@ -24,6 +24,21 @@ pub struct Configuration {
     #[serde(rename = "name")]
     name: String,
 
+    #[serde(default)]
+    compatibility_mode: Option<String>,
+
+    #[serde(default)]
+    modality_use_mode: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_run_mode: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ordinary_forms_in_managed_app_declared: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    extension_purpose: Option<String>,
+
     #[serde(rename = "commonModules", default)]
     common_modules: Vec<CommonModule>,
 
@@ -50,6 +65,9 @@ pub struct Configuration {
 
     #[serde(rename = "subsystems", default)]
     subsystems: Vec<crate::subsystem::Subsystem>,
+
+    #[serde(default)]
+    read_objects: Vec<crate::read_object::ReadObject>,
 
     #[serde(rename = "httpServices", default)]
     http_services: Vec<HTTPService>,
@@ -116,6 +134,12 @@ impl PartialEq for Configuration {
     fn eq(&self, other: &Self) -> bool {
         self.uuid == other.uuid
             && self.name == other.name
+            && self.compatibility_mode == other.compatibility_mode
+            && self.modality_use_mode == other.modality_use_mode
+            && self.default_run_mode == other.default_run_mode
+            && self.ordinary_forms_in_managed_app_declared
+                == other.ordinary_forms_in_managed_app_declared
+            && self.extension_purpose == other.extension_purpose
             && self.common_modules == other.common_modules
             && self.metadata_objects == other.metadata_objects
             && self.common_attribute_set == other.common_attribute_set
@@ -125,6 +149,7 @@ impl PartialEq for Configuration {
             && self.scheduled_jobs == other.scheduled_jobs
             && self.roles == other.roles
             && self.subsystems == other.subsystems
+            && self.read_objects == other.read_objects
             && self.http_services == other.http_services
             && self.web_services == other.web_services
             && self.integration_services == other.integration_services
@@ -140,6 +165,11 @@ impl Configuration {
         Self {
             uuid: Uuid::new_v4(),
             name: name.into(),
+            compatibility_mode: None,
+            modality_use_mode: None,
+            default_run_mode: None,
+            ordinary_forms_in_managed_app_declared: None,
+            extension_purpose: None,
             common_modules: Vec::new(),
             metadata_objects: Vec::new(),
             common_attribute_set: crate::CommonAttributeSet::default(),
@@ -149,6 +179,7 @@ impl Configuration {
             scheduled_jobs: Vec::new(),
             roles: Vec::new(),
             subsystems: Vec::new(),
+            read_objects: Vec::new(),
             uri_to_module: HashMap::new(),
             uri_lower_to_common_module: HashMap::new(),
             name_to_common_module: FxHashMap::default(),
@@ -179,6 +210,11 @@ impl Configuration {
         let config_node = root.children().find(|n| n.is_element()).ok_or_else(|| {
             crate::error::MetadataError::InvalidFormat("No Configuration element".to_string())
         })?;
+        if config_node.tag_name().name() != "Configuration" {
+            return Err(crate::error::MetadataError::InvalidFormat(
+                "Expected Configuration element".into(),
+            ));
+        }
 
         let uuid_str = config_node.attribute("uuid").unwrap_or("");
         let uuid = uuid_str.parse::<uuid::Uuid>().unwrap_or_else(|_| uuid::Uuid::new_v4());
@@ -217,9 +253,72 @@ impl Configuration {
 
         let mut config = Configuration::new(name);
         config.uuid = uuid;
+        if let Some(props) = crate::xml_parser::helpers::find_child(config_node, "Properties") {
+            config.compatibility_mode =
+                crate::xml_parser::helpers::child_text(props, "CompatibilityMode")
+                    .map(str::to_owned);
+            config.ordinary_forms_in_managed_app_declared = crate::xml_parser::helpers::child_text(
+                props,
+                "UseOrdinaryFormInManagedApplication",
+            )
+            .and_then(|value| {
+                if value.eq_ignore_ascii_case("true") {
+                    Some(true)
+                } else if value.eq_ignore_ascii_case("false") {
+                    Some(false)
+                } else {
+                    None
+                }
+            });
+            config.default_run_mode =
+                crate::xml_parser::helpers::child_text(props, "DefaultRunMode").map(str::to_owned);
+            config.extension_purpose =
+                crate::xml_parser::helpers::child_text(props, "ConfigurationExtensionPurpose")
+                    .map(str::to_owned);
+            config.modality_use_mode =
+                crate::xml_parser::helpers::child_text(props, "ModalityUseMode").map(str::to_owned);
+        }
         config.use_managed_form_in_ordinary_application = use_managed_form_in_ordinary_application;
         config.use_ordinary_form_in_managed_application = use_ordinary_form_in_managed_application;
         Ok(config)
+    }
+
+    /// The explicit ordinary-form setting; missing or invalid header values remain unknown.
+    pub fn ordinary_forms_in_managed_application_declared(&self) -> Option<bool> {
+        self.ordinary_forms_in_managed_app_declared
+    }
+
+    /// The application mode declared by this configuration header, when present.
+    pub fn default_run_mode(&self) -> Option<&str> {
+        self.default_run_mode.as_deref()
+    }
+
+    /// Whether the header explicitly identifies a configuration extension.
+    pub fn is_extension(&self) -> bool {
+        self.extension_purpose.is_some()
+    }
+
+    pub fn compatibility_mode(&self) -> Option<&str> {
+        self.compatibility_mode.as_deref()
+    }
+
+    pub fn modality_use_mode(&self) -> Option<&str> {
+        self.modality_use_mode.as_deref()
+    }
+
+    /// Copy only the configuration header; collections keep their own source inputs.
+    pub fn apply_source_header(&mut self, header: &Self) {
+        self.uuid = header.uuid;
+        self.name.clone_from(&header.name);
+        self.compatibility_mode.clone_from(&header.compatibility_mode);
+        self.modality_use_mode.clone_from(&header.modality_use_mode);
+        self.default_run_mode.clone_from(&header.default_run_mode);
+        self.ordinary_forms_in_managed_app_declared = header.ordinary_forms_in_managed_app_declared;
+        self.extension_purpose.clone_from(&header.extension_purpose);
+        self.use_managed_form_in_ordinary_application =
+            header.use_managed_form_in_ordinary_application;
+        self.use_ordinary_form_in_managed_application =
+            header.use_ordinary_form_in_managed_application;
     }
 
     #[allow(dead_code)]
@@ -506,6 +605,14 @@ impl Configuration {
             }
         }
 
+        for object in &extension.read_objects {
+            if let Some(base) = self.read_objects.iter_mut().find(|base| object.adopts(base)) {
+                base.apply_overlay(object);
+            } else {
+                self.read_objects.push(object.clone());
+            }
+        }
+
         self.build_caches();
     }
 
@@ -659,6 +766,25 @@ impl Configuration {
         &self.subsystems
     }
 
+    pub fn read_objects(&self) -> &[crate::read_object::ReadObject] {
+        &self.read_objects
+    }
+
+    pub fn find_read_object(
+        &self,
+        kind: crate::read_object::ReadObjectKind,
+        name: &str,
+    ) -> Option<&crate::read_object::ReadObject> {
+        self.read_objects
+            .iter()
+            .rev()
+            .find(|object| object.kind == kind && stdx::case::eq_ignore_case(&object.name, name))
+    }
+
+    pub fn add_read_object(&mut self, object: crate::read_object::ReadObject) {
+        self.read_objects.push(object);
+    }
+
     pub fn add_subsystem(&mut self, subsystem: crate::subsystem::Subsystem) {
         self.subsystems.push(subsystem);
     }
@@ -770,6 +896,16 @@ impl Configuration {
     /// maintains alongside them. New heap-owning fields must be added here too.
     pub fn estimated_heap_size(&self) -> usize {
         let mut bytes = self.name.capacity() + self.common_attribute_set.estimated_heap_size();
+        bytes += self.default_run_mode.as_ref().map_or(0, String::capacity)
+            + self.extension_purpose.as_ref().map_or(0, String::capacity)
+            + self.compatibility_mode.as_ref().map_or(0, String::capacity)
+            + self.modality_use_mode.as_ref().map_or(0, String::capacity)
+            + stdx::heap::vec_bytes::<crate::read_object::ReadObject>(self.read_objects.len())
+            + self
+                .read_objects
+                .iter()
+                .map(crate::read_object::ReadObject::estimated_heap_size)
+                .sum::<usize>();
 
         bytes += stdx::heap::vec_bytes::<CommonModule>(self.common_modules.len())
             + self.common_modules.iter().map(CommonModule::estimated_heap_size).sum::<usize>();
@@ -2108,7 +2244,7 @@ mod tests {
     }
 
     #[test]
-    fn overlay_merge_rebuilds_recorder_cache() {
+    fn adopted_document_preserves_base_and_extension_register_records() {
         use crate::enums::ObjectBelonging;
 
         let doc_name = "Документ1";
@@ -2123,8 +2259,10 @@ mod tests {
         let mut overlay_document = MetadataObject::new(MdoType::Document, doc_name);
         overlay_document.set_object_belonging(ObjectBelonging::Adopted);
         overlay_document.set_extends_uuid(base_uuid);
-        overlay_document
-            .set_register_records(vec![(MdoType::InformationRegister, "B".to_string())]);
+        overlay_document.set_register_records(vec![
+            (MdoType::InformationRegister, "B".to_string()),
+            (MdoType::InformationRegister, "b".to_string()),
+        ]);
         extension.add_metadata_object(overlay_document);
 
         let merged = base.merged_with_extension(
@@ -2137,7 +2275,17 @@ mod tests {
             merged.recorders_for_register(MdoType::InformationRegister, "B"),
             &[doc_name.to_string()],
         );
-        assert!(merged.recorders_for_register(MdoType::InformationRegister, "A").is_empty());
+        assert_eq!(
+            merged.recorders_for_register(MdoType::InformationRegister, "A"),
+            &[doc_name.to_string()],
+        );
+        assert_eq!(
+            merged.find_metadata_object(MdoType::Document, doc_name).unwrap().register_records(),
+            &[
+                (MdoType::InformationRegister, "A".to_string()),
+                (MdoType::InformationRegister, "B".to_string()),
+            ],
+        );
     }
 
     #[test]

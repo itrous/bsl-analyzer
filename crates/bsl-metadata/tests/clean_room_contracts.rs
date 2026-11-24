@@ -52,7 +52,8 @@ fn ownership_tokens_and_invalid_base_reference_keep_the_preserved_fallbacks() {
     for (value, expected) in [
         (Some("Adopted"), ObjectBelonging::Adopted),
         (Some("Own"), ObjectBelonging::Own),
-        (None, ObjectBelonging::Unknown),
+        (Some("Native"), ObjectBelonging::Own),
+        (None, ObjectBelonging::Own),
         (Some(""), ObjectBelonging::Unknown),
         (Some("FutureOwnership"), ObjectBelonging::Unknown),
     ] {
@@ -326,7 +327,7 @@ fn duplicate_name_and_uri_indexes_keep_distinct_winners_after_add_and_rebuild() 
 }
 
 #[test]
-fn root_xml_flags_and_identity_remain_distinct_from_disk_loader_defaults() {
+fn root_xml_flags_and_identity_survive_disk_loading() {
     let raw = Configuration::from_xml_str(ROOT).unwrap();
     assert_eq!(raw.name(), "Наблюдения");
     assert_eq!(raw.uuid().to_string(), "15300000-0000-4000-8000-000000000006");
@@ -337,10 +338,16 @@ fn root_xml_flags_and_identity_remain_distinct_from_disk_loader_defaults() {
     std::fs::create_dir(dir.path().join("CommonModules")).unwrap();
     std::fs::write(dir.path().join("CommonModules/ЁжModule.xml"), MODULE).unwrap();
     let loaded = load_from_directory(dir.path()).unwrap();
-    assert_eq!(loaded.name(), "Configuration");
-    assert_eq!(loaded.uuid().get_version_num(), 4);
-    assert!(!loaded.use_managed_form_in_ordinary_application());
-    assert!(!loaded.use_ordinary_form_in_managed_application());
+    assert_eq!(loaded.name(), raw.name());
+    assert_eq!(loaded.uuid(), raw.uuid());
+    assert_eq!(
+        loaded.use_managed_form_in_ordinary_application(),
+        raw.use_managed_form_in_ordinary_application()
+    );
+    assert_eq!(
+        loaded.use_ordinary_form_in_managed_application(),
+        raw.use_ordinary_form_in_managed_application()
+    );
     // Full loading keys on the XML like discovery does; the directory only
     // accompanies a body.
     assert!(loaded.find_common_module("ёЖmODULE").is_some_and(|m| m.is_server()));

@@ -41,10 +41,14 @@ pub(super) fn run_build_within(
     .entered();
     tracing::debug!(phase = "build", "call hierarchy compact index worker started");
     let recovery_lifecycle = context.lifecycle.clone();
+    let disk_read = context.frozen.disk_read.clone();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(context)));
 
     match result {
         Ok(task) => task,
+        Err(_) if !disk_read.is_current() => {
+            superseded(&recovery_lifecycle, source_root, generation, "workspace_disk_epoch_changed")
+        }
         Err(_) => {
             tracing::error!(
                 ?source_root,

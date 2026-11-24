@@ -99,6 +99,25 @@ mod tests {
 "#;
 
     #[test]
+    fn xml_string_aliases_keep_the_existing_configured_compatibility_policy() {
+        let source = "Procedure Test()\nRU = XMLСтрока('20260102');\nEN = XMLString('20260102');\nEndProcedure";
+        for mode in [
+            None,
+            Some("DontUse"),
+            Some("Version8_2_13"),
+            Some("Version8_3_17"),
+            Some("Version8_3_27"),
+        ] {
+            assert!(hidden(source, mode).is_empty(), "{mode:?}");
+        }
+        let control = format!("{source}\n{STR_SPLIT}");
+        let old_mode = hidden(&control, Some("Version8_2_13"));
+        assert_eq!(old_mode.len(), 1, "{old_mode:?}");
+        assert!(old_mode[0].contains("'СтрРазделить'"), "{old_mode:?}");
+        assert!(hidden(&control, Some("Version8_3_17")).is_empty());
+    }
+
+    #[test]
     fn a_global_hidden_by_an_8_2_mode_is_reported() {
         let reported = hidden(STR_SPLIT, Some("Version8_2_13"));
         assert_eq!(reported.len(), 1, "{reported:?}");

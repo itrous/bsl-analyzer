@@ -108,7 +108,7 @@ impl VendorSupport {
                 return Err(VendorSupportError {
                     offset: 0,
                     message: format!("cannot read: {error}"),
-                })
+                });
             }
         };
         support.configuration_root = configuration_root_uuid(config_root);

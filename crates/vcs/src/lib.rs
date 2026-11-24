@@ -25,7 +25,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use git2::{Delta, DiffOptions, Repository};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -49,7 +49,7 @@ pub struct FileChange {
 /// so callers can resolve report keys to absolute paths.
 #[derive(Debug)]
 pub struct RepoDiff {
-    /// Absolute path of the repository working directory.
+    /// Canonical absolute path of the repository working directory.
     pub workdir: PathBuf,
     pub report: DiffReport,
 }
@@ -128,8 +128,9 @@ fn discover_repo(repo_path: &Path) -> Result<Repository> {
 
 fn repo_workdir(repo: &Repository) -> Result<PathBuf> {
     repo.workdir()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| anyhow!("bare repository has no working directory"))
+        .ok_or_else(|| anyhow!("bare repository has no working directory"))?
+        .canonicalize()
+        .context("failed to canonicalize repository working directory")
 }
 
 fn resolve_commit<'r>(repo: &'r Repository, refname: &str) -> Result<git2::Commit<'r>> {
@@ -296,7 +297,30 @@ mod tests {
         let change = &diff.report.files["src/cf/CommonModules/M/Ext/Module.bsl"];
         assert_eq!(change.hunks.as_deref(), Some(&[[3, 3]][..]));
         assert_eq!(diff.report.files.len(), 1);
-        assert_eq!(diff.workdir, t.root());
+        assert_eq!(diff.workdir, t.root().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn diff_reports_anchor_native_git_paths_to_the_canonical_workdir() {
+        let t = TestRepo::new();
+        t.write("src/Own.bsl", &five_lines("Перем В;"));
+        t.commit("vendor");
+        t.branch("vendor");
+        t.write("src/Own.bsl", &five_lines("Перем Наша;"));
+        t.commit("change line 3");
+
+        let expected_root = t.root().canonicalize().unwrap();
+        let expected_file = t.root().join("src/Own.bsl").canonicalize().unwrap();
+        for diff in [
+            generate_diff_report(t.root(), "vendor", "HEAD", true).unwrap(),
+            generate_workdir_diff_report(t.root(), "vendor", true).unwrap(),
+        ] {
+            assert_eq!(diff.workdir, expected_root);
+            assert_eq!(diff.report.files.len(), 1);
+            let change = &diff.report.files["src/Own.bsl"];
+            assert_eq!(change.hunks.as_deref(), Some(&[[3, 3]][..]));
+            assert_eq!(diff.workdir.join("src/Own.bsl"), expected_file);
+        }
     }
 
     #[test]

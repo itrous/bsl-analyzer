@@ -388,6 +388,145 @@
       "rationale": "The extract keeps only the first five entries of a parameter's type list, so Дата — the first type the help documents after the scalars, and the one most often written here — is reported as a type mismatch at Error severity. Enumerating the admissible set in its place is not possible: it includes every configuration reference type and every system enumeration value, which the extract has no name for. «Произвольный» states what the platform states — this parameter carries no static constraint — and leaves the arguments that really are wrong (Массив, Структура, Тип) to the run-time conversion error, where the platform itself leaves them."
     }
   ],
+  "call_value_effects": [
+    {
+      "target": {
+        "kind": "function",
+        "name": "String"
+      },
+      "effect": "argument_to_result",
+      "parameter_index": 0,
+      "evidence_source": "1C:Enterprise 8.3.27 Syntax Assistant, String.",
+      "rationale": "The result is the string representation of the argument."
+    },
+    {
+      "target": {
+        "kind": "function",
+        "name": "XMLString"
+      },
+      "effect": "argument_to_result",
+      "parameter_index": 0,
+      "evidence_source": "1C:Enterprise 8.3.27 Syntax Assistant, XMLString.",
+      "rationale": "The result is the XML representation of the argument."
+    },
+    {
+      "target": {
+        "kind": "function",
+        "name": "StrConcat"
+      },
+      "effect": "argument_to_result",
+      "parameter_index": 0,
+      "evidence_source": "1C:Enterprise 8.3.27 Syntax Assistant, StrConcat.",
+      "rationale": "The result joins the input collection's strings."
+    },
+    {
+      "target": {
+        "kind": "function",
+        "name": "StrConcat"
+      },
+      "effect": "argument_to_result",
+      "parameter_index": 1,
+      "evidence_source": "1C:Enterprise 8.3.27 Syntax Assistant, StrConcat.",
+      "rationale": "The separator can appear between elements in the result."
+    },
+    {
+      "target": {
+        "kind": "constructor",
+        "type": "Array",
+        "variant": "На основании фиксированного массива"
+      },
+      "effect": "argument_to_result",
+      "parameter_index": 0,
+      "evidence_source": "1C:Enterprise 8.3.27 Syntax Assistant, Array, based on a fixed array.",
+      "rationale": "The new array copies values from the fixed array."
+    },
+    {
+      "target": {
+        "kind": "constructor",
+        "type": "Structure",
+        "variant": "По ключам и значениям"
+      },
+      "effect": "argument_to_result",
+      "parameter_index": 1,
+      "evidence_source": "1C:Enterprise 8.3.27 Syntax Assistant, Structure, by keys and values.",
+      "rationale": "The second parameter and its variadic tail supply stored values."
+    },
+    {
+      "target": {
+        "kind": "constructor",
+        "type": "Structure",
+        "variant": "На основании фиксированной структуры"
+      },
+      "effect": "argument_to_result",
+      "parameter_index": 0,
+      "evidence_source": "1C:Enterprise 8.3.27 Syntax Assistant, Structure, based on a fixed structure.",
+      "rationale": "The new structure copies values from the fixed structure."
+    },
+    {
+      "target": {
+        "kind": "method",
+        "type": "Array",
+        "name": "Add"
+      },
+      "effect": "argument_to_receiver",
+      "parameter_index": 0,
+      "evidence_source": "1C:Enterprise 8.3.27 Syntax Assistant, Array.Add.",
+      "rationale": "The parameter supplies the value appended to the array."
+    },
+    {
+      "target": {
+        "kind": "method",
+        "type": "Array",
+        "name": "Insert"
+      },
+      "effect": "argument_to_receiver",
+      "parameter_index": 1,
+      "evidence_source": "1C:Enterprise 8.3.27 Syntax Assistant, Array.Insert.",
+      "rationale": "The second parameter supplies the stored value. The first parameter selects its index."
+    },
+    {
+      "target": {
+        "kind": "method",
+        "type": "Array",
+        "name": "Add"
+      },
+      "effect": "no_argument_writeback",
+      "parameter_count": 1,
+      "evidence_source": "Linux 1C:Enterprise 8.3.27.2130 runtime probe EPF SHA-256 0761b89466aefdce2cb1ecc797266fb5f9875406bf24040d781659caeb2b922d: V = \"add\"; A = New Array; A.Add(V) leaves V = \"add\" and adds that value at A[0].",
+      "rationale": "Adding an element leaves the caller's value variable unchanged. The analysis retains its existing value after this signature when passing is unstated."
+    },
+    {
+      "target": {
+        "kind": "method",
+        "type": "Array",
+        "name": "Insert"
+      },
+      "effect": "no_argument_writeback",
+      "parameter_count": 2,
+      "evidence_source": "Linux 1C:Enterprise 8.3.27.2130 runtime probe EPF SHA-256 0761b89466aefdce2cb1ecc797266fb5f9875406bf24040d781659caeb2b922d: I = 0; V = \"insert\"; A.Insert(I, V) leaves I = 0 and V = \"insert\" and inserts that value at A[0].",
+      "rationale": "Inserting the element leaves both caller variables unchanged. The analysis retains their existing values after this signature when passing is unstated."
+    },
+    {
+      "target": {
+        "kind": "method",
+        "type": "Array",
+        "name": "Count"
+      },
+      "effect": "receiver_to_result",
+      "evidence_source": "1C:Enterprise 8.3.27 Syntax Assistant, Array.Count.",
+      "rationale": "The returned count reflects which elements the receiver contains."
+    },
+    {
+      "target": {
+        "kind": "method",
+        "type": "Array",
+        "name": "Clear"
+      },
+      "effect": "clear_receiver",
+      "evidence_source": "1C:Enterprise 8.3.27 Syntax Assistant, Array.Clear.",
+      "rationale": "The array is emptied in place."
+    }
+  ],
   "type_property_additions": [
     {
       "canonical_type": "ClientApplicationForm",
@@ -532,6 +671,30 @@
       "verified_against_version": "8.3.17",
       "evidence_source": "The bundled corpus keys members by the ENGLISH type name: in crates/bsl-platform/data/platform_facts.json `FormButton` carries 39 properties and no method, while the Russian spelling КнопкаФормы appears only in the type record (min_version 8.2) — a count filtered on the Russian name reads as zero, which is a trap of the data shape and not a gap of the extract. Those 39 names are identical, name for name, to the list the indexed 8.3.17 help returns for КнопкаФормы (39 properties, no method): neither side holds a name the other lacks. The highest min_version among the 39 is 8.3.16, so the whole attested surface predates 8.3.17 and no member of it is dated later. The installed 8.5.1 corpus documents 45 properties, and the six extras (ФоноваяКартинка, ЭффектОтображенияФоновойКартинки, ВыравниваниеКартинкиИЗаголовкаКарточки, Важность, ВысотаКартинки, ОтображатьКакКарточку) each carry min_version 8.5.1, so a newer corpus only adds dated members to the same surface. Neither Подсказка nor ОтображениеКнопки is in either list; the help has Отображение, whose TYPE is ОтображениеКнопки, which is how the misspelling arises. The corpus documents 46 types whose English name contains `form extension`, 36 of them with properties, and none widens a button: the only element-level ones extend an HTML document field (12 properties) and a PDF document field (15); of the 166 types whose name carries the word `extension`, none is named after a form button, and the three that mention one belong to a radio-button field and to a button group. The name is unique: exactly one of the 2350 corpus types folds to КнопкаФормы / FormButton. No docs-gap overlay of crates/bsl-platform/src/db.rs covers it — the name occurs nowhere in crates/bsl-platform/src. A live run on 8.3.17.1549 answers an assignment to the button's Подсказка with «Поле объекта не обнаружено (Подсказка)», while РасширеннаяПодсказка.Заголовок on the same element reads and writes normally, so the miss is a defect of the checked code.",
       "rationale": "A form button is a leaf element whose members are its 39 properties and nothing else, and no extension family of the corpus widens it, so the extracted list is the platform's own surface (the per-MDO extensions that give a managed form its properties belong to the form, not to its button). Both surfaces are attested: the type has no method, so a call on a button is a miss, and a property such as `Подсказка` or `ОтображениеКнопки` assigned on one is a miss the platform answers with an execution error. The version is 8.3.17 rather than the release the corpus was pinned from, because this field decides which served corpora the attestation applies to, and the measurement above shows the surface complete at 8.3.17: every attested member is dated 8.3.16 or earlier, and the 8.3.17 help lists exactly the same names. Dating it later would leave every 8.3.17 configuration unjudged, which is precisely where the defect was found — measured on a copy of a production configuration declaring 8.3.17.1549, where the probe assignment produced no finding while an unknown item NAME on the same run did. The earlier name check kept the button out because `form` is a substring of `FormButton`; the curating test now asks whether an extension family widens the type, which for the button it does not."
+    },
+    {
+      "type": "DOMNodeType",
+      "verified_against_version": "8.3.27",
+      "members": {
+        "methods": [],
+        "properties": [
+          "Attribute",
+          "CDATASection",
+          "Comment",
+          "Document",
+          "DocumentFragment",
+          "DocumentType",
+          "Element",
+          "Entity",
+          "EntityReference",
+          "Notation",
+          "ProcessingInstruction",
+          "Text",
+          "XPathNamespace"
+        ]
+      },
+      "evidence_source": "The pinned 8.3.27 platform_data.json identified in PROVENANCE.md (SHA-256 3c759994cbd82a1522b1c497d9f2ef68c77b776d5c6723ba5a72623b570cacce) lists DOMNodeType / ТипУзлаDOM as one type with no methods and exactly 13 properties, ids 2468-2480. The corpus-contract test checks every id and both member names against that corpus; the served snapshot must carry exactly this member set. The type has no docs-gap synthesized members and is not extended by configuration metadata.",
+      "rationale": "The enumeration has a fixed value surface. Its documented Element / Элемент exists, while УзелЭлемента does not. Exact member-set matching refuses truncated or changed extracts before the existing version and unique-owner gates can attest a missing member."
     }
   ],
   "parameter_passing_attestations": [

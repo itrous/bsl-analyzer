@@ -1,0 +1,2542 @@
+{
+ "rows": [
+  {
+   "id": "windows-L-ba023",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "&НаКлиенте\nПроцедура Тест(Команда)\nКонецПроцедуры\n&НаСервереБезКонтекста\nФункция Тест2(Знач А) Экспорт\n    Возврат А;\nКонецФункции\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonForm.BA023Managed"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-L-ba023-negative",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "&НаКлиенте\nПроцедура Тест(Команда)\nКонецПроцедуры\n&НаСервереБезКонтекста\nФункция Тест2(Знач А) Экспорт\n    @;\nКонецФункции\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonForm.BA023Managed"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "position": [
+     6,
+     5
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-L-snippet",
+   "fixture": "L",
+   "scope": "legacy_snippet",
+   "arguments": {
+    "action": "check",
+    "code": "А = 1;",
+    "connection": "L",
+    "max_output_tokens": 6000
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-L-snippet-negative",
+   "fixture": "L",
+   "scope": "legacy_snippet",
+   "arguments": {
+    "action": "check",
+    "code": "А = @;",
+    "connection": "L",
+    "max_output_tokens": 6000
+   },
+   "expected": {
+    "position": [
+     1,
+     4
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-L-snippet-words",
+   "fixture": "L",
+   "scope": "legacy_snippet",
+   "arguments": {
+    "action": "check",
+    "code": "// Функция\nСообщить(\"Процедура\");",
+    "connection": "L",
+    "max_output_tokens": 6000
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-L-snippet-bom-crlf",
+   "fixture": "L",
+   "scope": "legacy_snippet",
+   "arguments": {
+    "action": "check",
+    "code": "﻿А = 1;\r\n",
+    "connection": "L",
+    "max_output_tokens": 6000
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-L-snippet-eof",
+   "fixture": "L",
+   "scope": "legacy_snippet",
+   "arguments": {
+    "action": "check",
+    "code": "Если Истина Тогда\n    А = 1;",
+    "connection": "L",
+    "max_output_tokens": 6000
+   },
+   "expected": {
+    "position": [
+     2,
+     11
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-L-metadata-object",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = 1;\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "Catalog.BA023Catalog"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "object"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-L-metadata-object-negative",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = @;\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "Catalog.BA023Catalog"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "object"
+   },
+   "expected": {
+    "position": [
+     2,
+     8
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-L-metadata-manager",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = 1;\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "Catalog.BA023Catalog"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "manager"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-L-metadata-manager-negative",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = @;\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "Catalog.BA023Catalog"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "manager"
+   },
+   "expected": {
+    "position": [
+     2,
+     8
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-L-metadata-managed_form",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = 1;\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonForm.BA023Managed"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-L-metadata-managed_form-negative",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = @;\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonForm.BA023Managed"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "position": [
+     2,
+     8
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-L-metadata-ordinary_form",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = 1;\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonForm.BA023Ordinary"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "ordinary_form"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-L-metadata-ordinary_form-negative",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = @;\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonForm.BA023Ordinary"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "ordinary_form"
+   },
+   "expected": {
+    "position": [
+     2,
+     8
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-L-metadata-common",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n#Если Сервер Тогда\n    А = Метаданные.Справочники.BA023Catalog;\n#КонецЕсли\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonModule.BA023Common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-L-metadata-common-negative",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n#Если Сервер Тогда\n    А = @;\n#КонецЕсли\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonModule.BA023Common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "position": [
+     3,
+     8
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-L-synthetic-object",
+   "fixture": "L",
+   "scope": "explicit_synthetic_native",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = 1;\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "synthetic",
+     "module_type": "object"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "object"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-L-synthetic-object-negative",
+   "fixture": "L",
+   "scope": "explicit_synthetic_native",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = @;\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "synthetic",
+     "module_type": "object"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "object"
+   },
+   "expected": {
+    "position": [
+     2,
+     8
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-L-synthetic-manager",
+   "fixture": "L",
+   "scope": "explicit_synthetic_native",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = 1;\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "synthetic",
+     "module_type": "manager"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "manager"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-L-synthetic-manager-negative",
+   "fixture": "L",
+   "scope": "explicit_synthetic_native",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = @;\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "synthetic",
+     "module_type": "manager"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "manager"
+   },
+   "expected": {
+    "position": [
+     2,
+     8
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-L-synthetic-managed_form",
+   "fixture": "L",
+   "scope": "explicit_synthetic_native",
+   "arguments": {
+    "action": "check",
+    "code": "&НаКлиенте\nПроцедура Тест(Команда)\nКонецПроцедуры\n&НаСервереБезКонтекста\nФункция Тест2(Знач А) Экспорт\n    Возврат А;\nКонецФункции\n",
+    "connection": "L",
+    "context": {
+     "kind": "synthetic",
+     "module_type": "managed_form"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-L-synthetic-managed_form-negative",
+   "fixture": "L",
+   "scope": "explicit_synthetic_native",
+   "arguments": {
+    "action": "check",
+    "code": "&НаКлиенте\nПроцедура Тест(Команда)\nКонецПроцедуры\n&НаСервереБезКонтекста\nФункция Тест2(Знач А) Экспорт\n    @;\nКонецФункции\n",
+    "connection": "L",
+    "context": {
+     "kind": "synthetic",
+     "module_type": "managed_form"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "position": [
+     6,
+     5
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-L-synthetic-ordinary_form",
+   "fixture": "L",
+   "scope": "explicit_synthetic_native",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = 1;\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "synthetic",
+     "module_type": "ordinary_form"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "ordinary_form"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-L-synthetic-ordinary_form-negative",
+   "fixture": "L",
+   "scope": "explicit_synthetic_native",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = @;\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "synthetic",
+     "module_type": "ordinary_form"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "ordinary_form"
+   },
+   "expected": {
+    "position": [
+     2,
+     8
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-L-synthetic-common",
+   "fixture": "L",
+   "scope": "explicit_synthetic_native",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = 1;\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "synthetic",
+     "module_type": "common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-L-synthetic-common-negative",
+   "fixture": "L",
+   "scope": "explicit_synthetic_native",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = @;\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "synthetic",
+     "module_type": "common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "position": [
+     2,
+     8
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-L-module-geometry",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "﻿&НаСервереБезКонтекста\r\nПроцедура Тест()\r\n\tА = \"😀\"; @;\r\nКонецПроцедуры",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonForm.BA023Managed"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "position": [
+     3,
+     12
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-L-module-last-line",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест()\nКонецПроцедуры\n@;",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonModule.BA023Common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "position": [
+     2,
+     15
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-L-module-marker-event",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "&НаСервере\nПроцедура ПриСозданииНаСервере(Отказ, СтандартнаяОбработка)\nЗапись = Новый ЗаписьТекста(\"{SENTINELS}\\L-no-execution.marker\");\nЗапись.Закрыть();\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonForm.BA023Managed"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "execution_marker_must_not_exist": "{SENTINELS}\\L-no-execution.marker",
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-L-module-missing-context",
+   "fixture": "L",
+   "scope": "preflight_context_required",
+   "arguments": {
+    "action": "check",
+    "code": "&НаКлиенте\nПроцедура Тест(Команда)\nКонецПроцедуры\n&НаСервереБезКонтекста\nФункция Тест2(Знач А) Экспорт\n    Возврат А;\nКонецФункции\n",
+    "connection": "L",
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "status": "context_required"
+   }
+  },
+  {
+   "id": "windows-L-module-marker-initializer",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = 1;\nКонецПроцедуры\n\nЗапись = Новый ЗаписьТекста(\"{SENTINELS}\\L-no-execution.marker\");\nЗапись.Закрыть();",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "Catalog.BA023Catalog"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "object"
+   },
+   "expected": {
+    "execution_marker_must_not_exist": "{SENTINELS}\\L-no-execution.marker",
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-L-compatibility-global",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = СтрРазделить(\"а,б\", \",\");\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonModule.BA023Common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "position": [
+     2,
+     9
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-L-base-field-ref",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = BA023_ExtraField;\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "Catalog.BA023Catalog"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "object"
+   },
+   "expected": {
+    "position": [
+     2,
+     9
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-L-branch-thin",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n#Если ТонкийКлиент Тогда\n    БА023НесуществующаяПроцедура();\n#КонецЕсли\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonModule.BA023Common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "position": [
+     3,
+     5
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-L-branch-server",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n#Если Сервер Тогда\n    БА023НесуществующаяПроцедура();\n#КонецЕсли\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonModule.BA023Common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "position": [
+     3,
+     5
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-L-branch-external",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n#Если ВнешнееСоединение Тогда\n    БА023НесуществующаяПроцедура();\n#КонецЕсли\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonModule.BA023Common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "position": [
+     3,
+     5
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-L-branch-ordinary",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n#Если ТолстыйКлиентОбычноеПриложение Тогда\n    БА023НесуществующаяПроцедура();\n#КонецЕсли\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonModule.BA023Common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "position": [
+     3,
+     5
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-L-no-execution-marker",
+   "fixture": "L",
+   "scope": "legacy_snippet",
+   "arguments": {
+    "action": "check",
+    "code": "А = Новый ЗаписьТекста(\"{SENTINELS}\\L-no-execution.marker\");",
+    "connection": "L",
+    "max_output_tokens": 6000
+   },
+   "expected": {
+    "execution_marker_must_not_exist": "{SENTINELS}\\L-no-execution.marker",
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-ba023",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "&НаКлиенте\nПроцедура Тест(Команда)\nКонецПроцедуры\n&НаСервереБезКонтекста\nФункция Тест2(Знач А) Экспорт\n    Возврат А;\nКонецФункции\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonForm.BA023Managed"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-ba023-negative",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "&НаКлиенте\nПроцедура Тест(Команда)\nКонецПроцедуры\n&НаСервереБезКонтекста\nФункция Тест2(Знач А) Экспорт\n    @;\nКонецФункции\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonForm.BA023Managed"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "position": [
+     6,
+     5
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-snippet",
+   "fixture": "M",
+   "scope": "legacy_snippet",
+   "arguments": {
+    "action": "check",
+    "code": "А = 1;",
+    "connection": "M",
+    "max_output_tokens": 6000
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-snippet-negative",
+   "fixture": "M",
+   "scope": "legacy_snippet",
+   "arguments": {
+    "action": "check",
+    "code": "А = @;",
+    "connection": "M",
+    "max_output_tokens": 6000
+   },
+   "expected": {
+    "position": [
+     1,
+     4
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-snippet-words",
+   "fixture": "M",
+   "scope": "legacy_snippet",
+   "arguments": {
+    "action": "check",
+    "code": "// Функция\nСообщить(\"Процедура\");",
+    "connection": "M",
+    "max_output_tokens": 6000
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-snippet-bom-crlf",
+   "fixture": "M",
+   "scope": "legacy_snippet",
+   "arguments": {
+    "action": "check",
+    "code": "﻿А = 1;\r\n",
+    "connection": "M",
+    "max_output_tokens": 6000
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-snippet-eof",
+   "fixture": "M",
+   "scope": "legacy_snippet",
+   "arguments": {
+    "action": "check",
+    "code": "Если Истина Тогда\n    А = 1;",
+    "connection": "M",
+    "max_output_tokens": 6000
+   },
+   "expected": {
+    "position": [
+     2,
+     11
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-metadata-object",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = 1;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "Catalog.BA023Catalog"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "object"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-metadata-object-negative",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = @;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "Catalog.BA023Catalog"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "object"
+   },
+   "expected": {
+    "position": [
+     2,
+     8
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-metadata-manager",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = 1;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "Catalog.BA023Catalog"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "manager"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-metadata-manager-negative",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = @;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "Catalog.BA023Catalog"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "manager"
+   },
+   "expected": {
+    "position": [
+     2,
+     8
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-metadata-managed_form",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = 1;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonForm.BA023Managed"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-metadata-managed_form-negative",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = @;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonForm.BA023Managed"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "position": [
+     2,
+     8
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-metadata-ordinary_form",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = 1;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonForm.BA023Ordinary"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "ordinary_form"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-metadata-ordinary_form-negative",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = @;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonForm.BA023Ordinary"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "ordinary_form"
+   },
+   "expected": {
+    "position": [
+     2,
+     8
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-metadata-common",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n#Если Сервер Тогда\n    А = Метаданные.Справочники.BA023Catalog;\n#КонецЕсли\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonModule.BA023Common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-metadata-common-negative",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n#Если Сервер Тогда\n    А = @;\n#КонецЕсли\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonModule.BA023Common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "position": [
+     3,
+     8
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-synthetic-object",
+   "fixture": "M",
+   "scope": "explicit_synthetic_native",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = 1;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "synthetic",
+     "module_type": "object"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "object"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-synthetic-object-negative",
+   "fixture": "M",
+   "scope": "explicit_synthetic_native",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = @;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "synthetic",
+     "module_type": "object"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "object"
+   },
+   "expected": {
+    "position": [
+     2,
+     8
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-synthetic-manager",
+   "fixture": "M",
+   "scope": "explicit_synthetic_native",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = 1;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "synthetic",
+     "module_type": "manager"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "manager"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-synthetic-manager-negative",
+   "fixture": "M",
+   "scope": "explicit_synthetic_native",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = @;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "synthetic",
+     "module_type": "manager"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "manager"
+   },
+   "expected": {
+    "position": [
+     2,
+     8
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-synthetic-managed_form",
+   "fixture": "M",
+   "scope": "explicit_synthetic_native",
+   "arguments": {
+    "action": "check",
+    "code": "&НаКлиенте\nПроцедура Тест(Команда)\nКонецПроцедуры\n&НаСервереБезКонтекста\nФункция Тест2(Знач А) Экспорт\n    Возврат А;\nКонецФункции\n",
+    "connection": "M",
+    "context": {
+     "kind": "synthetic",
+     "module_type": "managed_form"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-synthetic-managed_form-negative",
+   "fixture": "M",
+   "scope": "explicit_synthetic_native",
+   "arguments": {
+    "action": "check",
+    "code": "&НаКлиенте\nПроцедура Тест(Команда)\nКонецПроцедуры\n&НаСервереБезКонтекста\nФункция Тест2(Знач А) Экспорт\n    @;\nКонецФункции\n",
+    "connection": "M",
+    "context": {
+     "kind": "synthetic",
+     "module_type": "managed_form"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "position": [
+     6,
+     5
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-synthetic-ordinary_form",
+   "fixture": "M",
+   "scope": "explicit_synthetic_native",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = 1;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "synthetic",
+     "module_type": "ordinary_form"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "ordinary_form"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-synthetic-ordinary_form-negative",
+   "fixture": "M",
+   "scope": "explicit_synthetic_native",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = @;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "synthetic",
+     "module_type": "ordinary_form"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "ordinary_form"
+   },
+   "expected": {
+    "position": [
+     2,
+     8
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-synthetic-common",
+   "fixture": "M",
+   "scope": "explicit_synthetic_native",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = 1;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "synthetic",
+     "module_type": "common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-synthetic-common-negative",
+   "fixture": "M",
+   "scope": "explicit_synthetic_native",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = @;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "synthetic",
+     "module_type": "common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "position": [
+     2,
+     8
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-module-geometry",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "﻿&НаСервереБезКонтекста\r\nПроцедура Тест()\r\n\tА = \"😀\"; @;\r\nКонецПроцедуры",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonForm.BA023Managed"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "position": [
+     3,
+     12
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-module-last-line",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест()\nКонецПроцедуры\n@;",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonModule.BA023Common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "position": [
+     2,
+     15
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-module-marker-event",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "&НаСервере\nПроцедура ПриСозданииНаСервере(Отказ, СтандартнаяОбработка)\nЗапись = Новый ЗаписьТекста(\"{SENTINELS}\\M-no-execution.marker\");\nЗапись.Закрыть();\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonForm.BA023Managed"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "execution_marker_must_not_exist": "{SENTINELS}\\M-no-execution.marker",
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-module-missing-context",
+   "fixture": "M",
+   "scope": "preflight_context_required",
+   "arguments": {
+    "action": "check",
+    "code": "&НаКлиенте\nПроцедура Тест(Команда)\nКонецПроцедуры\n&НаСервереБезКонтекста\nФункция Тест2(Знач А) Экспорт\n    Возврат А;\nКонецФункции\n",
+    "connection": "M",
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "status": "context_required"
+   }
+  },
+  {
+   "id": "windows-M-module-marker-initializer",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = 1;\nКонецПроцедуры\n\nЗапись = Новый ЗаписьТекста(\"{SENTINELS}\\M-no-execution.marker\");\nЗапись.Закрыть();",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "Catalog.BA023Catalog"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "object"
+   },
+   "expected": {
+    "execution_marker_must_not_exist": "{SENTINELS}\\M-no-execution.marker",
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-compatibility-global",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = СтрРазделить(\"а,б\", \",\");\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonModule.BA023Common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-extension-object",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура BA023_Тест() Экспорт\n    А = 1;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "extension",
+      "name": "BA023Extension"
+     },
+     "owner": "Catalog.BA023Catalog"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "object"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-extension-object-negative",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура BA023_Тест() Экспорт\n    А = @;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "extension",
+      "name": "BA023Extension"
+     },
+     "owner": "Catalog.BA023Catalog"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "object"
+   },
+   "expected": {
+    "position": [
+     2,
+     8
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-extension-manager",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура BA023_Тест() Экспорт\n    А = 1;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "extension",
+      "name": "BA023Extension"
+     },
+     "owner": "Catalog.BA023Catalog"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "manager"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-extension-manager-negative",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура BA023_Тест() Экспорт\n    А = @;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "extension",
+      "name": "BA023Extension"
+     },
+     "owner": "Catalog.BA023Catalog"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "manager"
+   },
+   "expected": {
+    "position": [
+     2,
+     8
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-extension-common",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура BA023_Тест() Экспорт\n    А = 1;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "extension",
+      "name": "BA023Extension"
+     },
+     "owner": "CommonModule.BA023_Extra"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-extension-common-negative",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура BA023_Тест() Экспорт\n    А = @;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "extension",
+      "name": "BA023Extension"
+     },
+     "owner": "CommonModule.BA023_Extra"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "position": [
+     2,
+     8
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-extension-managed_form",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "&НаКлиенте\nПроцедура BA023_Тест(Команда)\nКонецПроцедуры\n&НаСервереБезКонтекста\nФункция BA023_Тест2(Знач А) Экспорт\n    Возврат А;\nКонецФункции\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "extension",
+      "name": "BA023Extension"
+     },
+     "owner": "CommonForm.BA023_ExtManaged"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-extension-managed_form-negative",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "&НаКлиенте\nПроцедура BA023_Тест(Команда)\nКонецПроцедуры\n&НаСервереБезКонтекста\nФункция BA023_Тест2(Знач А) Экспорт\n    @;\nКонецФункции\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "extension",
+      "name": "BA023Extension"
+     },
+     "owner": "CommonForm.BA023_ExtManaged"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "position": [
+     6,
+     5
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-extension-ordinary_form",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура BA023_Тест() Экспорт\n    А = 1;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "extension",
+      "name": "BA023Extension"
+     },
+     "owner": "CommonForm.BA023_ExtOrdinary"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "ordinary_form"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-extension-ordinary_form-negative",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура BA023_Тест() Экспорт\n    А = @;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "extension",
+      "name": "BA023Extension"
+     },
+     "owner": "CommonForm.BA023_ExtOrdinary"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "ordinary_form"
+   },
+   "expected": {
+    "position": [
+     2,
+     8
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-extension-field-ref",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура BA023_Тест() Экспорт\n    А = BA023_ExtraField;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "extension",
+      "name": "BA023Extension"
+     },
+     "owner": "Catalog.BA023Catalog"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "object"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-base-field-ref",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = BA023_ExtraField;\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "Catalog.BA023Catalog"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "object"
+   },
+   "expected": {
+    "position": [
+     2,
+     9
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-metadata-catalog-refs",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "&НаКлиенте\nПроцедура Тест(Команда)\nКонецПроцедуры\n&НаСервереБезКонтекста\nФункция Тест2(Знач А) Экспорт\n    Б = Метаданные.Справочники.BA023Catalog;\n    Возврат А;\nКонецФункции\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonForm.BA023Managed"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-branch-thin",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n#Если ТонкийКлиент Тогда\n    БА023НесуществующаяПроцедура();\n#КонецЕсли\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonModule.BA023Common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "position": [
+     3,
+     5
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-branch-server",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n#Если Сервер Тогда\n    БА023НесуществующаяПроцедура();\n#КонецЕсли\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonModule.BA023Common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "position": [
+     3,
+     5
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-branch-external",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n#Если ВнешнееСоединение Тогда\n    БА023НесуществующаяПроцедура();\n#КонецЕсли\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonModule.BA023Common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "position": [
+     3,
+     5
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-branch-ordinary",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n#Если ТолстыйКлиентОбычноеПриложение Тогда\n    БА023НесуществующаяПроцедура();\n#КонецЕсли\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonModule.BA023Common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "position": [
+     3,
+     5
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-no-execution-marker",
+   "fixture": "M",
+   "scope": "legacy_snippet",
+   "arguments": {
+    "action": "check",
+    "code": "А = Новый ЗаписьТекста(\"{SENTINELS}\\M-no-execution.marker\");",
+    "connection": "M",
+    "max_output_tokens": 6000
+   },
+   "expected": {
+    "execution_marker_must_not_exist": "{SENTINELS}\\M-no-execution.marker",
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-L-duplicate-method",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\nКонецПроцедуры\nПроцедура Тест() Экспорт\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonModule.BA023Common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-L-unknown-directive",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "&BA310UnknownDirective\nПроцедура Тест() Экспорт\nКонецПроцедуры\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonModule.BA023Common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-L-module-eof",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = 1;",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonModule.BA023Common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "source_eof": {
+     "line": 2,
+     "utf16_column": 11
+    },
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-L-blank-bom-geometry",
+   "fixture": "L",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "﻿\r\n\r\nПроцедура Тест() Экспорт\r\n\tА = \"😀\"; @;\r\nКонецПроцедуры\r\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonModule.BA023Common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "position": [
+     4,
+     12
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-L-snippet-nested",
+   "fixture": "L",
+   "scope": "legacy_snippet",
+   "arguments": {
+    "action": "check",
+    "code": "Если Истина Тогда\n    А = 1;\nКонецЕсли;",
+    "connection": "L",
+    "max_output_tokens": 6000
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-L-snippet-wrapper-escape",
+   "fixture": "L",
+   "scope": "legacy_snippet",
+   "arguments": {
+    "action": "check",
+    "code": "КонецПроцедуры\nЗапись = Новый ЗаписьТекста(\"{SENTINELS}\\L-escape.marker\");\nЗапись.Закрыть();\nПроцедура Подмена()\n",
+    "connection": "L",
+    "max_output_tokens": 6000
+   },
+   "expected": {
+    "status": "context_required",
+    "failure_code": "context_required",
+    "backend": "caller/1",
+    "execution_marker_must_not_exist": "{SENTINELS}\\L-escape.marker"
+   }
+  },
+  {
+   "id": "windows-M-duplicate-method",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\nКонецПроцедуры\nПроцедура Тест() Экспорт\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonModule.BA023Common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-unknown-directive",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "&BA310UnknownDirective\nПроцедура Тест() Экспорт\nКонецПроцедуры\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonModule.BA023Common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-module-eof",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "Процедура Тест() Экспорт\n    А = 1;",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonModule.BA023Common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "source_eof": {
+     "line": 2,
+     "utf16_column": 11
+    },
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-blank-bom-geometry",
+   "fixture": "M",
+   "scope": "full_owner",
+   "arguments": {
+    "action": "check",
+    "code": "﻿\r\n\r\nПроцедура Тест() Экспорт\r\n\tА = \"😀\"; @;\r\nКонецПроцедуры\r\n",
+    "connection": "M",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonModule.BA023Common"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "common"
+   },
+   "expected": {
+    "position": [
+     4,
+     12
+    ],
+    "status": "invalid"
+   }
+  },
+  {
+   "id": "windows-M-snippet-nested",
+   "fixture": "M",
+   "scope": "legacy_snippet",
+   "arguments": {
+    "action": "check",
+    "code": "Если Истина Тогда\n    А = 1;\nКонецЕсли;",
+    "connection": "M",
+    "max_output_tokens": 6000
+   },
+   "expected": {
+    "status": "valid"
+   }
+  },
+  {
+   "id": "windows-M-snippet-wrapper-escape",
+   "fixture": "M",
+   "scope": "legacy_snippet",
+   "arguments": {
+    "action": "check",
+    "code": "КонецПроцедуры\nЗапись = Новый ЗаписьТекста(\"{SENTINELS}\\M-escape.marker\");\nЗапись.Закрыть();\nПроцедура Подмена()\n",
+    "connection": "M",
+    "max_output_tokens": 6000
+   },
+   "expected": {
+    "status": "context_required",
+    "failure_code": "context_required",
+    "backend": "caller/1",
+    "execution_marker_must_not_exist": "{SENTINELS}\\M-escape.marker"
+   }
+  }
+ ],
+ "lifecycle": [
+  {
+   "id": "windows-L-active-cancel",
+   "arguments": {
+    "action": "check",
+    "code": "&НаКлиенте\nПроцедура Тест(Команда)\nКонецПроцедуры\n&НаСервереБезКонтекста\nФункция Тест2(Знач А) Экспорт\n    Возврат А;\nКонецФункции\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonForm.BA023Managed"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "cleanup_complete": true,
+    "sdk_response_absent": true
+   },
+   "stimulus": {
+    "caller_reap_timeout_ms": 1000,
+    "followup_existing_request": "windows-L-snippet",
+    "kind": "active-cancel",
+    "stop_grace_ms": 2000,
+    "timeout_ms": 30000,
+    "trigger": "Observe owned actual Designer pid/start/group or Job via existing native-fault driver, then stop/suspend only that Designer. Cancel SDK request for cancel; await configured deadline for timeout. No source-code sleep."
+   }
+  },
+  {
+   "id": "windows-L-active-timeout",
+   "arguments": {
+    "action": "check",
+    "code": "&НаКлиенте\nПроцедура Тест(Команда)\nКонецПроцедуры\n&НаСервереБезКонтекста\nФункция Тест2(Знач А) Экспорт\n    Возврат А;\nКонецФункции\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonForm.BA023Managed"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "cleanup_complete": true,
+    "failure_code_one_of": [
+     "transport_timeout",
+     "deadline_exceeded"
+    ],
+    "status": "error"
+   },
+   "stimulus": {
+    "caller_reap_timeout_ms": 1000,
+    "followup_existing_request": "windows-L-metadata-object",
+    "kind": "active-timeout",
+    "stop_grace_ms": 2000,
+    "timeout_ms": 30000,
+    "trigger": "Observe owned actual Designer pid/start/group or Job via existing native-fault driver, then stop/suspend only that Designer. Cancel SDK request for cancel; await configured deadline for timeout. No source-code sleep."
+   }
+  },
+  {
+   "id": "windows-L-queue-cancel-active",
+   "arguments": {
+    "action": "check",
+    "code": "&НаКлиенте\nПроцедура Тест(Команда)\nКонецПроцедуры\n&НаСервереБезКонтекста\nФункция Тест2(Знач А) Экспорт\n    Возврат А;\nКонецФункции\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonForm.BA023Managed"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "cleanup_complete": true,
+    "status": "valid"
+   },
+   "stimulus": {
+    "followup_existing_request": "windows-L-metadata-manager",
+    "kind": "hold-active",
+    "timeout_ms": 120000,
+    "trigger": "Observe our Designer and hold it until queued peer terminates; then resume exactly that child"
+   }
+  },
+  {
+   "id": "windows-L-queue-cancel-peer",
+   "arguments": {
+    "action": "check",
+    "code": "А = 1;",
+    "connection": "L",
+    "max_output_tokens": 6000
+   },
+   "expected": {
+    "executor_launches": 0,
+    "sdk_response_absent": true
+   },
+   "stimulus": {
+    "kind": "queue-cancel",
+    "timeout_ms": 120000,
+    "trigger": "Submit only after active owned Designer held and caller queue observed. Cancel peer or await its configured deadline before resuming active."
+   }
+  },
+  {
+   "id": "windows-L-queue-deadline-active",
+   "arguments": {
+    "action": "check",
+    "code": "&НаКлиенте\nПроцедура Тест(Команда)\nКонецПроцедуры\n&НаСервереБезКонтекста\nФункция Тест2(Знач А) Экспорт\n    Возврат А;\nКонецФункции\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonForm.BA023Managed"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "cleanup_complete": true,
+    "status": "valid"
+   },
+   "stimulus": {
+    "followup_existing_request": "windows-L-metadata-managed_form",
+    "kind": "hold-active",
+    "timeout_ms": 120000,
+    "trigger": "Observe our Designer and hold it until queued peer terminates; then resume exactly that child"
+   }
+  },
+  {
+   "id": "windows-L-queue-deadline-peer",
+   "arguments": {
+    "action": "check",
+    "code": "А = 1;",
+    "connection": "L",
+    "max_output_tokens": 6000
+   },
+   "expected": {
+    "executor_launches": 0,
+    "failure_code": "transport_timeout",
+    "status": "error"
+   },
+   "stimulus": {
+    "kind": "queue-deadline",
+    "timeout_ms": 1000,
+    "trigger": "Submit only after active owned Designer held and caller queue observed. Cancel peer or await its configured deadline before resuming active."
+   }
+  },
+  {
+   "id": "windows-L-crash-recovery",
+   "arguments": {
+    "action": "check",
+    "code": "&НаКлиенте\nПроцедура Тест(Команда)\nКонецПроцедуры\n&НаСервереБезКонтекста\nФункция Тест2(Знач А) Экспорт\n    Возврат А;\nКонецФункции\n",
+    "connection": "L",
+    "context": {
+     "kind": "metadata",
+     "origin": {
+      "kind": "configuration"
+     },
+     "owner": "CommonForm.BA023Managed"
+    },
+    "input_kind": "module",
+    "max_output_tokens": 6000,
+    "module_type": "managed_form"
+   },
+   "expected": {
+    "foreign_marker_preserved": true,
+    "response_absent_or_transport_error": true,
+    "stale_owned_job_recovered": true
+   },
+   "stimulus": {
+    "followup_existing_request": "windows-L-metadata-common",
+    "kind": "owned-executor-crash",
+    "trigger": "Existing crash driver verifies owned executable/pid/start/workspace; kill only that worker while Designer active, preserve failure evidence, then startup recovery via normal positive request"
+   }
+  }
+ ]
+}

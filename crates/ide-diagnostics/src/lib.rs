@@ -174,7 +174,7 @@ pub(crate) fn module_diagnostics(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
 /// File diagnostics with `&ИзменениеИКонтроль` extension merging applied.
 ///
 /// Runs the ordinary standalone pass, then — only for an extension module that pairs to a
-/// base with a usable change-and-validate splice — adds the inference diagnostics computed
+/// base with a usable change-and-validate splice — adds inference and query diagnostics computed
 /// against the spliced effective module, remapped to the `#Вставка` ranges the author
 /// wrote. Copied-base inference false positives inside change-and-validate bodies (which
 /// reference base-module siblings absent from the standalone ext file) are suppressed.
@@ -244,11 +244,19 @@ pub fn apply_extension_merge<'db>(
     // some codes (e.g. `RedundantAccessToObject`, emitted both by the syntactic `ЭтотОбъект.X`
     // lowering check AND by the inference two-level check) also reach this list from non-
     // base-sensitive collectors, and those must survive. The base-aware passes below republish
-    // exactly the layer stripped here.
+    // exactly the layer stripped here. Queries inside change-and-validate bodies also belong
+    // to the effective pass; ordinary queries keep their standalone diagnostics.
     let std_provider = ide_db::SalsaProvider::with_file_set(db, config_path_input, file_set);
     let std_ctx = DiagnosticsContext::new(config, file_id, &std_provider);
     let mut std_base_sensitive =
         safe_collect("merge:standalone_base_sensitive", || collect_base_sensitive(&std_ctx));
+    if effective.is_some() {
+        std_base_sensitive.extend(
+            safe_collect("merge:standalone_sdbl", || collect_sdbl_hir_diagnostics(&std_ctx))
+                .into_iter()
+                .filter(|diagnostic| effective::range_inside_any(diagnostic.range, &cav_bodies)),
+        );
+    }
     standalone.retain(|d| match std_base_sensitive.iter().position(|s| s == d) {
         Some(pos) => {
             std_base_sensitive.swap_remove(pos);
@@ -304,8 +312,11 @@ pub fn apply_extension_merge<'db>(
         let eff_provider = ide_db::SalsaProvider::with_file_set(db, config_path_input, file_set)
             .with_effective(eid, file_id);
         let eff_ctx = DiagnosticsContext::new(config, file_id, &eff_provider);
-        let eff_base_sensitive =
+        let mut eff_base_sensitive =
             safe_collect("merge:effective_base_sensitive", || collect_base_sensitive(&eff_ctx));
+        eff_base_sensitive.extend(safe_collect("merge:effective_sdbl", || {
+            collect_sdbl_hir_diagnostics(&eff_ctx)
+        }));
         standalone.extend(effective::remap_inserted(eff_base_sensitive, &effmod.segments));
         // Already on the extension method's name, so not remapped.
         standalone.extend(safe_collect("merge:data_exchange_change_and_validate", || {

@@ -47,7 +47,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_utils::check_diagnostics_snapshot_for;
+    use crate::test_utils::{check_diagnostics_for, check_diagnostics_snapshot_for};
     use crate::DiagnosticCode;
     use expect_test::expect;
 
@@ -57,6 +57,20 @@ mod tests {
             DiagnosticCode::VirtualTableCallWithoutParameters,
             expected,
         );
+    }
+
+    #[test]
+    fn test_catalog_named_subconto_is_not_a_virtual_table() {
+        let code = include_str!("fixtures/catalog_subconto_source.bsl");
+        let diagnostics =
+            check_diagnostics_for(code, DiagnosticCode::VirtualTableCallWithoutParameters);
+        let tables: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| {
+                &code[usize::from(diagnostic.range.start())..usize::from(diagnostic.range.end())]
+            })
+            .collect();
+        assert_eq!(tables, ["РегистрБухгалтерии.Хозрасчетный.Остатки"]);
     }
 
     #[test]

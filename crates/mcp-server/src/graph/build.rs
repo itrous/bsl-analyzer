@@ -184,6 +184,10 @@ impl GraphState {
         source_path: &Path,
         observed_through: u64,
     ) -> Result<(), LoadFailure> {
+        let _disk_read = self
+            .disk_gate
+            .try_read()
+            .map_err(|_| LoadFailure::refused("workspace filesystem transaction is in progress"))?;
         let path = self.graph_db_path().unwrap_or_else(|| source_path.to_path_buf());
         let operation =
             bsl_search::lifecycle::Batch::new(&path, bsl_search::lifecycle::Reason::GraphReload);
@@ -333,7 +337,11 @@ impl GraphState {
         // The exclusions travel with the roots: the same roots under a new `[source].exclude`
         // are a different coverage, and the live project is the one to be followed.
         if !hub.ensure_scope(
-            &crate::change_hub::watch_targets_for(root, scan_roots),
+            &crate::change_hub::watch_targets_for(root, &{
+                let mut roots = scan_roots.to_vec();
+                roots.extend(live.semantic_dependency_roots());
+                roots
+            }),
             &live.user_excluded,
             declaration_epoch,
         ) {
@@ -365,6 +373,12 @@ impl GraphState {
     }
 
     fn run_load_inner(&self, is_reload: bool) -> bsl_search::lifecycle::Outcome {
+        let Ok(_disk_read) = self.disk_gate.try_read() else {
+            return self.record_load_failure(
+                is_reload,
+                LoadFailure::refused("workspace filesystem transaction is in progress"),
+            );
+        };
         self.clear_cold_build_ticker();
         if self.is_superseded() {
             return self.record_load_failure(
@@ -692,6 +706,10 @@ impl GraphState {
         // different trees. Only the straddle check walks again.
         let project =
             crate::graph::ProjectSnapshot::load_excluding(workspace_root, &self.cache_exclusions());
+        if !project.semantic_dependency_roots().is_empty() {
+            // An owner outside the graph's file keys can affect every caller's projection.
+            return self.note_incremental("semantic_owner_dependencies");
+        }
         // A topology change re-shapes visibility for ANY module even when only
         // `.bsl` bodies drifted on disk — never body-patch across it.
         match self.store.read(Some(base), wait, |snapshot| snapshot.graph.freshness_token()) {
@@ -2692,6 +2710,10 @@ fn catch_up_straddled_candidate(
         };
         let (_, candidate_fp, force_stale) =
             db.freshness_token().map_err(LoadFailure::operation)?;
+        if !project.semantic_dependency_roots().is_empty() && candidate_fp != fingerprint {
+            pending.resumable = false;
+            return Ok(None);
+        }
         if force_stale || candidate_fp.topology != original_topology {
             pending.resumable = false;
             return Ok(None);
@@ -6888,10 +6910,41 @@ mod tests {
         ));
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        copy_dir(&fixture.join("base"), root);
-        let extension = root.join("cfe/Расширение");
+        let base = root.join("src/cf/Base");
+        copy_dir(&fixture.join("base"), &base);
+        let extension = root.join("src/cfe/Расширение");
         copy_dir(&fixture.join("extension"), &extension);
-        declare_scoped_extension(root, "Расширение", "cfe/Расширение");
+        let tests = root.join("src/cfe/ProjectYAxUnitTests");
+        fs::create_dir_all(&tests).unwrap();
+        fs::write(tests.join("Configuration.xml"), "<Configuration/>").unwrap();
+        write_common_module(
+            &tests,
+            "КонтрольТестов",
+            true,
+            "&НаСервере\nПроцедура Проверить() Экспорт\nКонецПроцедуры",
+        );
+        fs::write(root.join("bsl-analyzer.toml"), r#"[source]
+root = "src/cf/Base"
+extensions = [
+  { name = "Расширение", path = "src/cfe/Расширение", scope = "InfoBase" },
+  { name = "ProjectYAxUnitTests", path = "src/cfe/ProjectYAxUnitTests", scope = "InfoBase", dependsOn = ["Расширение"] },
+]
+"#).unwrap();
+        let project = crate::graph::ProjectSnapshot::load(root);
+        assert_eq!(project.configs.paths.len(), 3);
+        assert_eq!(
+            project.configs.extension_scopes,
+            [
+                None,
+                Some(bsl_metadata::ExtensionScope::InfoBase),
+                Some(bsl_metadata::ExtensionScope::InfoBase)
+            ]
+        );
+        assert_eq!(
+            project.configs.closures[2],
+            [1],
+            "dependent root retains its selected extension"
+        );
 
         let meta = crate::graph_db::GraphMeta {
             revision: 1,
@@ -6907,12 +6960,18 @@ mod tests {
         build_whole_graph(root, &all_batches, usize::MAX, &meta)
             .expect("the whole workspace batch builds");
 
-        let (one_nodes, one_edges, _, _) = dump_data(&one_batch);
-        let (all_nodes, all_edges, _, _) = dump_data(&all_batches);
-        assert_eq!(one_nodes, all_nodes, "all graph nodes match across batch sizes");
-        assert_eq!(one_edges, all_edges, "all graph edges match across batch sizes");
+        let one = dump_data(&one_batch);
+        let all = dump_data(&all_batches);
+        assert_eq!(
+            one, all,
+            "nodes, edges, degree and unresolved addresses match across batch sizes"
+        );
         assert!(
-            one_nodes.iter().any(|row| {
+            one.0.iter().any(|row| row.contains("КонтрольТестов") && row.contains("Проверить")),
+            "the dependent root participates in both graph builds"
+        );
+        assert!(
+            one.0.iter().any(|row| {
                 row.contains("form_attr/Document/Заказ/ФормаДокумента/БазовыйРеквизитФормы")
             }),
             "batch size one must retain the inherited base-form attribute"
@@ -8510,14 +8569,15 @@ mod tests {
         .expect("fused graph database builds");
         let gdb = GraphDb::open(&out).expect("graph database opens");
 
-        let canon_root = root.canonicalize().unwrap().to_string_lossy().replace('\\', "/");
-        let canon_root = canon_root.trim_start_matches("//?/");
+        let canon_root = root.canonicalize().unwrap();
         let mut methods_checked = 0;
         for row in &sink.rows {
             match row.kind {
                 bsl_search::ChunkKind::Procedure | bsl_search::ChunkKind::Function => {
-                    let rel = row.path.strip_prefix(canon_root).unwrap().trim_start_matches('/');
-                    let id = ide::method_id_for_path(rel, &row.symbol).expect("durable id");
+                    let path = std::path::Path::new(&row.path).canonicalize().unwrap();
+                    let rel = path.strip_prefix(&canon_root).unwrap();
+                    let id = ide::method_id_for_path(rel.to_str().unwrap(), &row.symbol)
+                        .expect("durable id");
                     let expected =
                         gdb.graph_context(&id, fused_project.search_roots.as_ref()).unwrap();
                     assert_eq!(

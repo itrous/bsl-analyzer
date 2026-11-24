@@ -3,9 +3,9 @@
 <!-- Блоки выше заполняются автоматически, не трогать -->
 ## Description
 
-This diagnostic is reported when a call argument's inferred type is incompatible with the parameter types of every arity-compatible candidate.
+Reports incompatible call arguments and assignments to known writable platform properties.
 
-Currently, `TypeMismatch` is active for call-argument validation. When a function or method is called, the analyzer collects all candidate signatures, evaluates arity and applicability, and reports a mismatch only when the call is rejected.
+For a call, the analyzer collects all candidate signatures, evaluates arity and applicability, and reports a mismatch only when the call is rejected.
 
 ### Candidate Resolution Flow
 
@@ -22,6 +22,20 @@ The analyzer resolves each call into exactly one of three mutually exclusive sel
 - **Overlapping Types**: The diagnostic fires only when the expected and the actual type sets share no member. A value of type `Number | Undefined` inferred from code branches is not reported in a `Number` parameter, because some of its values fit. When a call has several such arguments, the first argument sharing no member is reported.
 - **Long unions**: A message keeps the first three members of a union and appends ` | … и ещё N` for the rest. The suffix is Russian because the message template is Russian. Detection still compares the full labels, so a long union is reported exactly when the full one would be. If shortening would make the two sides read the same, the full labels are printed instead. A type that is not itself a union is printed in full, even when its label contains ` | `. Other views of the type keep the full label. `TypeMismatchByDocComment` shortens the same way.
 - **Ambiguity**: Ambiguity in type resolution does not trigger a `TypeMismatch`. The diagnostic only fires when the candidate selection is explicitly rejected.
+
+`AccessRight` and `ПравоДоступа` accept the configuration's global `Metadata` object and supported metadata descriptions, including `Ref.Metadata()`. A number or string supplied instead of metadata remains incompatible.
+
+### Platform property assignments
+
+A writable platform property checks the entire known assigned type. In a managed
+form, `CurrentItem = List.FindByValue("")` reports the incompatible `ValueListItem`
+alternative even when both unions admit `Undefined`. A real form item or permitted
+`Undefined` remains valid. Unknown value or property types do not prove an error.
+
+Form properties resolve before an assignment can introduce an implicit local.
+Other local names, explicit bindings, ordinary forms and methods without form
+context retain their binding rules. Read-only writes keep the separate
+`ReadOnlyPropertyAssignment` diagnostic. Call argument overlap rules remain unchanged.
 
 ## Examples
 
