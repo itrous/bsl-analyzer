@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="2.20">
+	<Form uuid="0f0e0d0c-0b0a-4908-8706-050403020117">
+		<Properties>
+			<Name>ФормаНабораАнглийская</Name>
+			<FormType>Ordinary</FormType>
+		</Properties>
+	</Form>
+</MetaDataObject>
