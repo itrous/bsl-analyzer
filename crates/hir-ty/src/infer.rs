@@ -346,6 +346,7 @@ struct BodyCompileScopes {
     assignments: FxHashMap<NormName, Vec<StmtId>>,
     bindings: FxHashMap<NormName, Vec<StmtId>>,
     statements: FxHashMap<StmtId, CompileEnvScope>,
+    impossible_statements: rustc_hash::FxHashSet<StmtId>,
 }
 
 fn collect_body_compile_scopes(
@@ -360,7 +361,9 @@ fn collect_body_compile_scopes(
 
     for &stmt_idx in stmts {
         let stmt_id = StmtId::from_idx(stmt_idx);
-        if !in_dead_branch {
+        if in_dead_branch {
+            scopes.impossible_statements.insert(stmt_id);
+        } else {
             scopes.statements.insert(
                 stmt_id,
                 CompileEnvScope { definite, possible: (!possible.is_empty()).then_some(possible) },
@@ -1015,6 +1018,8 @@ pub struct InferenceContext<'db> {
     body_binding_stmts: FxHashMap<NormName, Vec<StmtId>>,
     body_binding_scope_stmts: FxHashMap<BindingId, StmtId>,
     body_stmt_scopes: FxHashMap<StmtId, CompileEnvScope>,
+    /// Statements excluded by a known-impossible conditional-compilation path.
+    impossible_body_stmts: rustc_hash::FxHashSet<StmtId>,
 
     /// Bare path answers are recorded once for all consumers that receive an ExprId.
     bare_name_resolutions: FxHashMap<ExprId, (BareNameOrigin, TypeId)>,
@@ -1476,6 +1481,7 @@ impl<'db> InferenceContext<'db> {
             assignments: body_assignment_stmts,
             bindings: body_binding_stmts,
             statements: body_stmt_scopes,
+            impossible_statements: impossible_body_stmts,
         } = scopes;
         let body_binding_scope_stmts = body
             .stmts_iter()
@@ -1526,6 +1532,7 @@ impl<'db> InferenceContext<'db> {
             body_binding_stmts,
             body_binding_scope_stmts,
             body_stmt_scopes,
+            impossible_body_stmts,
             bare_name_resolutions: FxHashMap::default(),
             assignment_target_resolutions: FxHashMap::default(),
             local_reads: FxHashSet::default(),
@@ -5024,6 +5031,16 @@ impl<'db> InferenceContext<'db> {
         use hir_def::resolver::Resolution;
 
         debug_assert!(matches!(usage, BareNameUse::ReadValue | BareNameUse::AssignmentTarget));
+        // The lowered body retains dead source for editor features, but it cannot produce a
+        // runtime unresolved-name diagnostic.
+        if usage == BareNameUse::ReadValue
+            && self
+                .body
+                .enclosing_stmt(expr_id)
+                .is_some_and(|stmt| self.impossible_body_stmts.contains(&stmt))
+        {
+            return BareNameResolution::Indeterminate { gaps: Vec::new() };
+        }
         let resolver = self.get_resolver();
         let found =
             |ty, origin, availability| BareNameResolution::Resolved { ty, origin, availability };
