@@ -3155,11 +3155,11 @@ EndProcedure
             summary.notify_dynamic_signature_handlers.iter().map(Name::as_str).collect::<Vec<_>>(),
             ["DynamicHandler", "DynamicErrorHandler"]
         );
-        assert_eq!(summary.notify_candidates.len(), 4, "{:#?}", summary.notify_candidates);
-        assert_eq!(summary.notify_candidates[0].caller, CallerId::Method(MethodKey::first("Test")));
-        assert_eq!(summary.notify_candidates[1].caller, CallerId::Method(MethodKey::first("Test")));
-        assert_eq!(summary.notify_candidates[2].caller, CallerId::Method(MethodKey::first("Test")));
-        assert_eq!(summary.notify_candidates[3].caller, CallerId::ModuleCode);
+        assert_eq!(summary.notify_candidates.len(), 7, "{:#?}", summary.notify_candidates);
+        assert!(summary.notify_candidates[..6]
+            .iter()
+            .all(|candidate| candidate.caller == CallerId::Method(MethodKey::first("Test"))));
+        assert_eq!(summary.notify_candidates[6].caller, CallerId::ModuleCode);
         assert!(summary
             .notify_candidates
             .iter()
