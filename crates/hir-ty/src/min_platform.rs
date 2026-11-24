@@ -169,8 +169,12 @@ mod tests {
         );
         // The control: the value that really is new keeps its own date, so correcting
         // the type does not swallow a genuine finding. A corpus older than 8.5.1 has no
-        // such value, while a corpus that has it keeps its own date: these tests run
-        // against whichever corpus the contract profile is given.
+        // such value (the pinned contract corpus carries only the three 8.0 values), so
+        // this arm is skipped there rather than failing; a corpus that has it keeps its
+        // own date. The control that cannot pass vacuously is
+        // `a_type_version_correction_redates_the_type_and_only_the_type` in
+        // `crates/bsl-platform/src/overlays_tests.rs`: it runs the correction against a
+        // corpus that dates the type 8.5.1 and asserts a value dated 8.5.1 keeps its date.
         if let Some(version) = type_member("РежимРедактированияКолонки", "Авто", true)
         {
             assert_eq!(version, v("8.5.1"));
