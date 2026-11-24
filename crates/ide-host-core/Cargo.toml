@@ -25,6 +25,7 @@ blake3 = "1.8"
 serde_json.workspace = true
 
 [dev-dependencies]
+stdx.workspace = true
 tempfile.workspace = true
 test-utils.workspace = true
 

@@ -1634,10 +1634,7 @@ impl Drop for ConfigXmlFixtureProject {
 }
 
 fn next_config_xml_fixture_root() -> std::path::PathBuf {
-    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    std::env::temp_dir().join(format!("bsl_analyzer_config_xml_{}_{}", std::process::id(), id))
+    stdx::test_temp::unique_dir("bsl_analyzer_config_xml")
 }
 
 fn minimal_configuration_xml() -> String {

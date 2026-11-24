@@ -85,7 +85,7 @@ pub(super) fn wait_child(
 pub(super) fn canonical_tempdir() -> tempfile::TempDir {
     #[cfg(windows)]
     {
-        let canonical = std::env::temp_dir().canonicalize().unwrap();
+        let canonical = stdx::test_temp::root().canonicalize().unwrap();
         let canonical = canonical.to_string_lossy();
         let dos_path = if let Some(unc_path) = canonical.strip_prefix(r"\\?\UNC\") {
             format!(r"\\{unc_path}")

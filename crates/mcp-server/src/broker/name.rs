@@ -432,6 +432,10 @@ fn canonical_run_user_dir() -> Option<PathBuf> {
 
 /// Select the existing runtime location without creating it. Workspace callers
 /// can validate the derived endpoint against project inputs before any mkdir.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the system temp dir is one of the candidate socket directories, chosen by socket_dir_source"
+)]
 fn runtime_socket_layout() -> io::Result<SocketDirLayout> {
     #[cfg(unix)]
     let (canonical, temp_is_uid_private) = (canonical_run_user_dir(), temp_dir_is_uid_private());
@@ -490,6 +494,10 @@ fn without_trailing_separators(path: &Path) -> &Path {
 #[cfg(unix)]
 fn temp_dir_is_uid_private() -> bool {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "asks whether the system temp dir itself is private to our uid, so it must read that dir"
+    )]
     let temp_dir = std::env::temp_dir();
     let Ok(meta) = std::fs::symlink_metadata(without_trailing_separators(&temp_dir)) else {
         return false;

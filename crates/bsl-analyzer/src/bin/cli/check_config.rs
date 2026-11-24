@@ -889,8 +889,10 @@ backend = "postgres"
             &project_config,
         );
 
-        let project =
-            project_model::Project::with_config(std::env::temp_dir(), project_config.clone());
+        let project = project_model::Project::with_config(
+            stdx::test_temp::unique_dir("bsl_check_config"),
+            project_config.clone(),
+        );
         let diagnostics_baseline = inspect_diagnostics_baseline(&project);
         let report = build_check_config_report(
             std::path::Path::new("bsl-analyzer.toml"),

@@ -39,6 +39,7 @@ windows-sys = { version = "0.61", features = [
 winresource = "0.1"
 
 [dev-dependencies]
+stdx.workspace = true
 test-utils.workspace = true
 
 [lints]

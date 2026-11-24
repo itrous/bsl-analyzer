@@ -500,8 +500,8 @@ mod tests {
         PreparedMetadataRenameSnapshot {
             roots: vec![MetadataPlanRoot {
                 id: "main".into(),
-                source_path: std::env::temp_dir().join("metadata-plan-fixture"),
-                canonical_path: std::env::temp_dir().join("metadata-plan-fixture"),
+                source_path: stdx::test_temp::root().join("metadata-plan-fixture"),
+                canonical_path: stdx::test_temp::root().join("metadata-plan-fixture"),
                 role: MetadataRootRole::Main,
                 writable: true,
                 case_sensitive: true,

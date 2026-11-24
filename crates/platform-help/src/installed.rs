@@ -66,6 +66,10 @@ pub struct LoadContext {
 }
 
 impl LoadContext {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "last-resort cache location when neither the override nor the OS cache dir is available"
+    )]
     pub fn from_environment() -> Self {
         let cache_dir = std::env::var_os(CACHE_DIR_ENV)
             .filter(|value| !value.is_empty())

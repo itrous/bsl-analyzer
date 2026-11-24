@@ -1057,12 +1057,7 @@ mod ctor_tests {
     use std::path::PathBuf;
 
     fn unique_tmpdir(tag: &str) -> PathBuf {
-        let pid = std::process::id();
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("html-parser-ctor-{tag}-{pid}-{ts}"));
+        let dir = stdx::test_temp::unique_dir(&format!("html-parser-ctor-{tag}"));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create tmp dir");
         dir
@@ -1327,12 +1322,7 @@ mod property_tests {
     use std::path::PathBuf;
 
     fn unique_tmpdir(tag: &str) -> PathBuf {
-        let pid = std::process::id();
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("html-parser-prop-{tag}-{pid}-{ts}"));
+        let dir = stdx::test_temp::unique_dir(&format!("html-parser-prop-{tag}"));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create tmp dir");
         dir

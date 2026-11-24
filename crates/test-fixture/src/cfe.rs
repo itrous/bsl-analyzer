@@ -264,10 +264,7 @@ impl CfeModule {
 }
 
 fn next_cfe_fixture_root() -> PathBuf {
-    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    std::env::temp_dir().join(format!("bsl_analyzer_cfe_{}_{}", std::process::id(), id))
+    stdx::test_temp::unique_dir("bsl_analyzer_cfe")
 }
 
 fn minimal_configuration_xml(name: &str) -> String {

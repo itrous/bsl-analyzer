@@ -1364,11 +1364,7 @@ mod tests {
     #[test]
     fn refresh_is_incremental_and_tracks_structure_on_bare_host() {
         let cat = bsl_metadata::MdoType::Catalog;
-        let root = std::env::temp_dir().join(format!(
-            "ihc_refresh_meta_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("ihc_refresh_meta");
         let catalogs = root.join("Catalogs");
         std::fs::create_dir_all(&catalogs).unwrap();
         let write = |name: &str, uuid: &str| {
@@ -1464,11 +1460,7 @@ mod tests {
             )
         }
 
-        let root = std::env::temp_dir().join(format!(
-            "ihc_role_refresh_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("ihc_role_refresh");
         let roles = root.join("Roles");
         std::fs::create_dir_all(roles.join("ТестоваяРоль/Ext")).unwrap();
         std::fs::write(roles.join("ТестоваяРоль.xml"), role_xml("ТестоваяРоль")).unwrap();
@@ -1557,11 +1549,7 @@ mod tests {
             )
         }
 
-        let root = std::env::temp_dir().join(format!(
-            "ihc_subsystem_refresh_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("ihc_subsystem_refresh");
         let subsystems = root.join("Subsystems");
         let nested = subsystems.join("Корневая/Subsystems");
         std::fs::create_dir_all(&nested).unwrap();
@@ -1630,11 +1618,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../bsl-metadata/fixtures/common_attributes"
         ));
-        let root = std::env::temp_dir().join(format!(
-            "ihc_common_attributes_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("ihc_common_attributes");
         for dir in ["Catalogs", "CommonAttributes"] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
             for entry in std::fs::read_dir(fixture.join(dir)).unwrap() {
