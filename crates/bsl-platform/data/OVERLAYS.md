@@ -266,6 +266,65 @@ of a property correction: an entry whose type or method a corpus does not have
 does not apply to it, two entries resolving to one method are refused, and the
 curated entries are guarded by `crates/bsl-platform/tests/bundled_facts.rs`.
 
+## Type version correction schema
+
+<!-- overlay-document -->
+```json
+{
+  "schema_version": 1,
+  "method_parameter_overrides": [],
+  "type_version_corrections": [
+    {
+      "type": "ColumnEditMode",
+      "min_version": "8.0",
+      "evidence_source": "the help of the earlier release dates the type 8.0, a runtime probe runs its values there",
+      "rationale": "the newest help re-dated the whole enumeration for one new value"
+    }
+  ]
+}
+```
+
+Replaces the `min_version` of a platform type the extract already carries, for
+a type whose help page is dated later than the release that really introduced
+it. Only the type record changes: the members of the type, a value of an
+enumeration among them, keep their own dates, so a value that really is newer
+is still reported. `type` may be spelled in either language and resolves like
+the target of a property correction. `min_version` is a platform version
+string in the spelling of the extract (`8.0`, `8.3.1`); anything else is
+refused at load time. An entry whose type a corpus does not have does not apply
+to it, two entries naming one type are refused, and the curated entries are
+guarded by `crates/bsl-platform/tests/bundled_facts.rs`.
+
+## Member version correction schema
+
+<!-- overlay-document -->
+```json
+{
+  "schema_version": 1,
+  "method_parameter_overrides": [],
+  "member_version_corrections": [
+    {
+      "type": "DataHashing",
+      "name": "ХешСумма",
+      "min_version": "8.3.1",
+      "evidence_source": "a runtime probe reads the property on the earlier release",
+      "rationale": "the help dates the property later than the release that runs it"
+    }
+  ]
+}
+```
+
+Replaces the `min_version` of a property or a method the extract already
+carries, for a member whose help page is dated later than the release that
+really introduced it. `type` and `name` may be spelled in either language.
+`min_version` is a platform version string in the spelling of the extract; anything
+else is refused at load time. The member resolves against the properties of the
+type and against its methods: a name that is both leaves the record
+uncorrected, because neither would be the right pick. An entry whose type or
+member a corpus does not have does not apply to it, two entries resolving to
+one record are refused, and the curated entries are guarded by
+`crates/bsl-platform/tests/bundled_facts.rs`.
+
 ## Type member surface attestation schema
 
 <!-- overlay-document -->

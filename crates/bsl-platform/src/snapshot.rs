@@ -184,6 +184,10 @@ impl PlatformSnapshot {
             .map_err(overlay_error)?;
         crate::overlays::apply_method_return_type_corrections(&mut data, overlays)
             .map_err(overlay_error)?;
+        crate::overlays::apply_type_version_corrections(&mut data, overlays)
+            .map_err(overlay_error)?;
+        crate::overlays::apply_member_version_corrections(&mut data, overlays)
+            .map_err(overlay_error)?;
         let member_surface_attestations =
             crate::overlays::parse_resolved_member_surface_attestations(&data, overlays)
                 .map_err(overlay_error)?;

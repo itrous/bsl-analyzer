@@ -93,6 +93,33 @@ pub(crate) struct MethodReturnTypeCorrection {
     pub(crate) return_types: Vec<String>,
 }
 
+/// A correction to the `min_version` of a platform type the extract already
+/// carries, for a type whose help page is dated later than the release that
+/// really introduced it. Like [`TypePropertyCorrection`] it never declares a
+/// type: a corpus that lacks the target is left alone. It dates the type
+/// record only; the members of the type keep their own dates.
+#[derive(Debug)]
+pub(crate) struct TypeVersionCorrection {
+    /// The type, by its Russian or English spelling.
+    pub(crate) type_name: String,
+    /// Replaces the extracted `min_version` of the type.
+    pub(crate) min_version: String,
+}
+
+/// A correction to the `min_version` of a property or method the extract
+/// already carries, for a member whose help page is dated later than the
+/// release that really introduced it. A name that is both a property and a
+/// method of the type resolves to neither, so the record stays as extracted.
+#[derive(Debug)]
+pub(crate) struct MemberVersionCorrection {
+    /// The owning type, by its Russian or English spelling.
+    pub(crate) type_name: String,
+    /// The property or method, by its Russian or English spelling.
+    pub(crate) member_name: String,
+    /// Replaces the extracted `min_version` of the member.
+    pub(crate) min_version: String,
+}
+
 /// A platform type whose extracted member surface — every method and property —
 /// is attested as complete for the named platform release. A miss on such a
 /// receiver is a defect of the checked code rather than a gap in the extract,
@@ -133,6 +160,8 @@ const OVERLAY_ROOT_FIELDS: &[&str] = &[
     "type_property_additions",
     "type_property_corrections",
     "method_return_type_corrections",
+    "type_version_corrections",
+    "member_version_corrections",
     "type_member_surface_attestations",
     "parameter_passing_attestations",
 ];
@@ -287,6 +316,81 @@ pub(crate) fn parse_method_return_type_corrections(
             return Err(OverlayError(format!(
                 "duplicate method return type correction for {}.{}",
                 correction.type_name, correction.method_name
+            )));
+        }
+    }
+    Ok(corrections)
+}
+
+/// Parses the optional `type_version_corrections` section. An absent section
+/// yields no corrections; the root schema is validated the same way as
+/// [`parse_overrides`].
+pub(crate) fn parse_type_version_corrections(
+    overlay_source: &str,
+) -> Result<Vec<TypeVersionCorrection>, OverlayError> {
+    let root: Value = serde_json::from_str(overlay_source)
+        .map_err(|error| OverlayError(format!("malformed overlay JSON: {error}")))?;
+    let object = root
+        .as_object()
+        .ok_or_else(|| OverlayError("overlay root must be an object".to_owned()))?;
+    require_only_fields(object, OVERLAY_ROOT_FIELDS, "overlay root")?;
+    validate_schema_version(object)?;
+    let entries = match object.get("type_version_corrections") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(value) => value.as_array().ok_or_else(|| {
+            OverlayError("overlay type_version_corrections must be an array".to_owned())
+        })?,
+    };
+
+    let corrections: Vec<TypeVersionCorrection> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| parse_type_version_correction(index, entry))
+        .collect::<Result<_, _>>()?;
+    let mut seen: HashSet<String> = HashSet::new();
+    for correction in &corrections {
+        if !seen.insert(correction.type_name.fold_lower()) {
+            return Err(OverlayError(format!(
+                "duplicate type version correction for {}",
+                correction.type_name
+            )));
+        }
+    }
+    Ok(corrections)
+}
+
+/// Parses the optional `member_version_corrections` section. An absent section
+/// yields no corrections; the root schema is validated the same way as
+/// [`parse_overrides`].
+pub(crate) fn parse_member_version_corrections(
+    overlay_source: &str,
+) -> Result<Vec<MemberVersionCorrection>, OverlayError> {
+    let root: Value = serde_json::from_str(overlay_source)
+        .map_err(|error| OverlayError(format!("malformed overlay JSON: {error}")))?;
+    let object = root
+        .as_object()
+        .ok_or_else(|| OverlayError("overlay root must be an object".to_owned()))?;
+    require_only_fields(object, OVERLAY_ROOT_FIELDS, "overlay root")?;
+    validate_schema_version(object)?;
+    let entries = match object.get("member_version_corrections") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(value) => value.as_array().ok_or_else(|| {
+            OverlayError("overlay member_version_corrections must be an array".to_owned())
+        })?,
+    };
+
+    let corrections: Vec<MemberVersionCorrection> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| parse_member_version_correction(index, entry))
+        .collect::<Result<_, _>>()?;
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for correction in &corrections {
+        let key = (correction.type_name.fold_lower(), correction.member_name.fold_lower());
+        if !seen.insert(key) {
+            return Err(OverlayError(format!(
+                "duplicate member version correction for {}.{}",
+                correction.type_name, correction.member_name
             )));
         }
     }
@@ -543,6 +647,53 @@ fn parse_method_return_type_correction(
     required_string(object, "rationale", index)?;
 
     Ok(MethodReturnTypeCorrection { type_name, method_name, return_types })
+}
+
+fn parse_type_version_correction(
+    index: usize,
+    entry: &Value,
+) -> Result<TypeVersionCorrection, OverlayError> {
+    let context = format!("type version correction {index}");
+    let object =
+        entry.as_object().ok_or_else(|| OverlayError(format!("{context} must be an object")))?;
+    require_only_fields(
+        object,
+        &["type", "min_version", "evidence_source", "rationale"],
+        &context,
+    )?;
+    let type_name = required_string(object, "type", index)?;
+    let min_version = required_string(object, "min_version", index)?;
+    if parse_version(&min_version).is_none() {
+        return Err(OverlayError(format!("{context} min_version must be a platform version")));
+    }
+    required_string(object, "evidence_source", index)?;
+    required_string(object, "rationale", index)?;
+
+    Ok(TypeVersionCorrection { type_name, min_version })
+}
+
+fn parse_member_version_correction(
+    index: usize,
+    entry: &Value,
+) -> Result<MemberVersionCorrection, OverlayError> {
+    let context = format!("member version correction {index}");
+    let object =
+        entry.as_object().ok_or_else(|| OverlayError(format!("{context} must be an object")))?;
+    require_only_fields(
+        object,
+        &["type", "name", "min_version", "evidence_source", "rationale"],
+        &context,
+    )?;
+    let type_name = required_string(object, "type", index)?;
+    let member_name = required_string(object, "name", index)?;
+    let min_version = required_string(object, "min_version", index)?;
+    if parse_version(&min_version).is_none() {
+        return Err(OverlayError(format!("{context} min_version must be a platform version")));
+    }
+    required_string(object, "evidence_source", index)?;
+    required_string(object, "rationale", index)?;
+
+    Ok(MemberVersionCorrection { type_name, member_name, min_version })
 }
 
 fn parse_member_surface_attestation(
