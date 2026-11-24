@@ -766,12 +766,6 @@ fn a_register_form_without_a_main_attribute_is_judged_as_before() {
     let (db, file_id) = setup_at(&form_module("ФормаСпискаБезТипа"), REGISTER_FORM_READS);
     assert_eq!(
         absent_names(&db, file_id),
-        reported(&[
-            "СовсемНеизвестноеИмя",
-            "Справочник1",
-            "Период",
-            "Отбор",
-            "Модифицированность"
-        ])
+        reported(&["СовсемНеизвестноеИмя", "Справочник1", "Период", "Отбор", "Модифицированность"])
     );
 }
