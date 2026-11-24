@@ -33,6 +33,27 @@ mod tests {
     use crate::test_utils::*;
     use crate::DiagnosticCode;
     use expect_test::expect;
+
+    #[test]
+    fn full_historical_methods_preserve_the_real_post_commit_violation() {
+        let code = include_str!("fixtures/reported_transaction_methods.bsl");
+        let diagnostics =
+            check_diagnostics_for(code, DiagnosticCode::CommitTransactionOutsideTryCatch);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(
+            u32::from(diagnostics[0].range.start()) as usize,
+            code.find("ЗафиксироватьТранзакцию();").unwrap()
+        );
+    }
+
+    #[test]
+    fn real_commit_outside_try_still_emits() {
+        let code = include_str!("fixtures/unpaired_transaction_paths.bsl");
+        assert_eq!(
+            check_diagnostics_for(code, DiagnosticCode::CommitTransactionOutsideTryCatch).len(),
+            1
+        );
+    }
     #[test]
     fn test_valid_inside_try() {
         let code = r#"Процедура Пример1()

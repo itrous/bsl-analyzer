@@ -91,10 +91,10 @@ fn codes(body: &Value) -> Vec<String> {
         .collect()
 }
 
-// The receiver is a platform type whose member surface the corpus attests as complete:
-// only on such a type does a miss prove the method absent, for a file and a snippet alike.
+// The authored module has a known exported method and a completely read interface.
+// A miss is provable without relying on platform-help provenance.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_method_the_type_lacks_is_reported_relative_to_the_snippet() {
+async fn a_method_the_module_lacks_is_reported_relative_to_the_snippet() {
     let _guard = TEST_LOCK.lock().await;
     let dir = tempfile::tempdir().unwrap();
     project(dir.path());
@@ -104,7 +104,7 @@ async fn a_method_the_type_lacks_is_reported_relative_to_the_snippet() {
         &client,
         json!({
             "action": "snippet",
-            "code": "Запись = Новый ЗаписьJSON;\nЗапись.МетодКоторогоНет();",
+            "code": "Сосед.Пусто();\nСосед.МетодКоторогоНет();",
         }),
     )
     .await;

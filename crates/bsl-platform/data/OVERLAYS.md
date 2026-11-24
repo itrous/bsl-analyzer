@@ -381,6 +381,21 @@ element name as a property, so its property list is not the whole of what
 `["methods"]`, and the reason (with the live run that shows it) belongs in the
 entry's `rationale` and `evidence_source`.
 
+An optional `members` object binds an attestation to the served member set. It
+contains both `methods` and `properties` arrays, written with canonical English
+member names. The existing member resolver accepts aliases and ignores case;
+each name must resolve uniquely, and the resolved set must equal the entire
+served set in both sections. Missing, added, replaced or ambiguous members drop
+only that attestation, leaving the corpus and other attestations usable. Omitting
+`members` preserves the version-based contract of earlier attestations; explicit
+empty arrays attest an empty set, rather than disabling the constraint. The
+`DOMNodeType` attestation uses this constraint, with its membership checked
+against the SHA-pinned corpus by the corpus-contract test.
+
+The two fields are independent: `verified_surface` narrows which surfaces a
+consumer may treat as complete, `members` decides whether the attestation
+holds for the served corpus at all.
+
 One type is attested once, and attestations are deduplicated after their type
 names are resolved: two entries naming one type through different spellings
 (`SpreadsheetDocumentRange` and `ОбластьЯчеекТабличногоДокумента`) are refused

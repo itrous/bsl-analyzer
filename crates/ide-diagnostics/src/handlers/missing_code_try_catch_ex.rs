@@ -4,7 +4,7 @@ use crate::{BodyContext, Diagnostic, DiagnosticCode};
 use hir::catch_class::{classify_catch_body, CatchBodyClass};
 use hir::BodySourceMap;
 use hir::LocalRange;
-use hir::{IdConversion, Stmt, StmtId};
+use hir::{Stmt, StmtId};
 use syntax::{NodeOrToken, SyntaxKind};
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
@@ -34,139 +34,38 @@ pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
         .get_bool(DiagnosticCode::MissingCodeTryCatchEx, "commentAsCode")
         .unwrap_or(false);
 
-    check_body_for_empty_except(ctx.body(), ctx.source_map(), comment_as_code, code, ctx, acc);
-}
-
-fn check_body_for_empty_except(
-    body: &hir::Body,
-    source_map: &BodySourceMap,
-    comment_as_code: bool,
-    code: DiagnosticCode,
-    ctx: &BodyContext,
-    diagnostics: &mut Vec<Diagnostic<LocalRange>>,
-) {
-    for stmt_id in body.body_stmts() {
-        check_stmt_recursive(stmt_id, body, source_map, comment_as_code, code, ctx, diagnostics);
-    }
-}
-
-fn check_stmt_recursive(
-    stmt_id: StmtId,
-    body: &hir::Body,
-    source_map: &BodySourceMap,
-    comment_as_code: bool,
-    code: DiagnosticCode,
-    ctx: &BodyContext,
-    diagnostics: &mut Vec<Diagnostic<LocalRange>>,
-) {
-    let stmt = body.stmt(stmt_id);
-
-    if let Stmt::Try { body: try_body, except } = stmt {
-        let class = classify_catch_body(body, except);
+    let body = ctx.body();
+    let source_map = ctx.source_map();
+    let mut catches: Vec<_> = body
+        .stmts_iter()
+        .filter_map(|(id, stmt)| match stmt {
+            Stmt::Try { except, .. } => Some((id, classify_catch_body(body, except))),
+            _ => None,
+        })
+        .collect();
+    catches.sort_by_key(|(id, _)| source_map.stmt_range(*id).map(|range| range.in_root().start()));
+    let observable = if catches
+        .iter()
+        .any(|(_, class)| matches!(class, CatchBodyClass::Silent | CatchBodyClass::RollbackOnly))
+    {
+        hir::dataflow::catch_outcome::observable_catch_results(
+            body,
+            ctx.cfg(),
+            ctx.platform_call_effects(),
+        )
+    } else {
+        Default::default()
+    };
+    for (stmt_id, class) in catches {
         let should_emit = match class {
             CatchBodyClass::Empty => {
                 !(comment_as_code && except_clause_has_comments(stmt_id, source_map, ctx))
             }
-            CatchBodyClass::Silent => true,
-            CatchBodyClass::RollbackOnly => true,
+            CatchBodyClass::Silent | CatchBodyClass::RollbackOnly => !observable.contains(&stmt_id),
             CatchBodyClass::RaisesOnly | CatchBodyClass::LogsOnly | CatchBodyClass::Mixed => false,
         };
-
         if should_emit {
-            emit_at_except_keyword(stmt_id, source_map, code, ctx, diagnostics, class);
-        }
-
-        for &nested_stmt_idx in try_body.iter() {
-            check_stmt_recursive(
-                StmtId::from_idx(nested_stmt_idx),
-                body,
-                source_map,
-                comment_as_code,
-                code,
-                ctx,
-                diagnostics,
-            );
-        }
-
-        for &nested_stmt_idx in except.iter() {
-            check_stmt_recursive(
-                StmtId::from_idx(nested_stmt_idx),
-                body,
-                source_map,
-                comment_as_code,
-                code,
-                ctx,
-                diagnostics,
-            );
-        }
-    } else {
-        match stmt {
-            Stmt::If(if_stmt) => {
-                for &nested_idx in if_stmt.then_branch.iter() {
-                    check_stmt_recursive(
-                        StmtId::from_idx(nested_idx),
-                        body,
-                        source_map,
-                        comment_as_code,
-                        code,
-                        ctx,
-                        diagnostics,
-                    );
-                }
-                for (_, branch) in if_stmt.elsif_branches.iter() {
-                    for &nested_idx in branch.iter() {
-                        check_stmt_recursive(
-                            StmtId::from_idx(nested_idx),
-                            body,
-                            source_map,
-                            comment_as_code,
-                            code,
-                            ctx,
-                            diagnostics,
-                        );
-                    }
-                }
-                if let Some(ref branch) = if_stmt.else_branch {
-                    for &nested_idx in branch.iter() {
-                        check_stmt_recursive(
-                            StmtId::from_idx(nested_idx),
-                            body,
-                            source_map,
-                            comment_as_code,
-                            code,
-                            ctx,
-                            diagnostics,
-                        );
-                    }
-                }
-            }
-            Stmt::While { body: while_body, .. } => {
-                for &nested_idx in while_body.iter() {
-                    check_stmt_recursive(
-                        StmtId::from_idx(nested_idx),
-                        body,
-                        source_map,
-                        comment_as_code,
-                        code,
-                        ctx,
-                        diagnostics,
-                    );
-                }
-            }
-            Stmt::For { body: for_body, .. } | Stmt::ForEach { body: for_body, .. } => {
-                for &nested_idx in for_body.iter() {
-                    check_stmt_recursive(
-                        StmtId::from_idx(nested_idx),
-                        body,
-                        source_map,
-                        comment_as_code,
-                        code,
-                        ctx,
-                        diagnostics,
-                    );
-                }
-            }
-            _ => {}
+            emit_at_except_keyword(stmt_id, source_map, code, ctx, acc, class);
         }
     }
 }
@@ -258,6 +157,171 @@ mod tests {
 
     fn check(code: &str, expected: expect_test::Expect) {
         check_diagnostics_snapshot_for(code, DiagnosticCode::MissingCodeTryCatchEx, expected);
+    }
+
+    fn configured_diagnostics(code: &str) -> Vec<crate::Diagnostic> {
+        crate::test_utils::check_with_cfe(code, test_fixture::CfeFixtureBuilder::new("").build())
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::MissingCodeTryCatchEx)
+            .collect()
+    }
+
+    #[test]
+    fn observable_exception_results_do_not_emit() {
+        let code = include_str!("fixtures/observable_catch_results.bsl");
+        let diagnostics = configured_diagnostics(code);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn unindexed_platform_calls_do_not_prove_exception_observation() {
+        let code = include_str!("fixtures/observable_catch_results.bsl");
+        let diagnostics = check_body_diagnostic(code, check_body);
+        assert_eq!(diagnostics.len(), 3, "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn unobserved_exception_results_still_emit() {
+        let code = include_str!("fixtures/unobserved_catch_results.bsl");
+        assert_eq!(configured_diagnostics(code).len(), 3);
+    }
+
+    #[test]
+    fn discarded_exception_results_still_emit() {
+        let code = include_str!("fixtures/discarded_catch_results.bsl");
+        let diagnostics = configured_diagnostics(code);
+        assert_eq!(diagnostics.len(), 10, "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn shadowed_formatters_do_not_prove_exception_observation() {
+        let code = include_str!("fixtures/shadowed_catch_formatters.bsl");
+        let diagnostics = configured_diagnostics(code);
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn platform_calls_propagate_only_the_value_positions() {
+        for (setup, caught, after, expected) in [
+            ("", "Failure = ErrorDescription();", "Return XMLString(String(Failure));", 0),
+            ("", "Ошибка = ОписаниеОшибки();", "Возврат XMLСтрока(Строка(Ошибка));", 0),
+            (
+                "",
+                "Failure = ErrorDescription();",
+                "Return New Structure(\"One,Two\", \"constant\", Failure);",
+                0,
+            ),
+            ("", "Failure = New FixedArray(New Array);", "Return New Array(Failure);", 0),
+            ("", "Size = 1;", "Return New Array(Size);", 1),
+            ("", "Failure = \"Key\";", "Return New Structure(Failure, \"constant\");", 1),
+            (
+                "Values = New Array;",
+                "Failure = ErrorDescription();",
+                "Values.Insert(0, Failure);\nReturn StrConcat(Values, \",\");",
+                0,
+            ),
+            (
+                "Values = New Array;",
+                "Position = 0;",
+                "Values.Insert(Position, \"constant\");\nReturn Values.Count();",
+                1,
+            ),
+            ("Values = New Array;", "Values.Add();", "Return Values.Count();", 0),
+            (
+                "Values = New Array;",
+                "Values.Add(ErrorDescription());",
+                "Values.Clear();\nReturn Values.Count();",
+                1,
+            ),
+            ("", "Failure = ErrorDescription();", "Values.Add(Failure);\nReturn Values;", 1),
+            (
+                "If Flag Then\nValues = New Structure;\nElse\nValues = New Array;\nEndIf;",
+                "Failure = ErrorDescription();",
+                "Values.Add(Failure);\nReturn Values;",
+                1,
+            ),
+        ] {
+            let code = format!(
+                "Function Test(Values, Flag)\n{setup}\nTry\n Work();\nExcept\n{caught}\nEndTry;\n{after}\nEndFunction"
+            );
+            let diagnostics = configured_diagnostics(&code);
+            assert_eq!(diagnostics.len(), expected, "{code}\n{diagnostics:#?}");
+        }
+    }
+
+    #[test]
+    fn array_calls_preserve_the_failure_variable() {
+        for (call, result, expected) in [
+            ("Values.Add(Failure)", "Failure", 0),
+            ("Values.Insert(Index, Failure)", "Failure", 0),
+            ("Values.Insert(Index, Failure)", "Index", 0),
+            ("UnknownValues.Add(Failure)", "Failure", 1),
+            ("Add(Failure)", "Failure", 1),
+        ] {
+            let code = format!(
+                r#"Procedure Add(Failure)
+    Failure = "";
+EndProcedure
+
+Function Test(UnknownValues)
+    Values = New Array;
+    Try
+        Work();
+    Except
+        Failure = ErrorDescription();
+        Index = 0;
+    EndTry;
+    {call};
+    Return {result};
+EndFunction"#
+            );
+            let diagnostics = configured_diagnostics(&code);
+            assert_eq!(diagnostics.len(), expected, "{call}\n{diagnostics:#?}");
+        }
+    }
+
+    #[test]
+    fn known_array_calls_preserve_the_type_of_collection_arguments() {
+        for (setup, earlier_call, expected) in [
+            ("Holder = New Array;", "Holder.Add(Values);", 0),
+            (
+                "Holder = New Array;\nOuter = New Array;",
+                "Outer.Add(Holder);\nHolder.Insert(0, Values);",
+                0,
+            ),
+            ("", "Holder.Add(Values);", 1),
+            (
+                "If Flag Then\nHolder = Unknown;\nElse\nHolder = New Array;\nEndIf;",
+                "Holder.Add(Values);",
+                1,
+            ),
+            (
+                "Holder = New Array;",
+                "While Flag Do\nHolder.Add(Values);\nValues.Add(Holder);\nHolder = Unknown;\nEndDo;",
+                1,
+            ),
+            ("", "Change(Values);", 1),
+        ] {
+            let code = format!(
+                r#"Procedure Change(Values)
+    Values = Undefined;
+EndProcedure
+
+Function Test(Holder, Unknown, Flag)
+    Values = New Array;
+    {setup}
+    {earlier_call}
+    Try
+        Work();
+    Except
+        Values.Add(ErrorDescription());
+    EndTry;
+    Return Values.Count();
+EndFunction"#
+            );
+            let diagnostics = configured_diagnostics(&code);
+            assert_eq!(diagnostics.len(), expected, "{setup}\n{earlier_call}\n{diagnostics:#?}");
+        }
     }
 
     #[test]

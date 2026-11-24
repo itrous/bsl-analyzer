@@ -5,6 +5,44 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use stdx::case::CaseExt;
 
+pub mod inspection;
+
+fn inspection_origin(db: &dyn base_db::SourceDatabase, id: vfs::FileId) -> String {
+    inspection_origin_query(db, base_db::FileIdInput::new(db, id))
+}
+
+#[salsa::tracked(returns(clone))]
+fn inspection_origin_query<'db>(
+    db: &'db dyn base_db::SourceDatabase,
+    file: base_db::FileIdInput<'db>,
+) -> String {
+    let id = file.file_id(db);
+    let Some(source) = db.try_source_root_input(base_db::METADATA_SOURCE_ROOT) else {
+        return String::new();
+    };
+    let Some(path) = source.root(db).file_set().path_for_file(&id) else { return String::new() };
+    let snapshot = WorkspaceConfigsInput::try_get(db).map(|input| input.snapshot(db));
+    inspection_origin_for_path(snapshot.as_deref(), path.as_path())
+}
+
+fn inspection_origin_for_path(snapshot: Option<&WorkspaceConfigsSnapshot>, path: &Path) -> String {
+    if let Some(snapshot) = snapshot {
+        if let Some(index) = snapshot.owner_of_path(path) {
+            let (label, configured) = &snapshot.paths[index];
+            for root in [configured, &snapshot.canonical_paths[index]] {
+                if let Ok(relative) = path.strip_prefix(root) {
+                    return format!(
+                        "{}:{}",
+                        label.as_deref().unwrap_or(""),
+                        relative.to_string_lossy()
+                    );
+                }
+            }
+        }
+    }
+    String::new()
+}
+
 /// Heap-size estimators for Salsa's `memory_usage` introspection, wrapping each
 /// metadata substrate's own `estimated_heap_size` so it reads `None` (a query
 /// that found nothing) as zero.
@@ -59,6 +97,12 @@ pub(crate) mod heap_estimate {
         v.as_ref().map_or(0, |s| s.estimated_heap_size())
     }
 
+    pub(crate) fn read_object_heap(
+        v: &Option<Arc<bsl_metadata::read_object::ReadObject>>,
+    ) -> usize {
+        v.as_ref().map_or(0, |object| object.estimated_heap_size())
+    }
+
     pub(crate) fn configuration_heap(v: &Arc<bsl_metadata::Configuration>) -> usize {
         v.estimated_heap_size()
     }
@@ -96,6 +140,19 @@ pub(crate) mod heap_estimate {
                 .map(|c| stdx::heap::vec_bytes::<usize>(c.len()))
                 .sum::<usize>()
             + snapshot.fingerprint.as_ref().map_or(0, String::capacity)
+            + snapshot.compilation_overrides.compatibility_mode.as_ref().map_or(0, String::capacity)
+            + snapshot
+                .external_owners
+                .iter()
+                .map(|(_, owner)| {
+                    owner
+                        .compilation_root()
+                        .map_or(0, |root| root.path.capacity() + root.canonical_path.capacity())
+                })
+                .sum::<usize>()
+            + stdx::heap::vec_bytes::<(usize, project_model::ExternalConfigurationOwner)>(
+                snapshot.external_owners.len(),
+            )
             + snapshot.source_exclusions.heap_bytes()
     }
 
@@ -395,16 +452,25 @@ impl RootKind {
     }
 }
 
-/// Atomic description of the workspace's config roots and their dependency
-/// topology. ONE input field holds the whole value because Salsa tracks input
-/// FIELDS independently (a revision per setter): splitting paths, closures and
-/// fingerprint across fields would let a reload be observed half-applied.
+/// Existing explicit settings tied to the project's main configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectCompilationOverrides {
+    pub(crate) compatibility_mode: Option<String>,
+    pub(crate) ordinary_app_support: Option<bool>,
+}
+
+/// Atomic roots and compilation choices. A single input prevents a reload from
+/// exposing new owner paths with dependency closures from the previous project.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkspaceConfigsSnapshot {
     /// Config roots in declaration order. At most one `None` label — the base;
     /// an extension-only project has none, and every entry is an extension or
     /// an external object.
     pub paths: Vec<(Option<String>, PathBuf)>,
+    /// Compilation choices for external root slots; their owner roots stay outside topology.
+    pub external_owners: Vec<(usize, project_model::ExternalConfigurationOwner)>,
+    /// Existing explicit main-project settings; never inherited by a different owner.
+    pub compilation_overrides: ProjectCompilationOverrides,
     /// Per entry (same order as `paths`): what the root is.
     pub kinds: Vec<RootKind>,
     /// Installation scope per root; base and external roots have no extension scope.
@@ -448,6 +514,8 @@ impl WorkspaceConfigsSnapshot {
         let extension_scopes = vec![None; paths.len()];
         Self {
             paths,
+            external_owners: Vec::new(),
+            compilation_overrides: ProjectCompilationOverrides::default(),
             kinds,
             extension_scopes,
             canonical_paths,
@@ -490,6 +558,17 @@ impl WorkspaceConfigsSnapshot {
             });
             closures.push(node.closure().iter().map(|id| id.index() + offset).collect());
         }
+        let external_owners = paths
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (_, path))| {
+                project
+                    .external_configuration_owners()
+                    .iter()
+                    .find(|(root, _)| root == path)
+                    .map(|(_, owner)| (index, owner.clone()))
+            })
+            .collect();
         let topological_order = base
             .map(|_| 0)
             .into_iter()
@@ -497,12 +576,19 @@ impl WorkspaceConfigsSnapshot {
             .collect();
         Self {
             paths,
+            external_owners,
+            compilation_overrides: ProjectCompilationOverrides {
+                compatibility_mode: project.config.compatibility_mode.clone(),
+                ordinary_app_support: project.ordinary_app_support().and_then(|(value, source)| {
+                    (source == project_model::OrdinaryAppSupportSource::Setting).then_some(value)
+                }),
+            },
             kinds,
             extension_scopes,
             canonical_paths,
             closures,
             topological_order,
-            fingerprint: Some(topology.fingerprint().to_hex()),
+            fingerprint: Some(project.compilation_fingerprint()),
             source_exclusions: project.source_exclusions().clone(),
         }
     }
@@ -513,10 +599,63 @@ impl WorkspaceConfigsSnapshot {
     /// path, so the registered roots must be canonical too or the reverse
     /// lookup misses on a symlinked workspace.
     pub fn canonicalized(mut self) -> Self {
+        for (_, owner) in &mut self.external_owners {
+            match owner {
+                project_model::ExternalConfigurationOwner::Selected(root)
+                | project_model::ExternalConfigurationOwner::LegacyProjectDefault(root) => {
+                    root.path.clone_from(&root.canonical_path);
+                }
+                project_model::ExternalConfigurationOwner::Unknown => {}
+            }
+        }
         for (idx, (_, path)) in self.paths.iter_mut().enumerate() {
             *path = self.canonical_paths[idx].clone();
         }
         self
+    }
+
+    /// Resolve only a published declaration; old path-only registrations retain their legacy default.
+    pub fn external_owner(
+        &self,
+        index: usize,
+    ) -> Option<project_model::ExternalConfigurationOwner> {
+        if !self.is_external(index) {
+            return None;
+        }
+        if let Some((_, owner)) = self.external_owners.iter().find(|(slot, _)| *slot == index) {
+            return Some(owner.clone());
+        }
+        Some(self.paths.iter().enumerate().find(|(_, (label, _))| label.is_none()).map_or(
+            project_model::ExternalConfigurationOwner::Unknown,
+            |(index, (_, path))| {
+                project_model::ExternalConfigurationOwner::LegacyProjectDefault(
+                    project_model::OwnerConfigurationRoot {
+                        path: path.clone(),
+                        canonical_path: self.canonical_paths[index].clone(),
+                    },
+                )
+            },
+        ))
+    }
+
+    /// Roots whose declarations must be prepared, with additional owners kept out of topology.
+    pub fn prepared_roots(&self) -> Vec<(RootKind, PathBuf, PathBuf)> {
+        let mut roots = self
+            .paths
+            .iter()
+            .enumerate()
+            .map(|(index, (_, path))| {
+                (self.kinds[index], path.clone(), self.canonical_paths[index].clone())
+            })
+            .collect::<Vec<_>>();
+        for (_, owner) in &self.external_owners {
+            if let Some(root) = owner.compilation_root() {
+                if !roots.iter().any(|(_, _, canonical)| canonical == &root.canonical_path) {
+                    roots.push((RootKind::Base, root.path.clone(), root.canonical_path.clone()));
+                }
+            }
+        }
+        roots
     }
 
     pub fn is_external(&self, idx: usize) -> bool {
@@ -642,12 +781,28 @@ pub fn load_configuration<'db>(
     let _span = tracing::info_span!("load_configuration").entered();
 
     let path_str = path_input.path(db);
-    let path = PathBuf::from(path_str);
+    let snapshot = WorkspaceConfigsInput::try_get(db).map(|input| input.snapshot(db));
+    let path = snapshot
+        .as_ref()
+        .and_then(|snapshot| {
+            snapshot.paths.iter().enumerate().find_map(|(index, (_, configured))| {
+                [configured, &snapshot.canonical_paths[index]]
+                    .into_iter()
+                    .any(|root| {
+                        canonicalize_configuration_path(&root.to_string_lossy()) == *path_str
+                    })
+                    .then(|| configured.clone())
+            })
+        })
+        .unwrap_or_else(|| PathBuf::from(path_str));
 
     tracing::warn!(?path, "METADATA LOAD: loading configuration from directory");
 
     let excluded = source_exclusions_for(db, path_input);
-    let config = bsl_metadata::load_from_directory_scoped(&path, &excluded).unwrap_or_else(|e| {
+    let config = bsl_metadata::load_from_directory_scoped_with_origins(&path, &excluded, &|main| {
+        inspection_origin_for_path(snapshot.as_deref(), main)
+    })
+    .unwrap_or_else(|e| {
         tracing::error!(error = %e, ?path, "failed to load configuration");
         Configuration::new("Configuration")
     });
@@ -677,10 +832,36 @@ pub fn load_configuration_from_prepared_inputs<'db>(
     let _span = tracing::info_span!("load_configuration_from_prepared_inputs").entered();
     let root = path_input.path(db);
     let _ = path_input.root_revision(db);
+    let source_root_path = WorkspaceConfigsInput::try_get(db)
+        .and_then(|input| {
+            input
+                .snapshot(db)
+                .paths
+                .iter()
+                .find(|(_, path)| canonicalize_configuration_path(&path.to_string_lossy()) == *root)
+                .map(|(_, path)| path.clone())
+        })
+        .unwrap_or_else(|| PathBuf::from(root));
 
-    // Match the existing directory loader's root header semantics: it does not
-    // read Configuration.xml and uses this default name/UUID behavior.
     let mut config = Configuration::new("Configuration");
+    if let Some(source_root) = db.try_source_root_input(base_db::METADATA_SOURCE_ROOT) {
+        let candidate = source_root_path
+            .join(bsl_conventions::ConventionalName::ConfigurationXml.canonical())
+            .to_string_lossy()
+            .into_owned();
+        if let Some(header) = base_db::resolve_vfs_path_ci_query(
+            db,
+            source_root,
+            candidate,
+            &[bsl_conventions::SegmentMatch::Ci],
+        ) {
+            if !db.file_is_unread(header) {
+                if let Ok(header) = Configuration::from_xml_str(db.file_text_ref(header)) {
+                    config.apply_source_header(&header);
+                }
+            }
+        }
+    }
 
     for entry in listing.entries(db).iter() {
         let files = MdoFiles::new(db, entry.kind, entry.main, entry.predefined, listing);
@@ -739,6 +920,31 @@ pub fn load_configuration_from_prepared_inputs<'db>(
     for entry in listing.subsystems(db).iter() {
         if let Some(value) = parse_subsystem_query(db, SubsystemFile::new(db, entry.main)) {
             config.add_subsystem((*value).clone());
+        }
+    }
+    if let Some(input) = db.try_source_root_input(base_db::METADATA_SOURCE_ROOT) {
+        let source = input.root(db);
+        for id in source.file_set().iter() {
+            let Some(path) = source.file_set().path_for_file(&id) else {
+                continue;
+            };
+            let Ok(relative) = path.as_path().strip_prefix(&source_root_path) else {
+                continue;
+            };
+            let mut parts = relative.iter();
+            let Some(kind) = parts
+                .next()
+                .and_then(|part| part.to_str())
+                .and_then(bsl_metadata::read_object::ReadObjectKind::parse)
+            else {
+                continue;
+            };
+            if parts.next().is_none() || parts.next().is_some() {
+                continue;
+            }
+            if let Some(object) = parse_read_object_query(db, ReadObjectFile::new(db, kind, id)) {
+                config.add_read_object((*object).clone());
+            }
         }
     }
     config.apply_common_attributes(&common_attribute_set(db, listing));
@@ -946,12 +1152,84 @@ pub fn parse_mdo_query<'db>(
         main_text,
         predefined_text.map(|t| &**t),
     )?;
+    object.read_properties.set_source_origin(&inspection_origin(db, files.main(db)));
+    if object.mdo_type == bsl_metadata::MdoType::ExchangePlan {
+        if let Some(source) = db.try_source_root_input(base_db::METADATA_SOURCE_ROOT) {
+            let path = source.root(db).file_set().path_for_file(&files.main(db));
+            if let Some(main) = path.map(|path| path.as_path()) {
+                let candidate = main
+                    .with_extension("")
+                    .join(bsl_conventions::ConventionalName::Ext.canonical())
+                    .join(bsl_conventions::ConventionalName::ContentXml.canonical())
+                    .to_string_lossy()
+                    .into_owned();
+                if let Some(id) = base_db::resolve_vfs_path_ci_query(
+                    db,
+                    source,
+                    candidate,
+                    &[bsl_conventions::SegmentMatch::Ci, bsl_conventions::SegmentMatch::Ci],
+                ) {
+                    object.read_properties.exchange_plan_content =
+                        bsl_metadata::source_content::parse_exchange_plan_content(
+                            db.file_text_ref(id),
+                        );
+                    object.read_properties.exchange_plan_content_complete =
+                        object.read_properties.exchange_plan_content.is_some();
+                }
+            }
+        }
+    }
     let applied =
         common_attribute_set(db, files.listing(db)).for_object(object.mdo_type, &object.name);
     if !applied.is_empty() {
         object.set_common_attributes(applied);
     }
     Some(Arc::new(object))
+}
+
+#[salsa::interned(debug,heap_size = stdx::heap::zero)]
+pub struct ReadObjectFile<'db> {
+    #[returns(copy)]
+    pub kind: bsl_metadata::read_object::ReadObjectKind,
+    #[returns(copy)]
+    pub main: vfs::FileId,
+}
+
+#[salsa::tracked(lru=8192,heap_size=heap_estimate::read_object_heap,returns(clone))]
+pub fn parse_read_object_query(
+    db: &dyn base_db::SourceDatabase,
+    file: ReadObjectFile<'_>,
+) -> Option<Arc<bsl_metadata::read_object::ReadObject>> {
+    if db.file_is_unread(file.main(db)) {
+        return None;
+    }
+    bsl_metadata::read_object::ReadObject::from_xml(db.file_text_ref(file.main(db)), file.kind(db))
+        .ok()
+        .map(Arc::new)
+}
+
+pub fn resolve_read_object_in_root(
+    db: &dyn base_db::SourceDatabase,
+    root: &str,
+    kind: bsl_metadata::read_object::ReadObjectKind,
+    name: &str,
+) -> Option<Arc<bsl_metadata::read_object::ReadObject>> {
+    if name.is_empty() || name.contains(['/', '\\', '.']) {
+        return None;
+    }
+    let source = db.try_source_root_input(base_db::METADATA_SOURCE_ROOT)?;
+    let candidate = Path::new(root)
+        .join(kind.collection())
+        .join(format!("{name}.{}", bsl_conventions::XML_EXTENSION))
+        .to_string_lossy()
+        .into_owned();
+    let main = base_db::resolve_vfs_path_ci_query(
+        db,
+        source,
+        candidate,
+        &[bsl_conventions::SegmentMatch::Ci, bsl_conventions::SegmentMatch::Ci],
+    )?;
+    parse_read_object_query(db, ReadObjectFile::new(db, kind, main))
 }
 
 /// One discovered metadata object in a config root's *structure* listing: which
@@ -1267,6 +1545,9 @@ pub fn parse_register_query(
 
     let main_text = db.file_text_ref(files.main(db));
     let mut register = bsl_metadata::parse_register_from_text(files.mdo_type(db), main_text)?;
+    let mut properties = register.read_properties().clone();
+    properties.set_source_origin(&inspection_origin(db, files.main(db)));
+    register.set_read_properties(properties);
     let common = common_attribute_set(db, files.listing(db));
     let applied = common.for_object(register.mdo_type(), register.name());
     if !applied.is_empty() {
@@ -2043,7 +2324,52 @@ pub fn parse_subsystem_query(
     let _span = tracing::info_span!("parse_subsystem").entered();
 
     let main_text = db.file_text_ref(file.main(db));
-    bsl_metadata::parse_subsystem_from_text(main_text).map(Arc::new)
+    let mut subsystem = bsl_metadata::parse_subsystem_from_text(main_text)?;
+    if let Some(source) = db.try_source_root_input(base_db::METADATA_SOURCE_ROOT) {
+        if let Some(path) = source.root(db).file_set().path_for_file(&file.main(db)) {
+            if let Some(input) = WorkspaceConfigsInput::try_get(db) {
+                if let Some((_, root)) = input
+                    .snapshot(db)
+                    .paths
+                    .iter()
+                    .filter(|(_, root)| path.as_path().starts_with(root))
+                    .max_by_key(|(_, root)| root.components().count())
+                {
+                    subsystem.set_source_identity(root, path.as_path());
+                }
+            }
+        }
+    }
+    Some(Arc::new(subsystem))
+}
+
+pub fn resolve_subsystem_in_root(
+    db: &dyn base_db::SourceDatabase,
+    root: &str,
+    name: &str,
+) -> Option<Arc<bsl_metadata::Subsystem>> {
+    let parts: Vec<_> = name.split('.').collect();
+    if parts.len().is_multiple_of(2)
+        || parts.iter().step_by(2).any(|part| part.is_empty() || part.contains(['/', '\\']))
+        || !parts.iter().skip(1).step_by(2).all(|part| part.eq_ignore_ascii_case("Subsystem"))
+    {
+        return None;
+    }
+    let source = db.try_source_root_input(base_db::METADATA_SOURCE_ROOT)?;
+    let mut path = PathBuf::from(root);
+    for name in parts.iter().step_by(2) {
+        path.push("Subsystems");
+        path.push(name);
+    }
+    path.set_extension(bsl_conventions::XML_EXTENSION);
+    let modes = vec![bsl_conventions::SegmentMatch::Ci; parts.len() + 1];
+    let main = base_db::resolve_vfs_path_ci_query(
+        db,
+        source,
+        path.to_string_lossy().into_owned(),
+        &modes,
+    )?;
+    parse_subsystem_query(db, SubsystemFile::new(db, main))
 }
 
 /// A config root's subsystem lookup, derived from its [`MetadataListingInput`]'s
@@ -3175,7 +3501,10 @@ mod tests {
         assert_eq!(metadata.module_type, bsl_metadata::ModuleType::FormModule);
         let form = metadata.form.as_ref().expect("common form metadata should be loaded");
         assert_eq!(form.name(), "ТестоваяФорма");
-        assert!(form.is_handler("ПриСозданииНаСервере"));
+        assert!(form.is_ordinary());
+        assert!(!form.ordinary_dialog_known());
+        assert!(form.is_handler("ПередОткрытием"));
+        assert!(!form.is_handler("ПриСозданииНаСервере"));
     }
 
     #[test]

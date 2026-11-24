@@ -186,3 +186,51 @@ fn execute_in_a_managed_form_module_is_still_reported() {
             .collect();
     assert_eq!(reported.len(), 2, "{reported:?}");
 }
+
+#[test]
+fn ordinary_form_attributes_keep_application_value_types() {
+    use hir::{Builders, HirDatabase, MetadataKind, TypeKernelDb, TypeKind};
+    let dir = tempfile::tempdir().unwrap();
+    let form_dir = dir.path().join("Catalogs/Справочник1/Forms/ФормаОбычная/Ext/Form");
+    std::fs::create_dir_all(&form_dir).unwrap();
+    let descriptor = designer_fixture_path().join("Catalogs/Справочник1/Forms/ФормаОбычная.xml");
+    std::fs::copy(descriptor, form_dir.parent().unwrap().parent().unwrap().with_extension("xml"))
+        .unwrap();
+    std::fs::write(
+        form_dir.join("Form.json"),
+        r#"{"schema":2,"attributes":[
+        {"name":"Основной","is_main":true,
+         "attr_type":{"Ref":{"mdo_type":"Catalog","name":"Справочник1"}}},
+        {"name":"Таблица","attr_type":{"Platform":"ValueTable"}},
+        {"name":"Неизвестный"}
+    ]}"#,
+    )
+    .unwrap();
+    let file_id = FileId(0);
+    let mut file_set = FileSet::default();
+    file_set.insert(file_id, VfsPath::from(form_dir.join("Module.bsl")));
+    let mut db = RootDatabaseImpl::new();
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    db.set_file_source_root(file_id, SourceRootId(0));
+    db.set_file_text(
+        file_id,
+        "Процедура Тест()\n А = Основной;\n Б = Таблица;\n В = Неизвестный;\nКонецПроцедуры",
+    );
+    db.set_all_config_paths(vec![(None, dir.path().to_path_buf())], None);
+    assert!(db.module_metadata(ModuleId::new(file_id)).is_ordinary_form_module());
+    let inferred = db.infer(file_id);
+    let main = inferred.var_types.get("а").copied().unwrap_or_else(|| db.unknown());
+    assert!(
+        matches!(db.lookup_type(main), TypeKind::MetadataRef(f) if f.kind == MetadataKind::CatalogObject && f.name.as_str() == "Справочник1"),
+        "{:?}",
+        db.lookup_type(main)
+    );
+    let table = inferred.var_types.get("б").copied().unwrap_or_else(|| db.unknown());
+    assert!(
+        matches!(db.lookup_type(table), TypeKind::ValueTable(_)),
+        "{:?}",
+        db.lookup_type(table)
+    );
+    let unknown = inferred.var_types.get("в").copied().unwrap_or_else(|| db.unknown());
+    assert_eq!(unknown, db.unknown());
+}

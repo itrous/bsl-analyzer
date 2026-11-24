@@ -48,7 +48,7 @@ class ReleaseDecision(RecordCase):
         elif name == "record incomplete":
             self.set_record("graph_resolve_s", noise=None)
         elif name == "profile incomplete":
-            self.machine.print["kernel"] = "7.0"
+            self.machine.print["mem_total"] = "63 GiB"
         elif name == "no baseline":
             os.remove(self.baseline_path)
         elif name == "peak over the target":
@@ -118,7 +118,7 @@ class ReleaseDecision(RecordCase):
 
     def test_an_incomplete_record_is_not_a_block_and_names_its_reason(self):
         for name, reason in (("record incomplete", "record_no_noise:graph_resolve_s"),
-                             ("profile incomplete", "record_profile_mismatch:kernel"),
+                             ("profile incomplete", "record_profile_mismatch:mem_total"),
                              ("no baseline", "baseline_missing")):
             with self.subTest(scenario=name):
                 code, summary, _ = self.run_scenario(name)

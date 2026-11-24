@@ -59,6 +59,11 @@ fn stage_workspace() -> TempDir {
     )
     .expect("write module body");
     std::fs::create_dir_all(root.join("CommonForms").join("Настройки")).expect("mkdir common form");
+    std::fs::write(
+        root.join("CommonForms").join("Настройки.xml"),
+        "<MetaDataObject xmlns='http://v8.1c.ru/8.3/MDClasses'><CommonForm uuid='00000000-0000-0000-0000-000000000003'><Properties><Name>Настройки</Name><FormType>Managed</FormType></Properties></CommonForm></MetaDataObject>",
+    )
+    .expect("write common form descriptor");
     dir
 }
 
@@ -232,7 +237,7 @@ async fn tools_list_publishes_the_mode_dependent_object_type_contract() {
         .join(" ");
     assert!(description.contains("source mode or auto without `connection`"), "{description}");
     assert!(description.contains("infobase mode or auto with `connection`"), "{description}");
-    assert!(description.contains("source-only managed form"), "{description}");
+    assert!(description.contains("source-only form layout"), "{description}");
 
     let properties = metadata.input_schema["properties"].as_object().expect("input properties");
     let object_type = properties["object_type"]["description"]
@@ -261,8 +266,11 @@ async fn tools_list_publishes_the_mode_dependent_object_type_contract() {
             "name_mask",
             "object_name",
             "object_type",
+            "predefined_code",
+            "root_id",
+            "template_name",
         ],
-        "the documentation-only change must not alter the input schema",
+        "the schema publishes all source inspection selectors",
     );
 }
 
@@ -277,24 +285,43 @@ async fn source_and_auto_without_connection_keep_form_on_the_source_path() {
     );
     let client = workspace_client_with_state(state).await;
 
-    let source = call(
-        &client,
-        &[
-            ("action", json!("form")),
-            ("mode", json!("source")),
-            ("connection", json!("live")),
-            ("object_type", json!("CommonForm")),
-        ],
-    )
-    .await;
-    assert!(text_of(&source).contains("Настройки"), "explicit source mode must read XML");
+    let mut patience = common::Patience::new(
+        test_utils::wait::hang_guard(Duration::from_secs(60)),
+        Duration::from_millis(100),
+    );
+    let source = loop {
+        let result = call(
+            &client,
+            &[
+                ("action", json!("form")),
+                ("mode", json!("source")),
+                ("connection", json!("live")),
+                ("object_type", json!("CommonForm")),
+            ],
+        )
+        .await;
+        if result.structured_content.as_ref().and_then(|body| body["status"].as_str())
+            != Some("loading")
+        {
+            break result;
+        }
+        assert!(patience.allows(), "the workspace resident never became ready: {result:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        text_of(&source).contains("Настройки"),
+        "explicit source mode must read XML: {source:?}"
+    );
 
     let auto = call(
         &client,
         &[("action", json!("form")), ("mode", json!("auto")), ("object_type", json!("CommonForm"))],
     )
     .await;
-    assert!(text_of(&auto).contains("Настройки"), "auto without connection must read XML");
+    assert!(
+        text_of(&auto).contains("Настройки"),
+        "auto without connection must read XML: {auto:?}"
+    );
     assert!(live.requests.lock().expect("request log").is_empty(), "source paths touched live 1C");
 }
 
@@ -391,10 +418,31 @@ async fn live_metadata_object_and_tree_obey_the_combined_output_budget() {
     let body = object.structured_content.as_ref().expect("live object structuredContent");
     assert_eq!(body["schema_version"], "2");
     assert_eq!(body["completeness"]["status"], "partial");
-    assert_eq!(body["object"]["ТабличныеЧасти"][1]["attributes"], json!([]));
+    assert_eq!(body["truncated"], true);
+    assert!(body["completeness"]["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|reason| reason["code"] == "output_budget"));
     let result_bytes = serde_json::to_vec(&object.content).unwrap().len()
         + serde_json::to_vec(body).unwrap().len();
     assert!(result_bytes <= 700 * 4, "{result_bytes} bytes");
+
+    let full = call(
+        &client,
+        &[
+            ("action", json!("object")),
+            ("mode", json!("infobase")),
+            ("connection", json!("live")),
+            ("object_type", json!("Справочники")),
+            ("object_name", json!("Товары")),
+            ("max_output_tokens", json!(2000)),
+        ],
+    )
+    .await;
+    let full = full.structured_content.as_ref().expect("full live object");
+    assert_eq!(full["truncated"], false);
+    assert_eq!(full["object"]["ТабличныеЧасти"][1]["attributes"], json!([]));
 
     let tiny_arguments: Map<String, Value> = [
         ("action", json!("object")),

@@ -33,7 +33,7 @@ LINE_KEYS = {
     "phase": {"name", "elapsed_ms", "source"},
     "footer": {"status", "errors"},
 }
-EVENT_NAMES = {"graph_ready", "call_start", "call_end"}
+EVENT_NAMES = {"graph_ready", "call_start", "call_end", "load_probe"}
 
 
 def own_proc(root, pid, run_id, cpu_s, rss_kb, hwm_kb, io=None):
@@ -99,7 +99,15 @@ def check_shape(case, g):
     keys = set(LINE_KEYS[kind])
     if kind == "event":
         case.assertIn(g["name"], EVENT_NAMES, g)
-        if g["name"] != "graph_ready":
+        if g["name"] == "load_probe":
+            keys.update(("busy_s", "own_cpu_s", "error", "cpu_by_pid"))
+            case.assertTrue(g["busy_s"] is None or isinstance(g["busy_s"], (int, float)), g)
+            case.assertIsInstance(g["own_cpu_s"], (int, float), g)
+            case.assertTrue(g["error"] is None or isinstance(g["error"], str), g)
+            case.assertIsInstance(g["cpu_by_pid"], dict, g)
+            case.assertTrue(all(isinstance(pid, str) and isinstance(cpu, (int, float))
+                                for pid, cpu in g["cpu_by_pid"].items()), g)
+        elif g["name"] != "graph_ready":
             keys.add("call_id")
         if g["name"] == "call_end":
             keys.add("ok")
@@ -634,7 +642,11 @@ class NonInterference(TracedGate):
                 self.assertIn(f"daemon.log: no `{name}` mark", record["resource_trace"]["errors"])
             self.assertEqual([g for g in got if g["kind"] == "phase"], [])
             self.assertEqual(got[-1]["errors"], record["resource_trace"]["errors"])
-            events = [g for g in got if g["kind"] == "event"]
+            probes = [g for g in got if g["kind"] == "event" and g["name"] == "load_probe"]
+            samples = [g for g in got if g["kind"] == "sample"]
+            self.assertTrue(probes)
+            self.assertLessEqual(len(probes), len(samples))
+            events = [g for g in got if g["kind"] == "event" and g["name"] != "load_probe"]
             self.assertEqual(events[0]["name"], "graph_ready")
             calls = [g["call_id"] for g in events if g["name"] == "call_start"]
             self.assertEqual(calls, [c["id"] for c in record["calls"]])
@@ -643,6 +655,9 @@ class NonInterference(TracedGate):
             own = {p["pid"] for g in got if g["kind"] == "sample" for p in g["processes"]}
             self.assertTrue(own)
             self.assertTrue(own.isdisjoint({os.getpid()}))
+        for label in ("off", "on"):
+            with open(self.data.path("gates", label, "report.md"), encoding="utf-8") as fh:
+                self.assertIn("- вердикт: **pass**", fh.read())
 
     def test_a_failed_call_ends_with_ok_false_and_the_same_reason(self):
         # Without `graph_answers` the first resolve has no candidates list and fails the run.
@@ -755,7 +770,7 @@ class TraceWiring(TracedGate):
         self.assertTrue(record["held"], record["errors"])
         stamps = [g["t_s"] for g in got if "t_s" in g]
         self.assertEqual(stamps, sorted(stamps))
-        events = [g for g in got if g["kind"] == "event"]
+        events = [g for g in got if g["kind"] == "event" and g["name"] != "load_probe"]
         self.assertEqual(events[0]["name"], "graph_ready")
         self.assertEqual(events[0]["t_s"], record["metrics"]["graph_ready_s"])
         starts = [g for g in events if g["name"] == "call_start"]

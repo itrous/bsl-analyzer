@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 ///
 /// The raw mutex is private to this type, so no path can reach it without the queue.
 pub(crate) struct AdmittedEngine {
+    pub(crate) disk_gate: ide_host_core::WorkspaceDiskGate,
     admission: Mutex<Admission>,
     turn: Condvar,
     engine: Mutex<Option<SearchEngine>>,
@@ -86,6 +87,7 @@ impl Drop for Ticket<'_> {
 impl AdmittedEngine {
     pub(crate) fn new(engine: Option<SearchEngine>) -> Self {
         Self {
+            disk_gate: Default::default(),
             admission: Mutex::new(Admission::default()),
             turn: Condvar::new(),
             engine: Mutex::new(engine),
@@ -93,6 +95,11 @@ impl AdmittedEngine {
             #[cfg(test)]
             between_the_look_and_the_lock: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn with_disk_gate(mut self, gate: ide_host_core::WorkspaceDiskGate) -> Self {
+        self.disk_gate = gate;
+        self
     }
 
     /// Put something in the window between the last look at the stop and the attempt on the

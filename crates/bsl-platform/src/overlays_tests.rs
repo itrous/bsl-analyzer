@@ -1196,6 +1196,35 @@ fn applies_global_function_override_by_name_alone() {
 }
 
 #[test]
+fn xml_string_override_replaces_only_the_value_type_and_preserves_availability() {
+    let mut data: Value =
+        serde_json::from_str(include_str!("../data/platform_facts.json")).unwrap();
+    let before = data["global_functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["english_name"] == "XMLString")
+        .unwrap()
+        .clone();
+    let mut overlay = curated_overlay();
+    overlay["global_function_parameter_overrides"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|entry| entry["english_name"] == "XMLString");
+    apply_global_function_parameter_overlays(&mut data, &overlay.to_string()).unwrap();
+    let after = data["global_functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["english_name"] == "XMLString")
+        .unwrap();
+    let mut expected = before;
+    expected["parameters"][0]["param_type"] = json!("Произвольный");
+    assert_eq!(after, &expected);
+    assert_eq!(after["context"]["web_client"], false);
+}
+
+#[test]
 fn global_function_override_leaves_method_overrides_alone() {
     let mut data = global_function_data();
 
@@ -1217,11 +1246,23 @@ fn absent_global_function_section_is_a_no_op() {
 }
 
 #[test]
-fn rejects_missing_global_function_target() {
+fn absent_global_function_target_leaves_a_partial_extract_unchanged() {
+    let mut data = global_function_data();
+    let before = data.clone();
+    let mut entry = access_right_override();
+    entry["english_name"] = Value::String("XMLString".to_owned());
+    entry["russian_name"] = Value::String("XMLСтрока".to_owned());
+
+    apply_global_function_parameter_overlays(&mut data, &global_function_overlay(entry)).unwrap();
+
+    assert_eq!(data, before);
+}
+
+#[test]
+fn a_present_global_function_alias_requires_its_matching_alias() {
     let mut data = global_function_data();
     let mut entry = access_right_override();
     entry["english_name"] = Value::String("NoSuchFunction".to_owned());
-    entry["russian_name"] = Value::String("НетТакойФункции".to_owned());
 
     let error =
         apply_global_function_parameter_overlays(&mut data, &global_function_overlay(entry))
@@ -1506,6 +1547,83 @@ fn corrects_the_curated_xdto_factory_create() {
         data["methods"][0]["return_type"], "ОбъектXDTO, ЗначениеXDTO",
         "the curated overlay must correct ФабрикаXDTO.Создать"
     );
+}
+
+fn range_attestation_with_members(methods: Value, properties: Value) -> Value {
+    let mut entry = range_attestation();
+    entry["members"] = json!({"methods": methods, "properties": properties});
+    entry
+}
+
+#[test]
+fn member_sets_distinguish_an_absent_constraint_from_an_empty_surface() {
+    let data = range_data();
+    let absent = parse_resolved_member_surface_attestations(
+        &data,
+        &attestation_overlay(json!([range_attestation()])),
+    )
+    .unwrap();
+    assert_eq!(absent.len(), 1);
+    let empty = parse_resolved_member_surface_attestations(
+        &data,
+        &attestation_overlay(json!([range_attestation_with_members(json!([]), json!([]))])),
+    )
+    .unwrap();
+    assert!(empty.is_empty());
+}
+
+#[test]
+fn member_sets_resolve_names_through_the_existing_member_aliases() {
+    let mut data = range_data();
+    data["methods"] = json!([{"id": 1, "type_name": "SpreadsheetDocumentRange", "name": "Прочитать", "english_name": "Read"}]);
+    for (methods, properties) in
+        [(json!(["Read"]), json!(["Value"])), (json!(["пРоЧиТаТь"]), json!(["vAlUe"]))]
+    {
+        let resolved = parse_resolved_member_surface_attestations(
+            &data,
+            &attestation_overlay(json!([range_attestation_with_members(methods, properties)])),
+        )
+        .unwrap();
+        assert_eq!(resolved.len(), 1);
+    }
+    let missing_method = parse_resolved_member_surface_attestations(
+        &data,
+        &attestation_overlay(json!([range_attestation_with_members(json!([]), json!(["Value"]))])),
+    )
+    .unwrap();
+    assert!(missing_method.is_empty());
+}
+
+#[test]
+fn member_sets_do_not_count_two_aliases_as_two_members() {
+    let data = range_data();
+    let resolved = parse_resolved_member_surface_attestations(
+        &data,
+        &attestation_overlay(json!([range_attestation_with_members(
+            json!([]),
+            json!(["Value", "Значение"])
+        )])),
+    )
+    .unwrap();
+    assert!(resolved.is_empty());
+}
+
+#[test]
+fn member_sets_reject_malformed_and_duplicate_names() {
+    for members in [
+        json!({"methods": []}),
+        json!({"methods": [], "properties": [false]}),
+        json!({"methods": [], "properties": ["Value", "value"]}),
+    ] {
+        let mut entry = range_attestation();
+        entry["members"] = members;
+        let error = parse_resolved_member_surface_attestations(
+            &range_data(),
+            &attestation_overlay(json!([entry])),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("members"), "{error}");
+    }
 }
 
 fn passing_data() -> Value {
@@ -2493,4 +2611,140 @@ fn duplicate_version_corrections_are_rejected_by_the_schema() {
         ])))
         .unwrap_err();
     assert_eq!(error.to_string(), "duplicate member version correction for DataHashing.ХешСумма");
+}
+
+#[test]
+fn call_value_effects_attach_to_bundled_signatures() {
+    assert_call_value_effects(include_bytes!("../data/platform_facts.json"));
+}
+
+#[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
+fn call_value_effects_attach_to_help_signatures() {
+    let path = std::env::var_os(crate::CORPUS_ENV).expect("platform help corpus path");
+    assert_call_value_effects(&std::fs::read(path).unwrap());
+}
+
+fn assert_call_value_effects(corpus: &[u8]) {
+    use crate::CallValueEffect::{
+        ArgumentToReceiver, ArgumentToResult, ClearReceiver, NoArgumentWriteback, ReceiverToResult,
+    };
+    use crate::CallValueEffectTarget::{Constructor, GlobalFunction, Method};
+    use crate::PlatformSnapshot;
+
+    let snapshot = PlatformSnapshot::from_corpus_json(corpus).unwrap();
+    for (name, expected) in [
+        ("СтрСоединить", vec![ArgumentToResult(0), ArgumentToResult(1)]),
+        ("Строка", vec![ArgumentToResult(0)]),
+        ("XMLСтрока", vec![ArgumentToResult(0)]),
+    ] {
+        let function = global_function(&snapshot, name);
+        assert_eq!(snapshot.call_value_effects[&GlobalFunction(function.id)], expected, "{name}");
+        assert_eq!(function.parameters[0].result_follows_argument_text, name == "Строка");
+    }
+    for (name, expected) in [
+        ("Add", vec![ArgumentToReceiver(0), NoArgumentWriteback { parameter_count: 1 }]),
+        ("Insert", vec![ArgumentToReceiver(1), NoArgumentWriteback { parameter_count: 2 }]),
+        ("Count", vec![ReceiverToResult]),
+        ("Clear", vec![ClearReceiver]),
+    ] {
+        let method = snapshot
+            .methods
+            .iter()
+            .find(|method| method.type_name == "Array" && method.english_name == name)
+            .unwrap();
+        assert_eq!(snapshot.call_value_effects[&Method(method.id)], expected, "{name}");
+    }
+    for (owner, variant, position) in [
+        ("Array", "На основании фиксированного массива", 0),
+        ("Structure", "По ключам и значениям", 1),
+        ("Structure", "На основании фиксированной структуры", 0),
+    ] {
+        let constructor = snapshot
+            .constructors
+            .iter()
+            .find(|ctor| ctor.type_name == owner && ctor.variant_name.as_deref() == Some(variant))
+            .unwrap();
+        assert_eq!(
+            snapshot.call_value_effects[&Constructor(constructor.id)],
+            [ArgumentToResult(position)]
+        );
+    }
+    assert_eq!(snapshot.call_value_effects.len(), 10);
+}
+
+#[test]
+fn call_value_effects_require_the_proven_writeback_signature() {
+    use crate::{CallValueEffect, CallValueEffectTarget, PlatformSnapshot};
+
+    let overlay = json!({
+        "schema_version": 1,
+        "method_parameter_overrides": [],
+        "call_value_effects": [{
+            "target": {"kind": "method", "type": "Array", "name": "Add"},
+            "effect": "no_argument_writeback",
+            "parameter_count": 1,
+            "evidence_source": "Sample",
+            "rationale": "Sample"
+        }]
+    })
+    .to_string();
+    let mut corpus = json!({
+        "types": [{"name": "Массив", "english_name": "Array"}],
+        "methods": [{
+            "id": 1,
+            "type_name": "Array",
+            "name": "Добавить",
+            "english_name": "Add",
+            "parameters": [{"name": "Значение", "param_type": "Произвольный"}]
+        }]
+    });
+    let load = |corpus: &Value| {
+        PlatformSnapshot::from_corpus_json_with_overlays(corpus.to_string().as_bytes(), &overlay)
+            .unwrap()
+    };
+    let snapshot = load(&corpus);
+    assert_eq!(
+        snapshot.call_value_effects[&CallValueEffectTarget::Method(1)],
+        [CallValueEffect::NoArgumentWriteback { parameter_count: 1 }]
+    );
+    assert_eq!(snapshot.methods[0].parameters[0].passing, None);
+    corpus["methods"][0]["parameters"][0]["is_variadic"] = json!(true);
+    assert!(load(&corpus).call_value_effects.is_empty());
+    corpus["methods"][0]["parameters"][0]["is_variadic"] = json!(false);
+    corpus["methods"][0]["parameters"].as_array_mut().unwrap().push(json!({"name": "Параметр"}));
+    assert!(load(&corpus).call_value_effects.is_empty());
+    assert!(load(&json!({})).call_value_effects.is_empty());
+}
+
+#[test]
+fn call_value_effects_validate_entries_and_skip_absent_corpus_signatures() {
+    use crate::PlatformSnapshot;
+
+    let valid = curated_overlay()["call_value_effects"][0].clone();
+    let load = |entry| {
+        PlatformSnapshot::from_corpus_json_with_overlays(
+            b"{}",
+            &json!({
+                "schema_version": 1,
+                "method_parameter_overrides": [],
+                "call_value_effects": [entry]
+            })
+            .to_string(),
+        )
+    };
+    assert!(load(valid.clone()).unwrap().call_value_effects.is_empty());
+    for (field, value) in [
+        ("target", json!(null)),
+        ("target", json!({"kind": "method", "name": "Add"})),
+        ("effect", json!("made_up")),
+        ("parameter_index", json!(-1)),
+        ("rationale", json!("")),
+        ("evidence_source", json!(null)),
+    ] {
+        let mut entry = valid.clone();
+        entry[field] = value;
+        let error = load(entry).unwrap_err();
+        assert!(error.to_string().contains("overlay entry 0"), "{field}: {error}");
+    }
 }

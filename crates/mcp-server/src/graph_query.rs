@@ -2342,6 +2342,83 @@ mod tests {
     }
 
     #[test]
+    fn resolve_accepts_the_same_qualified_method_symbol_as_the_resident() {
+        let id = "method/common/УчетЗарплаты/ДанныеФизическихЛиц";
+        let db = graph_db_with_nodes(&[
+            (id, "method"),
+            ("method/common/ДругойМодуль/ДанныеФизическихЛиц", "method"),
+            ("method/file/other-root/Module.bsl::ДанныеФизическихЛиц", "method"),
+        ]);
+        for query in ["УчетЗарплаты.ДанныеФизическихЛиц", "учетзарплаты.данныефизическихлиц", id]
+        {
+            let result = db.resolve(query, 10).unwrap();
+            assert_eq!(result.total, 1, "{query}");
+            assert_eq!(result.candidates[0].id, id);
+        }
+        assert_eq!(db.resolve("ДанныеФизическихЛиц", 10).unwrap().total, 3);
+    }
+
+    #[test]
+    fn qualified_method_resolution_keeps_the_callers_of_the_durable_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("graph.db");
+        let target = "method/common/УчетЗарплаты/ДанныеФизическихЛиц";
+        let caller = "method/common/Потребитель/Прочитать";
+        let mut writer = GraphDbWriter::create(&path).unwrap();
+        let nodes =
+            [(target, "УчетЗарплаты", "ДанныеФизическихЛиц"), (caller, "Потребитель", "Прочитать")]
+                .map(|(id, module, name)| ide::graph_index::NodeRow {
+                    id: id.to_owned(),
+                    kind: "method",
+                    name: name.to_owned(),
+                    qualified: format!("{module}.{name}"),
+                    module: Some(module.to_owned()),
+                    file: None,
+                    name_offset: None,
+                    sig_end: None,
+                    src_start: None,
+                    src_end: None,
+                    dispatch: Vec::new(),
+                    is_export: Some(true),
+                    addressable: true,
+                });
+        writer.write_nodes(&nodes).unwrap();
+        writer
+            .write_edges(&[ide::graph_index::EdgeRow {
+                from_id: caller.to_owned(),
+                to_id: target.to_owned(),
+                kind: "call",
+                provenance: "resolved",
+                call_start: None,
+                call_end: None,
+                call_site_absent: Some("source_unavailable"),
+                crosses: true,
+            }])
+            .unwrap();
+        writer
+            .finalize(&GraphMeta {
+                revision: 7,
+                fingerprint: crate::graph_db::GraphFp::default(),
+                files: 0,
+                built_at: "test".to_owned(),
+                publication_id: "qualified-symbol-roundtrip".to_owned(),
+            })
+            .unwrap();
+        let graph = GraphDb::open(&path).unwrap();
+        for query in ["ДанныеФизическихЛиц", "УчетЗарплаты.ДанныеФизическихЛиц", target]
+        {
+            let resolved = graph.resolve(query, 10).unwrap();
+            assert_eq!(resolved.total, 1, "{query}");
+            let id = &resolved.candidates[0].id;
+            assert_eq!(id, target);
+            let usages = graph.usages(id, 5).unwrap().unwrap();
+            assert_eq!(usages.count, 1);
+            assert!(usages.top_modules.contains(&("Потребитель".to_owned(), 1)));
+            assert!(!usages.top_modules_sampled);
+        }
+    }
+
+    #[test]
     fn resolve_recovers_wrong_cased_module_id_from_member_methods() {
         // Module nodes are synthesized on demand and not stored; only the methods are. A
         // wrong-cased `module/...` query must still resolve via the owning-module id derived

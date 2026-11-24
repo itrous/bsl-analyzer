@@ -1,3 +1,4 @@
+pub mod catch_outcome;
 pub mod definite_init;
 pub mod effect_summary;
 pub mod guard_predicates;

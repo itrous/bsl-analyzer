@@ -31,6 +31,18 @@ pub(super) fn lexical_code_hits(
     query: &str,
     limit: usize,
 ) -> Result<CodeHits, SearchFailure> {
+    let Ok(_disk_read) = engine.disk_gate.try_read() else {
+        if engine.disk_gate.recovery_required() {
+            return Err(McpError::internal_error(
+                crate::diagnostics_state::DISK_RECOVERY_REQUIRED,
+                Some(serde_json::json!({"recovery_required": true, "retry": false})),
+            )
+            .into());
+        }
+        return Ok(CodeHits::Pending(
+            "Workspace filesystem transaction is in progress; retry shortly.".to_owned(),
+        ));
+    };
     ensure_workspace_search_allowed(configured_baseline)?;
     ensure_workspace_baseline_runtime_ready(
         workspace_search_mode.clone(),
