@@ -23,6 +23,16 @@ pub fn load_from_directory_scoped(
     path: impl AsRef<Path>,
     excluded: &ExcludedPaths,
 ) -> Result<Configuration> {
+    load_from_directory_scoped_with_origins(path, excluded, &|_| String::new())
+}
+
+/// Read one root and attach caller-attested origins to properties before composing overlays.
+/// The callback receives the actual main XML path and runs concurrently across files.
+pub fn load_from_directory_scoped_with_origins(
+    path: impl AsRef<Path>,
+    excluded: &ExcludedPaths,
+    source_origin: &(dyn Fn(&Path) -> String + Sync),
+) -> Result<Configuration> {
     let path = path.as_ref();
     let scope = ScopedFs::new(excluded);
     let _span = tracing::info_span!("load_from_directory", ?path).entered();
@@ -39,11 +49,35 @@ pub fn load_from_directory_scoped(
         );
     }
 
-    let loaded = off_exclusive_pool(|| load_all_metadata_parallel(path, &scope));
+    let loaded = off_exclusive_pool(|| load_all_metadata_parallel(path, &scope, source_origin));
     let mut config = build_configuration(loaded);
+    if let Some(header) = bsl_conventions::find_stored_child_ci_in(
+        &scope,
+        path,
+        bsl_conventions::ConventionalName::ConfigurationXml.canonical(),
+    )
+    .and_then(|file| fs::read_to_string(file).ok())
+    .and_then(|xml| Configuration::from_xml_str(&xml).ok())
+    {
+        config.apply_source_header(&header);
+    }
+    for object in discover_read_object_structure(path, &scope) {
+        if let Some(value) = fs::read_to_string(object.main)
+            .ok()
+            .and_then(|xml| crate::read_object::ReadObject::from_xml(&xml, object.kind).ok())
+        {
+            config.add_read_object(value);
+        }
+    }
     // An export root holds no collection at all; its one object is the whole
     // configuration this root contributes to a visibility chain.
-    if let Some(external) = crate::external_object::load_external_object_in(path, &scope) {
+    if let Some(mut external) = crate::external_object::load_external_object_in(path, &scope) {
+        if let Some(main) = crate::external_object::external_object_xml(path, &scope) {
+            let origin = source_origin(&main);
+            if !origin.is_empty() {
+                external.read_properties.set_source_origin(&origin);
+            }
+        }
         config.add_metadata_object(external);
     }
 
@@ -142,7 +176,11 @@ struct LoadedMetadata {
     common_attributes: crate::common_attribute::CommonAttributeSet,
 }
 
-fn load_all_metadata_parallel(path: &Path, scope: &ScopedFs<'_>) -> LoadedMetadata {
+fn load_all_metadata_parallel(
+    path: &Path,
+    scope: &ScopedFs<'_>,
+    source_origin: &(dyn Fn(&Path) -> String + Sync),
+) -> LoadedMetadata {
     let start = std::time::Instant::now();
     let common_modules = Mutex::new(Vec::new());
     let catalogs = Mutex::new(Vec::new());
@@ -178,35 +216,45 @@ fn load_all_metadata_parallel(path: &Path, scope: &ScopedFs<'_>) -> LoadedMetada
                 load_common_modules_parallel(scope, &collection_dir(scope, path, "CommonModules"))
         });
         s.spawn(|_| {
-            *catalogs.lock().unwrap() =
-                load_catalogs_parallel(scope, &collection_dir(scope, path, "Catalogs"))
+            *catalogs.lock().unwrap() = load_catalogs_parallel(
+                scope,
+                &collection_dir(scope, path, "Catalogs"),
+                source_origin,
+            )
         });
         s.spawn(|_| {
-            *documents.lock().unwrap() =
-                load_documents_parallel(scope, &collection_dir(scope, path, "Documents"))
+            *documents.lock().unwrap() = load_documents_parallel(
+                scope,
+                &collection_dir(scope, path, "Documents"),
+                source_origin,
+            )
         });
         s.spawn(|_| {
             *info_registers.lock().unwrap() = load_information_registers_parallel(
                 scope,
                 &collection_dir(scope, path, "InformationRegisters"),
+                source_origin,
             )
         });
         s.spawn(|_| {
             *accum_registers.lock().unwrap() = load_accumulation_registers_parallel(
                 scope,
                 &collection_dir(scope, path, "AccumulationRegisters"),
+                source_origin,
             )
         });
         s.spawn(|_| {
             *account_registers.lock().unwrap() = load_accounting_registers_parallel(
                 scope,
                 &collection_dir(scope, path, "AccountingRegisters"),
+                source_origin,
             )
         });
         s.spawn(|_| {
             *calc_registers.lock().unwrap() = load_calculation_registers_parallel(
                 scope,
                 &collection_dir(scope, path, "CalculationRegisters"),
+                source_origin,
             )
         });
         s.spawn(|_| {
@@ -231,40 +279,50 @@ fn load_all_metadata_parallel(path: &Path, scope: &ScopedFs<'_>) -> LoadedMetada
             *charts_char_types.lock().unwrap() = load_charts_of_characteristic_types_parallel(
                 scope,
                 &collection_dir(scope, path, "ChartsOfCharacteristicTypes"),
+                source_origin,
             )
         });
         s.spawn(|_| {
-            *constants.lock().unwrap() =
-                load_constants_parallel(scope, &collection_dir(scope, path, "Constants"))
+            *constants.lock().unwrap() = load_constants_parallel(
+                scope,
+                &collection_dir(scope, path, "Constants"),
+                source_origin,
+            )
         });
         s.spawn(|_| {
-            *exchange_plans.lock().unwrap() =
-                load_exchange_plans_parallel(scope, &collection_dir(scope, path, "ExchangePlans"))
+            *exchange_plans.lock().unwrap() = load_exchange_plans_parallel(
+                scope,
+                &collection_dir(scope, path, "ExchangePlans"),
+                source_origin,
+            )
         });
         s.spawn(|_| {
             *business_processes.lock().unwrap() = load_business_processes_parallel(
                 scope,
                 &collection_dir(scope, path, "BusinessProcesses"),
+                source_origin,
             )
         });
         s.spawn(|_| {
             *enums.lock().unwrap() =
-                load_enums_parallel(scope, &collection_dir(scope, path, "Enums"))
+                load_enums_parallel(scope, &collection_dir(scope, path, "Enums"), source_origin)
         });
         s.spawn(|_| {
             *tasks.lock().unwrap() =
-                load_tasks_parallel(scope, &collection_dir(scope, path, "Tasks"))
+                load_tasks_parallel(scope, &collection_dir(scope, path, "Tasks"), source_origin)
         });
         s.spawn(|_| {
             *charts_accounts.lock().unwrap() = load_charts_of_accounts_parallel(
                 scope,
                 &collection_dir(scope, path, "ChartsOfAccounts"),
+                source_origin,
             )
         });
         s.spawn(|_| {
             *charts_calc_types.lock().unwrap() = load_charts_of_calculation_types_parallel(
                 scope,
                 &collection_dir(scope, path, "ChartsOfCalculationTypes"),
+                source_origin,
             )
         });
         s.spawn(|_| {
@@ -289,12 +347,15 @@ fn load_all_metadata_parallel(path: &Path, scope: &ScopedFs<'_>) -> LoadedMetada
             )
         });
         s.spawn(|_| {
-            *data_processors.lock().unwrap() =
-                load_data_processors_parallel(scope, &collection_dir(scope, path, "DataProcessors"))
+            *data_processors.lock().unwrap() = load_data_processors_parallel(
+                scope,
+                &collection_dir(scope, path, "DataProcessors"),
+                source_origin,
+            )
         });
         s.spawn(|_| {
             *reports.lock().unwrap() =
-                load_reports_parallel(scope, &collection_dir(scope, path, "Reports"))
+                load_reports_parallel(scope, &collection_dir(scope, path, "Reports"), source_origin)
         });
         s.spawn(|_| {
             *subsystems.lock().unwrap() =
@@ -462,12 +523,13 @@ fn load_common_attributes(
 /// `child_subsystems`, not inferred from the directory layout.
 fn load_subsystems(scope: &ScopedFs<'_>, dir: &Path) -> Vec<crate::subsystem::Subsystem> {
     let mut out = Vec::new();
-    collect_subsystems(scope, dir, &mut out);
+    collect_subsystems(scope, dir.parent().unwrap_or(dir), dir, &mut out);
     out
 }
 
 fn collect_subsystems(
     scope: &ScopedFs<'_>,
+    root: &Path,
     dir: &Path,
     out: &mut Vec<crate::subsystem::Subsystem>,
 ) {
@@ -482,13 +544,14 @@ fn collect_subsystems(
         let path = entry.path();
         if path.is_file() && bsl_conventions::has_extension(&path, bsl_conventions::XML_EXTENSION) {
             if let Ok(xml) = fs::read_to_string(&path) {
-                if let Ok(subsystem) = xml_parser::parse_subsystem_xml(&xml) {
+                if let Ok(mut subsystem) = xml_parser::parse_subsystem_xml(&xml) {
+                    subsystem.set_source_identity(root, &path);
                     out.push(subsystem);
                 }
             }
         } else if path.is_dir() {
             // Nested subsystems live under `<Name>/Subsystems/`.
-            collect_subsystems(scope, &collection_dir(scope, &path, "Subsystems"), out);
+            collect_subsystems(scope, root, &collection_dir(scope, &path, "Subsystems"), out);
         }
     }
 }
@@ -546,56 +609,111 @@ fn load_common_modules_parallel(
         .collect()
 }
 
-fn load_catalogs_parallel(scope: &ScopedFs<'_>, dir: &Path) -> Vec<MetadataObject> {
-    load_metadata_objects_parallel(scope, dir, xml_parser::parse_catalog_xml)
+fn load_catalogs_parallel(
+    scope: &ScopedFs<'_>,
+    dir: &Path,
+    source_origin: &(dyn Fn(&Path) -> String + Sync),
+) -> Vec<MetadataObject> {
+    load_metadata_objects_parallel(scope, dir, xml_parser::parse_catalog_xml, source_origin)
 }
 
-fn load_documents_parallel(scope: &ScopedFs<'_>, dir: &Path) -> Vec<MetadataObject> {
-    load_metadata_objects_parallel(scope, dir, xml_parser::parse_document_xml)
+fn load_documents_parallel(
+    scope: &ScopedFs<'_>,
+    dir: &Path,
+    source_origin: &(dyn Fn(&Path) -> String + Sync),
+) -> Vec<MetadataObject> {
+    load_metadata_objects_parallel(scope, dir, xml_parser::parse_document_xml, source_origin)
 }
 
-fn load_business_processes_parallel(scope: &ScopedFs<'_>, dir: &Path) -> Vec<MetadataObject> {
-    load_metadata_objects_parallel(scope, dir, xml_parser::parse_business_process_xml)
+fn load_business_processes_parallel(
+    scope: &ScopedFs<'_>,
+    dir: &Path,
+    source_origin: &(dyn Fn(&Path) -> String + Sync),
+) -> Vec<MetadataObject> {
+    load_metadata_objects_parallel(
+        scope,
+        dir,
+        xml_parser::parse_business_process_xml,
+        source_origin,
+    )
 }
 
-fn load_tasks_parallel(scope: &ScopedFs<'_>, dir: &Path) -> Vec<MetadataObject> {
-    load_metadata_objects_parallel(scope, dir, xml_parser::parse_task_xml)
+fn load_tasks_parallel(
+    scope: &ScopedFs<'_>,
+    dir: &Path,
+    source_origin: &(dyn Fn(&Path) -> String + Sync),
+) -> Vec<MetadataObject> {
+    load_metadata_objects_parallel(scope, dir, xml_parser::parse_task_xml, source_origin)
 }
 
-fn load_exchange_plans_parallel(scope: &ScopedFs<'_>, dir: &Path) -> Vec<MetadataObject> {
-    load_metadata_objects_parallel(scope, dir, xml_parser::parse_exchange_plan_xml)
+fn load_exchange_plans_parallel(
+    scope: &ScopedFs<'_>,
+    dir: &Path,
+    source_origin: &(dyn Fn(&Path) -> String + Sync),
+) -> Vec<MetadataObject> {
+    load_metadata_objects_parallel(scope, dir, xml_parser::parse_exchange_plan_xml, source_origin)
 }
 
 fn load_charts_of_characteristic_types_parallel(
     scope: &ScopedFs<'_>,
     dir: &Path,
+    source_origin: &(dyn Fn(&Path) -> String + Sync),
 ) -> Vec<MetadataObject> {
-    load_metadata_objects_parallel(scope, dir, xml_parser::parse_chart_of_characteristic_types_xml)
+    load_metadata_objects_parallel(
+        scope,
+        dir,
+        xml_parser::parse_chart_of_characteristic_types_xml,
+        source_origin,
+    )
 }
 
-fn load_charts_of_accounts_parallel(scope: &ScopedFs<'_>, dir: &Path) -> Vec<MetadataObject> {
-    load_metadata_objects_parallel(scope, dir, xml_parser::parse_chart_of_accounts_xml)
+fn load_charts_of_accounts_parallel(
+    scope: &ScopedFs<'_>,
+    dir: &Path,
+    source_origin: &(dyn Fn(&Path) -> String + Sync),
+) -> Vec<MetadataObject> {
+    load_metadata_objects_parallel(
+        scope,
+        dir,
+        xml_parser::parse_chart_of_accounts_xml,
+        source_origin,
+    )
 }
 
 fn load_charts_of_calculation_types_parallel(
     scope: &ScopedFs<'_>,
     dir: &Path,
+    source_origin: &(dyn Fn(&Path) -> String + Sync),
 ) -> Vec<MetadataObject> {
-    load_metadata_objects_parallel(scope, dir, xml_parser::parse_chart_of_calculation_types_xml)
+    load_metadata_objects_parallel(
+        scope,
+        dir,
+        xml_parser::parse_chart_of_calculation_types_xml,
+        source_origin,
+    )
 }
 
-fn load_data_processors_parallel(scope: &ScopedFs<'_>, dir: &Path) -> Vec<MetadataObject> {
-    load_metadata_objects_parallel(scope, dir, xml_parser::parse_data_processor_xml)
+fn load_data_processors_parallel(
+    scope: &ScopedFs<'_>,
+    dir: &Path,
+    source_origin: &(dyn Fn(&Path) -> String + Sync),
+) -> Vec<MetadataObject> {
+    load_metadata_objects_parallel(scope, dir, xml_parser::parse_data_processor_xml, source_origin)
 }
 
-fn load_reports_parallel(scope: &ScopedFs<'_>, dir: &Path) -> Vec<MetadataObject> {
-    load_metadata_objects_parallel(scope, dir, xml_parser::parse_report_xml)
+fn load_reports_parallel(
+    scope: &ScopedFs<'_>,
+    dir: &Path,
+    source_origin: &(dyn Fn(&Path) -> String + Sync),
+) -> Vec<MetadataObject> {
+    load_metadata_objects_parallel(scope, dir, xml_parser::parse_report_xml, source_origin)
 }
 
 fn load_metadata_objects_parallel<F>(
     scope: &ScopedFs<'_>,
     dir: &Path,
     parser: F,
+    source_origin: &(dyn Fn(&Path) -> String + Sync),
 ) -> Vec<MetadataObject>
 where
     F: Fn(&str) -> Result<MetadataObject> + Sync,
@@ -641,7 +759,27 @@ where
                     })
                         });
 
-                build_metadata_object(&main_xml, predefined_xml.as_deref(), &parser)
+                let mut object =
+                    build_metadata_object(&main_xml, predefined_xml.as_deref(), &parser)?;
+                let origin = source_origin(&xml_path);
+                if !origin.is_empty() {
+                    object.read_properties.set_source_origin(&origin);
+                }
+                if object.mdo_type == MdoType::ExchangePlan {
+                    let content = bsl_conventions::resolve_stored_chain_ci_in(
+                        scope,
+                        &path,
+                        &[
+                            bsl_conventions::ConventionalName::Ext.canonical(),
+                            bsl_conventions::ConventionalName::ContentXml.canonical(),
+                        ],
+                    )
+                    .and_then(|file| fs::read_to_string(file).ok())
+                    .and_then(|xml| crate::source_content::parse_exchange_plan_content(&xml));
+                    object.read_properties.exchange_plan_content_complete = content.is_some();
+                    object.read_properties.exchange_plan_content = content;
+                }
+                Some(object)
             } else if bsl_conventions::has_extension(&path, bsl_conventions::XML_EXTENSION) {
                 let file_stem = path.file_stem()?.to_str()?;
 
@@ -650,7 +788,12 @@ where
                 }
 
                 let xml = fs::read_to_string(&path).ok()?;
-                build_metadata_object(&xml, None, &parser)
+                let mut object = build_metadata_object(&xml, None, &parser)?;
+                let origin = source_origin(&path);
+                if !origin.is_empty() {
+                    object.read_properties.set_source_origin(&origin);
+                }
+                Some(object)
             } else {
                 None
             }
@@ -673,6 +816,10 @@ where
     let mut mdo = parser(main_xml).ok()?;
 
     if let Some(predefined_xml) = predefined_xml {
+        if mdo.mdo_type == MdoType::ChartOfAccounts {
+            mdo.read_properties.predefined_accounts =
+                crate::source_content::parse_predefined_accounts(predefined_xml);
+        }
         match xml_parser::parse_predefined_xml(predefined_xml) {
             Some(items) => {
                 mdo.predefined_items = items;
@@ -1003,6 +1150,108 @@ pub fn discover_scheduled_job_structure(
     out
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredReadObject {
+    pub kind: crate::read_object::ReadObjectKind,
+    pub name: String,
+    pub main: PathBuf,
+}
+
+pub fn discover_read_object_structure(
+    root: &Path,
+    tree: &dyn DirTree,
+) -> Vec<DiscoveredReadObject> {
+    let mut objects = Vec::new();
+    for kind in crate::read_object::ReadObjectKind::ALL {
+        objects.extend(
+            loose_xml_children(tree, &collection_dir(tree, root, kind.collection()))
+                .into_iter()
+                .map(|(name, main)| DiscoveredReadObject { kind, name, main }),
+        );
+    }
+    objects.sort_by(|a, b| a.main.cmp(&b.main));
+    objects
+}
+
+/// Additional read-only metadata inputs stored in the same versioned source root.
+pub fn discover_read_metadata_files(root: &Path, tree: &dyn DirTree) -> Vec<PathBuf> {
+    let mut files: Vec<_> =
+        discover_read_object_structure(root, tree).into_iter().map(|value| value.main).collect();
+    let directory = collection_dir(tree, root, "ExchangePlans");
+    for (name, _) in loose_xml_children(tree, &directory) {
+        if let Some(file) = bsl_conventions::resolve_stored_chain_ci_in(
+            tree,
+            &directory.join(name),
+            &[
+                bsl_conventions::ConventionalName::Ext.canonical(),
+                bsl_conventions::ConventionalName::ContentXml.canonical(),
+            ],
+        ) {
+            files.push(file);
+        }
+    }
+    files.extend(crate::inspection_sources::discover(root, tree));
+    let mut command_owners = vec![root.to_path_buf()];
+    command_owners.extend(
+        discover_subsystem_structure(root, tree)
+            .into_iter()
+            .map(|subsystem| subsystem.main.with_extension("")),
+    );
+    for owner in command_owners {
+        if let Some(file) = bsl_conventions::resolve_stored_chain_ci_in(
+            tree,
+            &owner,
+            &[
+                bsl_conventions::ConventionalName::Ext.canonical(),
+                bsl_conventions::ConventionalName::CommandInterfaceXml.canonical(),
+            ],
+        ) {
+            files.push(file);
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
+pub fn is_read_metadata_file(root: &Path, path: &Path) -> bool {
+    if crate::inspection_sources::is_input(root, path) {
+        return true;
+    }
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let parts: Vec<_> = relative.iter().filter_map(|part| part.to_str()).collect();
+    if let [owners @ .., ext, file] = parts.as_slice() {
+        if ext.eq_ignore_ascii_case(bsl_conventions::ConventionalName::Ext.canonical())
+            && file.eq_ignore_ascii_case(
+                bsl_conventions::ConventionalName::CommandInterfaceXml.canonical(),
+            )
+            && owners.len() % 2 == 0
+            && owners
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|pair| pair[0].eq_ignore_ascii_case("Subsystems"))
+        {
+            return true;
+        }
+    }
+    match parts.as_slice() {
+        [collection, file] => {
+            crate::read_object::ReadObjectKind::parse(collection).is_some()
+                && bsl_conventions::has_extension(Path::new(file), bsl_conventions::XML_EXTENSION)
+        }
+        [collection, _, ext, file] => {
+            collection.eq_ignore_ascii_case("ExchangePlans")
+                && ext.eq_ignore_ascii_case(bsl_conventions::ConventionalName::Ext.canonical())
+                && file
+                    .eq_ignore_ascii_case(bsl_conventions::ConventionalName::ContentXml.canonical())
+        }
+        _ => false,
+    }
+}
+
 pub fn discover_subsystem_structure(root: &Path, tree: &dyn DirTree) -> Vec<DiscoveredSubsystem> {
     let mut out = Vec::new();
     collect_subsystem_structure(tree, &collection_dir(tree, root, "Subsystems"), &mut out);
@@ -1284,7 +1533,11 @@ pub fn discover_role_structure(root: &Path, tree: &dyn DirTree) -> Vec<Discovere
     out
 }
 
-fn load_enums_parallel(scope: &ScopedFs<'_>, dir: &Path) -> Vec<MetadataObject> {
+fn load_enums_parallel(
+    scope: &ScopedFs<'_>,
+    dir: &Path,
+    source_origin: &(dyn Fn(&Path) -> String + Sync),
+) -> Vec<MetadataObject> {
     if !dir.exists() {
         return Vec::new();
     }
@@ -1305,12 +1558,21 @@ fn load_enums_parallel(scope: &ScopedFs<'_>, dir: &Path) -> Vec<MetadataObject> 
             }
 
             let xml = fs::read_to_string(&path).ok()?;
-            xml_parser::parse_enum_xml(&xml).ok()
+            let mut object = xml_parser::parse_enum_xml(&xml).ok()?;
+            let origin = source_origin(&path);
+            if !origin.is_empty() {
+                object.read_properties.set_source_origin(&origin);
+            }
+            Some(object)
         })
         .collect()
 }
 
-fn load_constants_parallel(scope: &ScopedFs<'_>, dir: &Path) -> Vec<MetadataObject> {
+fn load_constants_parallel(
+    scope: &ScopedFs<'_>,
+    dir: &Path,
+    source_origin: &(dyn Fn(&Path) -> String + Sync),
+) -> Vec<MetadataObject> {
     if !dir.exists() {
         return Vec::new();
     }
@@ -1331,7 +1593,12 @@ fn load_constants_parallel(scope: &ScopedFs<'_>, dir: &Path) -> Vec<MetadataObje
             }
 
             let xml = fs::read_to_string(&path).ok()?;
-            xml_parser::parse_constant_xml(&xml).ok()
+            let mut object = xml_parser::parse_constant_xml(&xml).ok()?;
+            let origin = source_origin(&path);
+            if !origin.is_empty() {
+                object.read_properties.set_source_origin(&origin);
+            }
+            Some(object)
         })
         .collect()
 }
@@ -1340,6 +1607,7 @@ fn load_registers_parallel<F>(
     scope: &ScopedFs<'_>,
     dir: &Path,
     parser: F,
+    source_origin: &(dyn Fn(&Path) -> String + Sync),
 ) -> Vec<crate::register::Register>
 where
     F: Fn(&str) -> Result<crate::register::Register> + Sync,
@@ -1364,7 +1632,14 @@ where
             }
 
             let xml = fs::read_to_string(&path).ok()?;
-            parser(&xml).ok()
+            let mut register = parser(&xml).ok()?;
+            let origin = source_origin(&path);
+            if !origin.is_empty() {
+                let mut properties = register.read_properties().clone();
+                properties.set_source_origin(&origin);
+                register.set_read_properties(properties);
+            }
+            Some(register)
         })
         .collect()
 }
@@ -1372,29 +1647,33 @@ where
 fn load_information_registers_parallel(
     scope: &ScopedFs<'_>,
     dir: &Path,
+    source_origin: &(dyn Fn(&Path) -> String + Sync),
 ) -> Vec<crate::register::Register> {
-    load_registers_parallel(scope, dir, xml_parser::parse_information_register_xml)
+    load_registers_parallel(scope, dir, xml_parser::parse_information_register_xml, source_origin)
 }
 
 fn load_accumulation_registers_parallel(
     scope: &ScopedFs<'_>,
     dir: &Path,
+    source_origin: &(dyn Fn(&Path) -> String + Sync),
 ) -> Vec<crate::register::Register> {
-    load_registers_parallel(scope, dir, xml_parser::parse_accumulation_register_xml)
+    load_registers_parallel(scope, dir, xml_parser::parse_accumulation_register_xml, source_origin)
 }
 
 fn load_accounting_registers_parallel(
     scope: &ScopedFs<'_>,
     dir: &Path,
+    source_origin: &(dyn Fn(&Path) -> String + Sync),
 ) -> Vec<crate::register::Register> {
-    load_registers_parallel(scope, dir, xml_parser::parse_accounting_register_xml)
+    load_registers_parallel(scope, dir, xml_parser::parse_accounting_register_xml, source_origin)
 }
 
 fn load_calculation_registers_parallel(
     scope: &ScopedFs<'_>,
     dir: &Path,
+    source_origin: &(dyn Fn(&Path) -> String + Sync),
 ) -> Vec<crate::register::Register> {
-    load_registers_parallel(scope, dir, xml_parser::parse_calculation_register_xml)
+    load_registers_parallel(scope, dir, xml_parser::parse_calculation_register_xml, source_origin)
 }
 
 fn load_event_subscriptions_parallel(
@@ -1701,9 +1980,12 @@ mod tests {
     /// resolve it when the crate is COMPILED, and `HOME` does not exist on Windows - which
     /// stopped this crate from compiling its tests there at all. The tests using this are
     /// `#[ignore]`d and skip themselves when the directory is absent, so a home variable that
-    /// is not set is not an error either: it only means "not this machine".
+    /// is unset or empty is not an error either: it only means "not this machine".
     fn home_checkout(relative: &str) -> Option<std::path::PathBuf> {
-        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+        let home = ["HOME", "USERPROFILE"]
+            .into_iter()
+            .filter_map(std::env::var_os)
+            .find(|home| !home.is_empty())?;
         Some(std::path::PathBuf::from(home).join(relative))
     }
 
@@ -1731,6 +2013,51 @@ mod tests {
     /// The hop must not change what is loaded. Compared against the same
     /// directory read without the guard rather than against a fixed count, so
     /// the check keeps its meaning as the fixture grows.
+    #[test]
+    fn source_nested_subsystem_address_retains_its_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let children = directory.path().join("Subsystems/Operations/Subsystems");
+        std::fs::create_dir_all(&children).unwrap();
+        std::fs::write(directory.path().join("Subsystems/Operations.xml"),"<MetaDataObject><Subsystem><Properties><Name>Operations</Name><Content/></Properties></Subsystem></MetaDataObject>").unwrap();
+        std::fs::write(children.join("Rules.xml"),"<MetaDataObject><Subsystem><Properties><Name>Rules</Name><Content/></Properties></Subsystem></MetaDataObject>").unwrap();
+        let config = load_from_directory(directory.path()).unwrap();
+        let subsystem =
+            config.subsystems().iter().find(|subsystem| subsystem.name() == "Rules").unwrap();
+        let value = serde_json::to_value(subsystem).unwrap();
+        assert_eq!(value["qualified_name"], "Operations.Subsystem.Rules");
+        assert_eq!(value["parent"], "Operations");
+    }
+
+    #[test]
+    fn command_interfaces_are_prepared_at_root_and_nested_subsystems() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let inputs = [
+            "Ext/CommandInterface.xml",
+            "Subsystems/Operations/Ext/CommandInterface.xml",
+            "Subsystems/Operations/Subsystems/Rules/Ext/CommandInterface.xml",
+        ];
+        for input in inputs {
+            let path = root.join(input);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "<CommandInterface/>").unwrap();
+        }
+        for descriptor in
+            ["Subsystems/Operations.xml", "Subsystems/Operations/Subsystems/Rules.xml"]
+        {
+            std::fs::write(root.join(descriptor), "<MetaDataObject/>").unwrap();
+        }
+        let discovered = discover_read_metadata_files(root, &bsl_conventions::RealFs);
+        for input in inputs {
+            assert!(discovered.contains(&root.join(input)), "{input}: {discovered:?}");
+            assert!(is_read_metadata_file(root, &root.join(input)));
+        }
+        assert!(!is_read_metadata_file(
+            root,
+            &root.join("Catalogs/Partners/Ext/CommandInterface.xml")
+        ));
+    }
+
     #[test]
     fn the_guarded_load_yields_the_same_configuration() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/designer");
@@ -3250,7 +3577,7 @@ mod tests {
             return;
         }
 
-        let config = load_from_directory(doc3_path).expect("Failed to load doc3 configuration");
+        let config = load_from_directory(&doc3_path).expect("Failed to load doc3 configuration");
 
         let enums: Vec<_> = config
             .metadata_objects()
@@ -3385,7 +3712,7 @@ mod tests {
             return;
         }
 
-        let config = load_from_directory(doc3_path).expect("Failed to load doc3 configuration");
+        let config = load_from_directory(&doc3_path).expect("Failed to load doc3 configuration");
 
         println!("Total registers loaded: {}", config.registers().len());
 
@@ -3443,7 +3770,9 @@ mod tests {
 
             assert!(register.is_information_register(), "Should be InformationRegister");
         } else {
-            panic!("❌ Register 'ЗначенияДействийПриОбработкеПисем' not found in loaded configuration!");
+            panic!(
+                "❌ Register 'ЗначенияДействийПриОбработкеПисем' not found in loaded configuration!"
+            );
         }
     }
 

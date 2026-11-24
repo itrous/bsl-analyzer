@@ -17,6 +17,12 @@ pub struct ScheduledJob {
 
     #[serde(rename = "use", default)]
     pub(crate) use_flag: bool,
+
+    #[serde(default)]
+    pub(crate) enabled: Option<bool>,
+
+    #[serde(default)]
+    pub(crate) schedule: Option<crate::read_properties::MetadataValue>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,6 +47,8 @@ impl ScheduledJob {
             method_name: method_name.into(),
             predefined: false,
             use_flag: true,
+            enabled: Some(true),
+            schedule: None,
         }
     }
 
@@ -52,6 +60,8 @@ impl ScheduledJob {
             method_name: method_name.into(),
             predefined: true,
             use_flag: true,
+            enabled: Some(true),
+            schedule: None,
         }
     }
 
@@ -69,6 +79,14 @@ impl ScheduledJob {
 
     pub fn is_enabled(&self) -> bool {
         self.use_flag
+    }
+
+    pub fn enabled(&self) -> Option<bool> {
+        self.enabled
+    }
+
+    pub fn schedule(&self) -> Option<&crate::read_properties::MetadataValue> {
+        self.schedule.as_ref()
     }
 
     pub fn parse_handler(&self) -> Option<ScheduledJobHandler> {
@@ -92,7 +110,12 @@ impl ScheduledJob {
     /// `parse_scheduled_job_query` for Salsa's `heap_size` hook: its name plus
     /// its method-name string. New heap-owning fields must be added here too.
     pub fn estimated_heap_size(&self) -> usize {
-        self.name.capacity() + self.method_name.capacity()
+        self.name.capacity()
+            + self.method_name.capacity()
+            + self
+                .schedule
+                .as_ref()
+                .map_or(0, crate::read_properties::MetadataValue::estimated_heap_size)
     }
 }
 

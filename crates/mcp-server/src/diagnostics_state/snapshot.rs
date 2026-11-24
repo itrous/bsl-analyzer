@@ -121,6 +121,7 @@ impl DiagnosticsState {
         &self,
         path: &Path,
     ) -> Option<(Arc<str>, syntax::Parse<syntax::SyntaxNode>)> {
+        let _disk_read = self.disk_gate.try_read().ok()?;
         match self.try_snapshot_once(path) {
             SnapshotAttempt::Fetched(pair) => Some(pair),
             SnapshotAttempt::Unavailable => None,
@@ -165,6 +166,7 @@ impl DiagnosticsState {
     /// it is never nested under the search engine lock); a full rebuild in flight is skipped by
     /// the drain path, so this never blocks a query on a rebuild.
     pub(crate) fn poll_pending_drift(&self) {
+        let Ok(_disk_read) = self.disk_gate.try_read() else { return };
         self.poll_drift();
     }
 }

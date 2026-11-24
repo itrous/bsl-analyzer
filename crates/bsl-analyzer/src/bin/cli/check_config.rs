@@ -773,13 +773,20 @@ backend = "postgres"
             ..Default::default()
         };
         project_config.externals = Some(vec![
-            project_model::ExternalDecl { name: "A".into(), path: "a".into(), depends_on: None },
             project_model::ExternalDecl {
+                configuration_root: None,
+                name: "A".into(),
+                path: "a".into(),
+                depends_on: None,
+            },
+            project_model::ExternalDecl {
+                configuration_root: None,
                 name: "B".into(),
                 path: "b".into(),
                 depends_on: Some(vec!["X".into(), "Y".into()]),
             },
             project_model::ExternalDecl {
+                configuration_root: None,
                 name: "C".into(),
                 path: "c".into(),
                 depends_on: Some(vec![]),

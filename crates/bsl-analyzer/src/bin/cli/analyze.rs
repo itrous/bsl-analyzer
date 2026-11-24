@@ -8,6 +8,14 @@ use std::{
 use clap::ValueEnum;
 use ide_db::metadata;
 
+struct BatchVfs(std::cell::RefCell<vfs::Vfs>);
+
+impl ide_host_core::VfsWrite for BatchVfs {
+    fn with_write<R>(&self, f: impl FnOnce(&mut vfs::Vfs) -> R) -> R {
+        f(&mut self.0.borrow_mut())
+    }
+}
+
 #[derive(Debug, Clone, Default, ValueEnum)]
 pub enum OutputFormat {
     #[default]
@@ -563,9 +571,10 @@ fn analyze_salsa(
 
     tracing::info!("Loading files into database");
     let mut all_file_ids: Vec<(FileId, PathBuf)> = Vec::new();
+    let vfs = BatchVfs(std::cell::RefCell::new(vfs::Vfs::default()));
 
-    for (idx, path) in bsl_files.iter().enumerate() {
-        let file_id = FileId(idx as u32);
+    for path in &bsl_files {
+        let file_id = vfs.0.borrow_mut().alloc_file_id(vfs::VfsPath::from(path.clone()));
         all_file_ids.push((file_id, path.clone()));
     }
 
@@ -603,6 +612,8 @@ fn analyze_salsa(
     if let Some((path, err)) = unreadable.into_iter().next() {
         return Err(format!("failed to read BSL file {}: {err}", path.display()).into());
     }
+    // Owner headers and semantic dependency bodies must use the subjects' FileId space.
+    ide_host_core::bootstrap_metadata_substrate(&mut db, &vfs);
     let file_set_arc = {
         use base_db::SourceDatabase;
 

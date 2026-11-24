@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" xmlns:d="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:v="http://v8.1c.ru/8.1/data/core">
+  <ChildItems><Table name="Rows" id="1"><DataPath>Object.Rows</DataPath>
+    <ChildItems><InputField name="Caption" id="2"><DataPath>Object.Rows.Caption</DataPath><Title>Caption</Title></InputField></ChildItems>
+  </Table><InputField name="OtherCaption" id="3"><DataPath>Other.Caption</DataPath></InputField></ChildItems>
+  <Attributes>
+    <Attribute name="Object" id="1"><Type><v:Type>d:CatalogObject.Partners</v:Type></Type><MainAttribute>true</MainAttribute></Attribute>
+    <Attribute name="Other" id="2"><Type><v:Type>d:CatalogRef.Customers</v:Type></Type></Attribute>
+  </Attributes>
+</Form>

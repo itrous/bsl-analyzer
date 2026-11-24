@@ -256,6 +256,26 @@
 					</Method>
 				</ChildObjects>
 			</URLTemplate>
+			<URLTemplate uuid="13bc4a34-782f-4164-9d76-67086c17aa6d">
+				<Properties>
+					<Name>ПроверкаМодуля</Name>
+					<Synonym/>
+					<Comment/>
+					<Template>/check-module</Template>
+				</Properties>
+				<ChildObjects>
+					<Method uuid="722fe868-3ac6-473d-b733-57c93026eefb">
+						<Properties>
+							<Name>POST</Name>
+							<Synonym/>
+							<Comment/>
+							<HTTPMethod>POST</HTTPMethod>
+							<Handler>ПроверитьМодульPOST</Handler>
+						</Properties>
+					</Method>
+				</ChildObjects>
+			</URLTemplate>
+
 		</ChildObjects>
 	</HTTPService>
 </MetaDataObject>

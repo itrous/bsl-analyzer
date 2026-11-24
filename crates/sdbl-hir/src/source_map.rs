@@ -5,6 +5,8 @@ use text_size::TextRange;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SdblSourceMap {
+    metadata_references: Vec<crate::metadata_reference::MetadataReference>,
+    metadata_reference_issues: Vec<crate::metadata_reference::MetadataReferenceIssue>,
     pub(crate) clause_keywords: Vec<TokenInfo>,
 
     pub(crate) operators: Vec<TokenInfo>,
@@ -37,6 +39,29 @@ pub struct SdblSourceMap {
 }
 
 impl SdblSourceMap {
+    pub fn metadata_references(&self) -> &[crate::metadata_reference::MetadataReference] {
+        &self.metadata_references
+    }
+    pub fn metadata_reference_issues(
+        &self,
+    ) -> &[crate::metadata_reference::MetadataReferenceIssue] {
+        &self.metadata_reference_issues
+    }
+    pub(crate) fn record_metadata_reference(
+        &mut self,
+        reference: crate::metadata_reference::MetadataReference,
+    ) {
+        self.metadata_references.push(reference);
+    }
+    pub(crate) fn record_metadata_columns(
+        &mut self,
+        references: Vec<crate::metadata_reference::MetadataReference>,
+        issues: Vec<crate::metadata_reference::MetadataReferenceIssue>,
+    ) {
+        self.metadata_references.extend(references);
+        self.metadata_reference_issues.extend(issues);
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -169,10 +194,33 @@ impl SdblSourceMap {
             bytes += cap * (size_of::<TextRange>() + size_of::<TokenCategory>() + 1);
         }
 
+        bytes += stdx::heap::vec_bytes::<crate::metadata_reference::MetadataReference>(
+            self.metadata_references.len(),
+        );
+        bytes +=
+            self.metadata_references
+                .iter()
+                .map(|reference| {
+                    reference.owner_name.capacity()
+                        + stdx::heap::vec_bytes::<
+                            bsl_metadata::declaration_identity::DeclarationSegment,
+                        >(reference.members.len())
+                        + reference
+                            .members
+                            .iter()
+                            .map(|member| member.kind.capacity() + member.name.capacity())
+                            .sum::<usize>()
+                })
+                .sum::<usize>();
+        bytes += stdx::heap::vec_bytes::<crate::metadata_reference::MetadataReferenceIssue>(
+            self.metadata_reference_issues.len(),
+        );
         bytes
     }
 
     pub(crate) fn finalize(&mut self) {
+        self.metadata_references.sort_by_key(|reference| reference.range.start());
+        self.metadata_reference_issues.sort_by_key(|issue| issue.range.start());
         self.clause_keywords.sort_by_key(|t| t.range.start());
         self.operators.sort_by_key(|t| t.range.start());
         self.special_keywords.sort_by_key(|t| t.range.start());

@@ -72,6 +72,11 @@ pub fn schedule_diagnostics(state: &mut GlobalState, uri: &Url) {
         return;
     }
 
+    let Ok(disk_read) = state.prepare_disk_read() else {
+        state.enqueue_pending_diagnostics(uri.clone());
+        return;
+    };
+
     if is_excluded_document(state, uri) {
         tracing::debug!(%uri, "diagnostics skipped: document is excluded by [source].exclude");
         return;
@@ -114,6 +119,7 @@ pub fn schedule_diagnostics(state: &mut GlobalState, uri: &Url) {
     };
 
     let db = state.analysis_host.raw_database().clone();
+    disk_read.register_cancel(db.cancellation_token());
     let dispatched = crate::global_state::DispatchStamp::of(&db);
     state.diagnostics_tokens.insert(uri.clone(), db.cancellation_token());
     state.parked_diagnostics.remove(uri);
@@ -171,7 +177,15 @@ pub fn schedule_diagnostics(state: &mut GlobalState, uri: &Url) {
         }));
         let compute_ms = started_at.elapsed().as_millis() as u64;
 
-        match result {
+        let cancelled = Task::DiagnosticsCancelled {
+            uri: uri.clone(),
+            version,
+            generation,
+            kind: salsa::Cancelled::Local,
+            dispatched,
+            completed_at: Instant::now(),
+        };
+        let task = match result {
             Ok(diagnostics) => {
                 tracing::info!(
                     %uri,
@@ -199,6 +213,11 @@ pub fn schedule_diagnostics(state: &mut GlobalState, uri: &Url) {
                     completed_at: Instant::now(),
                 }
             }
+        };
+        Task::DiskReadCompleted {
+            epoch: disk_read.epoch(),
+            task: Box::new(task),
+            cancelled: Box::new(cancelled),
         }
     });
     if spawned.is_err() {
@@ -226,6 +245,76 @@ pub(crate) fn refresh_after_shared_catch_up(state: &mut GlobalState) {
     state.request_workspace_diagnostic_refresh();
 }
 
+/// Replay authoritative buffers while the caller owns terminal disk state or a read ticket.
+pub(crate) fn replay_open_documents_after_disk_transaction(state: &mut GlobalState) -> Result<()> {
+    use base_db::SourceDatabase as _;
+    let previous: rustc_hash::FxHashSet<_> =
+        state.open_files.iter().chain(state.open_file_uri_ids.values()).copied().collect();
+    let mut documents = Vec::new();
+    for uri in state.opened_document_uris() {
+        if !is_handled_uri(&uri) || is_excluded_document(state, &uri) {
+            continue;
+        }
+        let Some(text) = state.mem_docs.get(&uri) else { continue };
+        let file_id = state.vfs_file_for_url(&uri)?;
+        let path = state.vfs.read().file_path(file_id).as_path().to_path_buf();
+        documents.push((uri, file_id, path, Arc::<str>::from(text.as_str())));
+    }
+    documents.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut overlay_ids = rustc_hash::FxHashSet::default();
+    let overlays: Vec<_> =
+        documents.iter().filter(|(_, id, _, _)| overlay_ids.insert(*id)).collect();
+    let current: rustc_hash::FxHashSet<_> = documents.iter().map(|(_, id, _, _)| *id).collect();
+    state.analysis_host.request_cancellation();
+    state.open_files = current.clone();
+    state.open_file_uri_ids = documents.iter().map(|(uri, id, _, _)| (uri.clone(), *id)).collect();
+    if state.analysis_host.is_shared() {
+        state.ensure_shared_view();
+        if let Some(view) = state.analysis_host.view_mut() {
+            for file_id in previous.difference(&current) {
+                view.close(*file_id);
+            }
+            for (_, id, path, text) in &overlays {
+                view.open(*id, path.clone(), text.clone());
+            }
+        }
+        let mut vfs = state.vfs.write();
+        for (_, _, path, text) in &overlays {
+            vfs.set_file_contents(vfs::VfsPath::new(path), Some(text.clone()));
+        }
+        let _ = vfs.take_changes();
+        drop(vfs);
+        state.mark_shared_buffers_changed();
+    } else {
+        {
+            let mut vfs = state.vfs.write();
+            for (_, _, path, text) in &overlays {
+                vfs.set_file_contents(vfs::VfsPath::new(path), Some(text.clone()));
+            }
+        }
+        state.process_changes(false);
+        let db = state.analysis_host.raw_database_mut();
+        for file_id in previous.difference(&current) {
+            if let Some(input) = db.try_file_revision_input(*file_id) {
+                let revision = input.revision(db);
+                db.set_file_revision_from_disk(*file_id, revision);
+            }
+        }
+        for (_, file_id, _, text) in &overlays {
+            ide_host_core::set_file_text_source(
+                db,
+                *file_id,
+                ide_host_core::FileTextSource::Overlay(text),
+            );
+        }
+    }
+    for (uri, _, _, _) in documents {
+        state.enqueue_pending_diagnostics(uri);
+    }
+    state.metadata_rename.buffers_deferred = false;
+    Ok(())
+}
+
 /// Put an editor buffer into the shared session's view as an open document, the
 /// view's text for `file_id` from then on.
 pub(crate) fn open_shared_document(
@@ -234,6 +323,11 @@ pub(crate) fn open_shared_document(
     file_id: vfs::FileId,
     text: &str,
 ) {
+    let Ok(_disk_read) = state.prepare_disk_read() else {
+        state.metadata_rename.buffers_deferred = true;
+        state.enqueue_pending_diagnostics(uri.clone());
+        return;
+    };
     let Some(owner) = state.analysis_host.owner().cloned() else { return };
     state.open_file_uri_ids.insert(uri.clone(), file_id);
     state.ensure_shared_view();
@@ -277,6 +371,12 @@ pub fn handle_did_open(state: &mut GlobalState, params: DidOpenTextDocumentParam
     tracing::debug!("Document opened: {} (version {})", uri, version);
 
     state.mem_docs.insert(uri.clone(), text.clone(), version);
+
+    let Ok(_disk_read) = state.prepare_disk_read() else {
+        state.metadata_rename.buffers_deferred = true;
+        state.enqueue_pending_diagnostics(uri);
+        return Ok(());
+    };
 
     // The buffer is kept, so that lifting the exclusion later brings back the
     // editor's text; the file itself gets no FileId, no text input and no analysis.
@@ -363,6 +463,8 @@ pub(crate) fn preload_dependencies(state: &mut GlobalState, file_id: vfs::FileId
         return;
     }
 
+    let Ok(disk_read) = state.prepare_disk_read() else { return };
+
     // Discovery belongs in the job, not here: asking the database what this file
     // depends on is itself a query, and on the event loop it holds up every other
     // notification for as long as it takes. The job carries the exclusion test with
@@ -376,11 +478,13 @@ pub(crate) fn preload_dependencies(state: &mut GlobalState, file_id: vfs::FileId
     if let Some(prev) = state.preload_tokens.remove(&file_id) {
         prev.cancel();
     }
+    disk_read.register_cancel(task.cancellation_token());
     state.preload_tokens.insert(file_id, task.cancellation_token());
     let queued_at = Instant::now();
 
     let analysis_guard = state.note_analysis_spawned();
     let spawned = state.task_pool.pool.try_spawn(move || {
+        let _disk_read = disk_read;
         let _analysis_guard = analysis_guard;
         let started_at = Instant::now();
         let queue_wait_ms = started_at.duration_since(queued_at).as_millis() as u64;
@@ -448,6 +552,12 @@ pub fn handle_did_change(
 
     state.scope_dirty_docs.insert(uri.clone());
 
+    let Ok(_disk_read) = state.prepare_disk_read() else {
+        state.metadata_rename.buffers_deferred = true;
+        state.enqueue_pending_diagnostics(uri);
+        return Ok(());
+    };
+
     if is_excluded_document(state, &uri) {
         return Ok(());
     }
@@ -494,6 +604,30 @@ pub fn handle_did_close(state: &mut GlobalState, params: DidCloseTextDocumentPar
 
     let uri = params.text_document.uri;
 
+    let Ok(_disk_read) = state.prepare_disk_read() else {
+        state.metadata_rename.buffers_deferred = true;
+        state.mem_docs.remove(&uri);
+        state.scope_dirty_docs.remove(&uri);
+        if let Some(token) = state.diagnostics_tokens.remove(&uri) {
+            token.cancel();
+        }
+        *state.diagnostics_generation.entry(uri.clone()).or_default() += 1;
+        let file_id = state.open_file_uri_ids.get(&uri).copied().or_else(|| {
+            uri.to_file_path()
+                .ok()
+                .and_then(|path| state.vfs.read().file_id(&vfs::VfsPath::new(path)))
+        });
+        if let Some(file_id) = file_id {
+            state.open_file_uri_ids.insert(uri.clone(), file_id);
+            if !state.open_file_uri_ids.iter().any(|(other, id)| {
+                *id == file_id && *other != uri && state.mem_docs.contains(other)
+            }) {
+                state.open_files.remove(&file_id);
+            }
+        }
+        return Ok(());
+    };
+
     tracing::debug!("Document closed: {}", uri);
 
     if is_excluded_document(state, &uri) {
@@ -532,7 +666,7 @@ pub fn handle_did_close(state: &mut GlobalState, params: DidCloseTextDocumentPar
             state.open_files.remove(&file_id);
             let accepted = match owner.refresh_saved_path(&path) {
                 mcp_server::WorkspaceRead::Ready(snapshot) => {
-                    caught_up = state.analysis_host.catch_up();
+                    caught_up = state.shared_view_seeded && state.analysis_host.catch_up();
                     state.shared_view_seeded
                         && state
                             .analysis_host
@@ -665,6 +799,13 @@ pub fn handle_did_save(state: &mut GlobalState, params: DidSaveTextDocumentParam
 
     let uri = params.text_document.uri;
 
+    let Ok(_disk_read) = state.prepare_disk_read() else {
+        state.metadata_rename.buffers_deferred = true;
+        state.enqueue_pending_diagnostics(uri);
+        state.request_scope_rebuild();
+        return Ok(());
+    };
+
     if let Some(owner) = state.analysis_host.owner().cloned() {
         let refreshed = uri.to_file_path().ok().is_some_and(|path| {
             let notified = owner.notify_changed_path(&path);
@@ -677,7 +818,7 @@ pub fn handle_did_save(state: &mut GlobalState, params: DidSaveTextDocumentParam
         if !refreshed {
             owner.request_update();
         }
-        if state.analysis_host.catch_up() {
+        if state.shared_view_seeded && state.analysis_host.catch_up() {
             state.mark_shared_view_changed();
             refresh_after_shared_catch_up(state);
         }
@@ -785,7 +926,15 @@ pub fn handle_did_change_watched_files(
     state: &mut GlobalState,
     params: DidChangeWatchedFilesParams,
 ) -> Result<()> {
-    let roots = state.project.as_ref().map(|project| project.source_roots()).unwrap_or_default();
+    let roots = state
+        .project
+        .as_ref()
+        .map(|project| {
+            let mut roots = project.source_roots();
+            roots.extend(project.semantic_dependency_roots());
+            roots
+        })
+        .unwrap_or_default();
     let workspace_root = state.workspace_root.as_deref();
     let owner = state.analysis_host.owner().cloned();
     let mut invalidated = 0usize;
@@ -874,6 +1023,185 @@ mod tests {
         state.vfs_done = true;
 
         (state, receiver)
+    }
+
+    #[test]
+    fn workspace_disk_background_admission_preserves_pending_and_resumes_after_writer() {
+        let (mut state, _receiver) = create_test_state();
+        state.vfs_done = false;
+        let uri = crate::test_uri::file_uri("workspace-disk-background.bsl");
+        handle_did_open(
+            &mut state,
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "bsl".into(),
+                    version: 1,
+                    text: "Procedure Test() EndProcedure".into(),
+                },
+            },
+        )
+        .unwrap();
+        state.vfs_done = true;
+        state.shared_view_seeded = true;
+        state.shared_metadata_warm_pending = true;
+        state.foreign_bindings_priming.pending = true;
+        let gate = state.workspace_disk_gate();
+        let writer = gate.begin_write(std::time::Duration::ZERO, &|| false).unwrap();
+        state.start_shared_metadata_warmup();
+        state.start_foreign_handler_bindings_priming();
+        schedule_diagnostics(&mut state, &uri);
+        assert!(state.shared_metadata_warm_pending);
+        assert!(!state.shared_metadata_warm_in_flight);
+        assert!(state.foreign_bindings_priming.pending);
+        assert!(!state.foreign_bindings_priming.in_flight);
+        assert!(state.pending_diagnostics_uris.contains(&uri));
+        assert!(!state.diagnostics_tokens.contains_key(&uri));
+        writer.finish();
+        schedule_diagnostics(&mut state, &uri);
+        assert!(state.diagnostics_tokens.contains_key(&uri));
+        state.start_shared_metadata_warmup();
+        assert!(state.shared_metadata_warm_in_flight);
+    }
+
+    #[test]
+    fn workspace_disk_background_queued_result_rechecks_epoch_and_preserves_retry() {
+        let (mut state, receiver) = create_test_state();
+        let uri = crate::test_uri::file_uri("workspace-disk-queued.bsl");
+        state.mem_docs.insert(uri.clone(), "Procedure Test() EndProcedure".into(), 1);
+        state.diagnostics_generation.insert(uri.clone(), 1);
+        let read = state.try_disk_read().unwrap();
+        let old_epoch = read.epoch();
+        drop(read);
+        state
+            .workspace_disk_gate()
+            .begin_write(std::time::Duration::ZERO, &|| false)
+            .unwrap()
+            .finish();
+        let completion = |epoch| Task::DiskReadCompleted {
+            epoch,
+            task: Box::new(Task::DiagnosticsReady {
+                uri: uri.clone(),
+                diagnostics: vec![lsp_types::Diagnostic::new_simple(
+                    lsp_types::Range::default(),
+                    "computed".into(),
+                )],
+                version: 1,
+                generation: 1,
+                completed_at: Instant::now(),
+            }),
+            cancelled: Box::new(Task::DiagnosticsCancelled {
+                uri: uri.clone(),
+                version: 1,
+                generation: 1,
+                kind: salsa::Cancelled::Local,
+                dispatched: crate::global_state::DispatchStamp::of(
+                    state.analysis_host.raw_database(),
+                ),
+                completed_at: Instant::now(),
+            }),
+        };
+        let stale = completion(old_epoch);
+        let current = state.try_disk_read().unwrap().epoch();
+        let fresh = completion(current);
+        crate::server::handle_task(&mut state, stale).unwrap();
+        assert!(state.pending_diagnostics_uris.contains(&uri));
+        assert!(receiver.try_recv().is_err());
+        crate::server::handle_task(&mut state, fresh).unwrap();
+        assert!(
+            matches!(receiver.try_recv().unwrap(),Message::Notification(n) if n.method=="textDocument/publishDiagnostics")
+        );
+        assert!(state
+            .workspace_disk_gate()
+            .begin_write(std::time::Duration::ZERO, &|| false)
+            .is_ok());
+    }
+
+    #[test]
+    fn workspace_disk_background_deferred_buffers_replay_after_preflight_abort() {
+        let (mut state, _receiver) = create_test_state();
+        state.vfs_done = false;
+        let uri = crate::test_uri::file_uri("workspace-disk-replay.bsl");
+        handle_did_open(
+            &mut state,
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "bsl".into(),
+                    version: 1,
+                    text: "Procedure Before() EndProcedure".into(),
+                },
+            },
+        )
+        .unwrap();
+        let file_id = crate::lsp::file_id(&state, &uri).unwrap();
+        let writer =
+            state.workspace_disk_gate().begin_write(std::time::Duration::ZERO, &|| false).unwrap();
+        handle_did_change(
+            &mut state,
+            DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier { uri: uri.clone(), version: 2 },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "Procedure After() EndProcedure".into(),
+                }],
+            },
+        )
+        .unwrap();
+        assert!(state.metadata_rename.buffers_deferred);
+        assert_eq!(state.mem_docs.get_version(&uri), Some(2));
+        writer.finish();
+        let _read = state.try_disk_read().unwrap();
+        replay_open_documents_after_disk_transaction(&mut state).unwrap();
+        assert!(!state.metadata_rename.buffers_deferred);
+        assert_eq!(
+            &*state.analysis_host.analysis().file_text(file_id),
+            "Procedure After() EndProcedure"
+        );
+        assert_eq!(state.mem_docs.get_version(&uri), Some(2));
+    }
+
+    #[test]
+    fn workspace_disk_background_deferred_close_replays_disk_without_ghost_overlay() {
+        use base_db::SourceDatabase as _;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("Closed.bsl");
+        let text = "Procedure Saved() EndProcedure";
+        std::fs::write(&path, text).unwrap();
+        let uri = Url::from_file_path(&path).unwrap();
+        let (mut state, _receiver) = create_test_state();
+        state.vfs_done = false;
+        handle_did_open(
+            &mut state,
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "bsl".into(),
+                    version: 1,
+                    text: text.into(),
+                },
+            },
+        )
+        .unwrap();
+        let file_id = crate::lsp::file_id(&state, &uri).unwrap();
+        let writer =
+            state.workspace_disk_gate().begin_write(std::time::Duration::ZERO, &|| false).unwrap();
+        handle_did_close(
+            &mut state,
+            DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+            },
+        )
+        .unwrap();
+        assert!(!state.mem_docs.contains(&uri));
+        assert!(!state.open_files.contains(&file_id));
+        writer.finish();
+        let _read = state.try_disk_read().unwrap();
+        replay_open_documents_after_disk_transaction(&mut state).unwrap();
+        assert!(!state.open_file_uri_ids.contains_key(&uri));
+        assert!(state.analysis_host.raw_database().try_file_text_input(file_id).is_none());
+        assert_eq!(&*state.analysis_host.analysis().file_text(file_id), text);
     }
 
     #[derive(Debug)]
@@ -1786,7 +2114,18 @@ mod tests {
         assert!(state.diagnostics_tokens.contains_key(uri), "the push must be scheduled");
         let bound = test_utils::wait::ceiling(std::time::Duration::from_secs(60));
         loop {
-            match state.task_pool.receiver.recv_timeout(bound).expect("the push reports") {
+            let task = match state.task_pool.receiver.recv_timeout(bound).expect("the push reports")
+            {
+                crate::global_state::Task::DiskReadCompleted { epoch, task, cancelled } => {
+                    if state.workspace_disk_gate().is_current(epoch) {
+                        *task
+                    } else {
+                        *cancelled
+                    }
+                }
+                task => task,
+            };
+            match task {
                 crate::global_state::Task::DiagnosticsReady { uri: ready, diagnostics, .. }
                     if &ready == uri =>
                 {

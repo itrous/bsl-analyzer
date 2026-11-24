@@ -871,6 +871,7 @@ fn the_test_only_modules_are_the_ones_the_parent_gates() {
     assert_eq!(
         exempt,
         [
+            "broker/proxy/windows_lifetime_tests.rs",
             "check_executor_windows_tests.rs",
             "check_executor_wire_tests.rs",
             "diagnostics_state/project_config_tests.rs",
@@ -885,6 +886,11 @@ fn the_test_only_modules_are_the_ones_the_parent_gates() {
             "state/test_support.rs",
             "test_clock.rs",
             "test_wait.rs",
+            "tools/diagnostics/occurrence_identity_tests.rs",
+            "tools/epf_module_check/tests.rs",
+            "tools/metadata/source_cards/characteristic_type_tests.rs",
+            "tools/metadata/source_cards/subsystem_contract_tests.rs",
+            "tools/query/execution_tests.rs",
             "tools/search/cancel_tests.rs",
             "tools/search/test_support.rs",
             "walk_probe.rs",

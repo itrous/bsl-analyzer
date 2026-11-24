@@ -185,6 +185,7 @@ fn parse_metadata_object_xml(xml: &str, mdo_type: MdoType) -> Result<MetadataObj
     }
 
     let mut mdo = MetadataObject::new(mdo_type, properties.name.clone());
+    mdo.read_properties = super::read_properties::parse_read_properties(mdo_node);
     if let Some(uuid_str) = mdo_node.attribute("uuid") {
         match parse_uuid(uuid_str, "MDO root") {
             Ok(uuid) => mdo.set_uuid(uuid),

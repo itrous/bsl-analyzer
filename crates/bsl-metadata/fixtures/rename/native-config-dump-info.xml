@@ -1,0 +1,24 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<ConfigDumpInfo xmlns="http://v8.1c.ru/8.3/xcf/dumpinfo" xmlns:xen="http://v8.1c.ru/8.3/xcf/enums" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" format="Hierarchical" version="2.20">
+	<ConfigVersions>
+		<Metadata name="Catalog.BaseCatalog" id="018e4d6b-f86e-5cbd-b1eb-c6310ea5d8fa" configVersion="a6a59e59803bcd498d55656a20fadf4300000000"/>
+		<Metadata name="CommonAttribute.AreaNoAuto" id="29658603-36eb-5742-9ab5-9867a9881140" configVersion="8a244b3d50e9074b84dc8de484747dd800000000"/>
+		<Metadata name="CommonAttribute.AreaUse" id="7414a345-b3cf-5561-85e9-50d27d974c17" configVersion="21785ac6f652fb41b639a1fbb932446300000000"/>
+		<Metadata name="CommonAttribute.OrdinaryAuto" id="5e39e3a0-01d4-5022-973b-170defb72673" configVersion="f3d29230ded95949a606c615d30792ec00000000"/>
+		<Metadata name="CommonAttribute.OtherNoAuto" id="29fe59b1-2e49-5c68-86fe-8149bbad380c" configVersion="666e226e49ebc74bbaf34f1367bdf74700000000"/>
+		<Metadata name="CommonAttribute.OtherUse" id="2f7445ba-531d-576b-85e5-0cbcf74b6444" configVersion="a0a034fc00d53747aeb8dbaf113d35c500000000"/>
+		<Metadata name="Configuration.Issue379Native" id="36ce9ddb-45a7-4017-9511-7a0f9f03092c" configVersion="41a5d9da4e42cf4b91a0b0fec71b78dd00000000"/>
+		<Metadata name="Configuration.Issue379Native.OrdinaryApplicationModule" id="7626e71c-76c2-4db8-b5af-49b911ddd719.0" configVersion="75bfb04e6043dd44a7ea2a21880f454200000000"/>
+		<Metadata name="Configuration.Issue379Native.SessionModule" id="7626e71c-76c2-4db8-b5af-49b911ddd719.7" configVersion="1b668b59ae3f7d478452982d13f7bb1900000000"/>
+		<Metadata name="InformationRegister.BaseRegister" id="0974fddb-727e-5ee2-bbb2-f9896e3c8862" configVersion="0b6f2116b335c04fab0ba86d031817fc00000000">
+			<Metadata name="InformationRegister.BaseRegister.Resource.Amount" id="a6104c22-5bdb-5ff0-a680-ef36119f630c"/>
+			<Metadata name="InformationRegister.BaseRegister.Dimension.Key" id="ebb24cd0-dcac-5c49-b3d7-9a10b7d8a7b0"/>
+		</Metadata>
+		<Metadata name="Language.English" id="3334fa8d-3eff-404f-8977-12b1946bed88" configVersion="9ec6b17f6c8b5f43bd5b625f3850630400000000"/>
+		<Metadata name="SessionParameter.AreaNoAutoValue" id="99b52d3b-9cd3-5a6d-af0a-a5334825538f" configVersion="75a66df302ae8d4bba1076ea96a9eba300000000"/>
+		<Metadata name="SessionParameter.AreaUseValue" id="d129dcc2-b3d0-50bb-a768-81bf365ce47a" configVersion="17a5bfbef578a84eae90e9f169e5c2e300000000"/>
+		<Metadata name="SessionParameter.OtherNoAutoValue" id="bd0f1d64-8d12-59d3-9d43-1b7f6dc1db68" configVersion="9fef07a4be220640867bb49bb92a117c00000000"/>
+		<Metadata name="SessionParameter.OtherUseValue" id="8c405a46-882d-5afc-8b15-4372636fae22" configVersion="91cd281764f1e74eab0d208bd23bf1ed00000000"/>
+		<Metadata name="SessionParameter.UseSeparation" id="0f2bcf1d-545d-5833-a6e7-420c816a6e31" configVersion="f3c6890df9f26347ba3cf39588f3d5b600000000"/>
+	</ConfigVersions>
+</ConfigDumpInfo>

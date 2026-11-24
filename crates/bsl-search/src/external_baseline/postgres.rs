@@ -4853,6 +4853,27 @@ mod tests {
     use crate::{BaselineRef, IndexedDocument};
     use std::collections::HashMap;
 
+    #[test]
+    fn foreign_absolute_root_ids_are_refused_without_a_connection() {
+        let portable = indexed_document("code", "Module.bsl", "Module", 1, "h", "t");
+        for root in ["", ".", "src/cfe/One"] {
+            let document = IndexedDocument { root_id: root.into(), ..portable.clone() };
+            super::ensure_the_roots_mean_the_same_elsewhere(&[document]).unwrap();
+        }
+        for root in [
+            "/srv/extensions/One",
+            r"\extensions\One",
+            "C:/extensions/One",
+            r"C:\extensions\One",
+            r"\\server\share\One",
+            r"\\?\C:\extensions\One",
+        ] {
+            let document = IndexedDocument { root_id: root.into(), ..portable.clone() };
+            let error = super::ensure_the_roots_mean_the_same_elsewhere(&[document]).unwrap_err();
+            assert_eq!(error.reason_code(), Some("root_id_not_portable"), "{root:?}: {error}");
+        }
+    }
+
     /// Two facts hold this file together, and neither is visible from where the other lives.
     ///
     /// The garbage collector rebuilds the set of live embedding keys from `snapshot_files.path`

@@ -202,6 +202,8 @@ fn a_borrowed_form_does_not_judge_items_the_base_describes() {
     db.set_file_text(FileId(1), &std::fs::read_to_string(&base_module).unwrap());
     let paths = vec![(None, base.clone()), (Some("Расширение".to_string()), extension.clone())];
     db.set_workspace_configs_snapshot(WorkspaceConfigsSnapshot {
+        external_owners: Vec::new(),
+        compilation_overrides: Default::default(),
         extension_scopes: vec![None, Some(bsl_metadata::ExtensionScope::InfoBase)],
         canonical_paths: paths
             .iter()
@@ -249,6 +251,8 @@ fn a_change_and_validate_insert_does_not_judge_an_extension_item() {
     db.set_file_text(FileId(1), base_text);
     let paths = vec![(None, base.clone()), (Some("Расширение".to_string()), extension.clone())];
     db.set_workspace_configs_snapshot(WorkspaceConfigsSnapshot {
+        external_owners: Vec::new(),
+        compilation_overrides: Default::default(),
         extension_scopes: vec![None, Some(bsl_metadata::ExtensionScope::InfoBase)],
         canonical_paths: paths
             .iter()

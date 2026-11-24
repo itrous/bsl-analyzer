@@ -7,8 +7,16 @@ use serde::{Deserialize, Serialize};
 
 pub const SHARED_CONFIGURATIONS_ROOT_ENV: &str = "ONEC_CONFIGURATIONS_ROOT";
 
+mod external_owner;
+pub use external_owner::{
+    resolve_external_configuration_owner, ExternalConfigurationOwner, ExternalOwnerError,
+    OwnerConfigurationRoot,
+};
+
 mod diagnostics_baseline_fs;
-pub use diagnostics_baseline_fs::{ManagedBaselineDirectory, ManagedEntryReading};
+pub use diagnostics_baseline_fs::{
+    ManagedBaselineDirectory, ManagedDirectoryEntry, ManagedDirectoryEntryKind, ManagedEntryReading,
+};
 
 pub mod extension_topology;
 pub mod file_role;
@@ -97,6 +105,8 @@ pub struct DiagnosticsBaselineDependencyScope {
 pub struct DiagnosticsBaselineProjectExternal {
     pub name: String,
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration_root: Option<String>,
     /// The extensions the object narrowed its view to; `None` when it sees
     /// every extension. Absent from the serialized form then, so a baseline
     /// published before the key existed keeps its scope fingerprint.
@@ -143,6 +153,8 @@ pub enum DiagnosticsBaselinePartitionIdentity {
     External {
         name: String,
         path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        configuration_root: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         depends_on: Option<Vec<String>>,
     },
@@ -347,6 +359,7 @@ pub struct Project {
     extension_in_config_location: Option<PathBuf>,
     extension_paths: Vec<(String, PathBuf)>,
     external_paths: Vec<(String, PathBuf)>,
+    external_owners: Vec<(PathBuf, ExternalConfigurationOwner)>,
     external_discovery_rejections: Vec<ExternalDiscoveryRejection>,
     topology: ExtensionTopology,
     /// `[source].exclude`, resolved. Wins over every root, declared or discovered.
@@ -436,6 +449,30 @@ impl Project {
             extension: extension_in_config_location,
             excluded: base_excluded,
         } = Self::discover_source_path(&root, &config, &exclusions)?;
+        let mut external_owners = Vec::new();
+        for declaration in config.externals.iter().flatten() {
+            if declaration
+                .configuration_root
+                .as_ref()
+                .is_some_and(|path| exclusions.is_excluded_resolved(&root.join(path)))
+            {
+                return Err(TopologyError::InvalidExternalConfigurationOwner {
+                    name: declaration.name.clone(),
+                    reason: "configuration owner root is excluded".to_owned(),
+                }
+                .into());
+            }
+            let owner = resolve_external_configuration_owner(
+                &root,
+                declaration.configuration_root.as_deref(),
+                source_path.as_deref(),
+            )
+            .map_err(|error| TopologyError::InvalidExternalConfigurationOwner {
+                name: declaration.name.clone(),
+                reason: error.to_string(),
+            })?;
+            external_owners.push((root.join(&declaration.path), owner));
+        }
         let mut candidates_cut = false;
         let specs = Self::resolve_extension_specs(
             &root,
@@ -443,6 +480,8 @@ impl Project {
             &exclusions,
             &mut candidates_cut,
             &mut external_discovery_rejections,
+            &external_owners,
+            source_path.as_deref(),
         )?;
         let base_path = source_path.as_deref().unwrap_or(&root);
         let canonical_base =
@@ -465,6 +504,16 @@ impl Project {
         };
         let extension_paths = paths_of_kind(false);
         let external_paths = paths_of_kind(true);
+        external_owners.retain(|(path, _)| external_paths.iter().any(|(_, root)| root == path));
+        for (_, path) in &external_paths {
+            if !external_owners.iter().any(|(root, _)| root == path) {
+                external_owners.push((
+                    path.clone(),
+                    resolve_external_configuration_owner(&root, None, source_path.as_deref())
+                        .expect("a legacy context cannot fail validation"),
+                ));
+            }
+        }
         Ok(Self {
             root,
             config,
@@ -472,6 +521,7 @@ impl Project {
             extension_in_config_location,
             extension_paths,
             external_paths,
+            external_owners,
             external_discovery_rejections,
             topology,
             exclusions,
@@ -778,9 +828,22 @@ impl Project {
                 .map(|id| self.topology.node(*id).name().to_owned())
                 .collect();
             if node.kind().is_external() {
+                let configuration_root = self
+                    .external_owners
+                    .iter()
+                    .find(|(path, _)| path == node.path())
+                    .and_then(|(_, owner)| owner.proven_root())
+                    .map(|owner| {
+                        relative_baseline_path(
+                            &canonicalize_baseline_path(&owner.canonical_path)?,
+                            &project_root,
+                        )
+                    })
+                    .transpose()?;
                 externals.push(DiagnosticsBaselineProjectExternal {
                     name: node.name().to_owned(),
                     path,
+                    configuration_root,
                     depends_on: (!node.sees_every_extension()).then_some(depends_on),
                 });
                 continue;
@@ -1002,6 +1065,7 @@ impl Project {
                 DiagnosticsBaselinePartitionIdentity::External {
                     name: external.name.clone(),
                     path: external.path.clone(),
+                    configuration_root: external.configuration_root.clone(),
                     depends_on: external.depends_on.clone(),
                 },
             ));
@@ -1176,6 +1240,33 @@ impl Project {
 
     /// External data processors and reports, by declared name, in declaration
     /// order. Never part of [`Self::extension_paths`]: the two compose differently.
+    /// External roots and their selected compilation context, kept outside designer topology.
+    pub fn external_configuration_owners(&self) -> &[(PathBuf, ExternalConfigurationOwner)] {
+        &self.external_owners
+    }
+
+    /// Stable project-relative identity of the compilation choices, for consumer caches.
+    pub fn compilation_context_fingerprint(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"external-compilation-context-v1\0");
+        for (external, owner) in &self.external_owners {
+            let relative = external.strip_prefix(&self.root).unwrap_or(external);
+            hasher.update(relative.to_string_lossy().as_bytes());
+            hasher.update(&[0]);
+            hasher.update(&[match owner {
+                ExternalConfigurationOwner::Unknown => 0,
+                ExternalConfigurationOwner::LegacyProjectDefault(_) => 1,
+                ExternalConfigurationOwner::Selected(_) => 2,
+            }]);
+            if let Some(owner) = owner.compilation_root() {
+                let relative = owner.path.strip_prefix(&self.root).unwrap_or(&owner.path);
+                hasher.update(relative.to_string_lossy().as_bytes());
+            }
+            hasher.update(&[0]);
+        }
+        *hasher.finalize().as_bytes()
+    }
+
     pub fn external_paths(&self) -> &[(String, PathBuf)] {
         &self.external_paths
     }
@@ -1249,6 +1340,8 @@ impl Project {
             &ExcludedPaths::default(),
             &mut false,
             &mut Vec::new(),
+            &[],
+            None,
         )?;
         Ok(specs.into_iter().map(|spec| (spec.name, spec.path)).collect())
     }
@@ -1272,6 +1365,8 @@ impl Project {
         exclusions: &ExcludedPaths,
         cut: &mut bool,
         external_discovery_rejections: &mut Vec<ExternalDiscoveryRejection>,
+        external_owners: &[(PathBuf, ExternalConfigurationOwner)],
+        project_default: Option<&Path>,
     ) -> Result<Vec<ExtensionNodeSpec>, TopologyError> {
         enum Candidate {
             Legacy(PathBuf),
@@ -1402,7 +1497,14 @@ impl Project {
                 &mut seen,
                 external_discovery_rejections,
             ),
-            Some(list) => Self::declare_externals(root, list, &mut specs, &mut seen)?,
+            Some(list) => Self::declare_externals(
+                root,
+                list,
+                external_owners,
+                project_default,
+                &mut specs,
+                &mut seen,
+            )?,
         }
         Ok(specs)
     }
@@ -1410,15 +1512,21 @@ impl Project {
     fn declare_externals(
         root: &Path,
         list: &[ExternalDecl],
+        external_owners: &[(PathBuf, ExternalConfigurationOwner)],
+        project_default: Option<&Path>,
         specs: &mut Vec<ExtensionNodeSpec>,
         seen: &mut std::collections::HashMap<PathBuf, usize>,
     ) -> Result<(), TopologyError> {
-        // The object name, not the declared alias, is the identity every
-        // `(MdoType, name)`-keyed surface sees; two exports of one name would
-        // leave the later one invisible there.
+        // A name is ambiguous within one owner. Only distinct explicit owners
+        // establish that two same-named exports belong to different scopes.
+        struct SeenObject {
+            declaration: usize,
+            name: String,
+            owner: Option<PathBuf>,
+        }
         let mut seen_objects: std::collections::HashMap<
             (ExternalObjectKind, String),
-            (usize, String),
+            Vec<SeenObject>,
         > = std::collections::HashMap::new();
         for decl in list {
             let path = root.join(&decl.path);
@@ -1436,14 +1544,45 @@ impl Project {
                 });
             }
             let object_key = (kind, stdx::case::fold_lower_per_char(&object));
-            if let Some((first, object)) = seen_objects.get(&object_key) {
+            let owner =
+                external_owners.iter().find(|(root, _)| root == &path).map(|(_, owner)| owner);
+            let proven_owner = owner
+                .and_then(ExternalConfigurationOwner::proven_root)
+                .map(|root| root.canonical_path.clone());
+            if let Some(previous) = seen_objects.get(&object_key).and_then(|entries| {
+                entries.iter().find(|previous| {
+                    proven_owner.is_none()
+                        || previous.owner.is_none()
+                        || previous.owner == proven_owner
+                })
+            }) {
                 return Err(TopologyError::ExternalObjectNameDuplicate {
-                    object: object.clone(),
-                    first: specs[*first].name.clone(),
+                    object: previous.name.clone(),
+                    first: specs[previous.declaration].name.clone(),
                     second: decl.name.clone(),
                 });
             }
-            seen_objects.insert(object_key, (specs.len(), object));
+            seen_objects.entry(object_key).or_default().push(SeenObject {
+                declaration: specs.len(),
+                name: object,
+                owner: proven_owner.clone(),
+            });
+            let selected_is_foreign = proven_owner.as_deref().is_some_and(|selected| {
+                project_default.and_then(|path| std::fs::canonicalize(path).ok()).as_deref()
+                    != Some(selected)
+            });
+            let depends_on = if selected_is_foreign {
+                if decl.depends_on.as_ref().is_some_and(|deps| !deps.is_empty()) {
+                    return Err(TopologyError::InvalidExternalConfigurationOwner {
+                        name: decl.name.clone(),
+                        reason: "extension dependencies belong to the project's main configuration"
+                            .into(),
+                    });
+                }
+                Some(Vec::new())
+            } else {
+                decl.depends_on.clone()
+            };
             tracing::info!(name = %decl.name, path = %path.display(), ?kind, "resolved external");
             seen.insert(canonical.clone(), specs.len());
             specs.push(ExtensionNodeSpec {
@@ -1451,7 +1590,7 @@ impl Project {
                 name: decl.name.clone(),
                 path,
                 canonical_path: canonical,
-                depends_on: decl.depends_on.clone(),
+                depends_on,
                 structured: true,
                 scope: None,
             });
@@ -2463,6 +2602,9 @@ pub struct StructuredExtensionDecl {
 pub struct ExternalDecl {
     pub name: String,
     pub path: String,
+    /// Main configuration used by this external object, relative to the project.
+    #[serde(default, alias = "configurationRoot")]
+    pub configuration_root: Option<String>,
     /// The extensions the object sees, by name, transitively. Without the key
     /// it sees every extension of the project; with it, exactly the closure of
     /// the listed ones — an empty list is the base alone.
@@ -8658,7 +8800,12 @@ mod external_root_tests {
     }
 
     fn external(name: &str, path: &str) -> ExternalDecl {
-        ExternalDecl { name: name.to_string(), path: path.to_string(), depends_on: None }
+        ExternalDecl {
+            configuration_root: None,
+            name: name.to_string(),
+            path: path.to_string(),
+            depends_on: None,
+        }
     }
 
     fn touch_extension(root: &Path, rel: &str) {
@@ -9223,7 +9370,7 @@ externals = [
         let external = plan.partitions.iter().find(|p| p.id == "external:E").expect("partition");
         assert!(matches!(
             &external.identity,
-            DiagnosticsBaselinePartitionIdentity::External { name, path, depends_on: None }
+            DiagnosticsBaselinePartitionIdentity::External { name, path, depends_on: None, .. }
                 if name == "E" && path == "src/epf/E"
         ));
         let identity_json = serde_json::to_string(&external.identity).unwrap();

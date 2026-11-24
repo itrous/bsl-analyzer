@@ -1,18 +1,18 @@
-use crate::AnalysisContext;
+use crate::BodyContext;
 use crate::{Diagnostic, DiagnosticCode};
 use bsl_platform::deprecation::{DeprecationEntry, LifecycleGroup};
 use hir::LocalRange;
 
 use super::deprecated_platform_api;
 use super::deprecated_platform_facts::{
-    canonical_name_for, global_function_fact, is_russian_alias,
-    replacement_absent_from_configuration, replacement_for_name,
+    applicable_replacement, canonical_name_for, global_function_fact, global_function_message,
+    is_russian_alias, replacement_absent_from_configuration, replacement_for_name,
 };
 
 pub fn from_hir(
     name: &str,
     range: LocalRange,
-    ctx: &AnalysisContext,
+    ctx: &BodyContext,
 ) -> Option<Diagnostic<LocalRange>> {
     let code = DiagnosticCode::DeprecatedPlatformApi;
 
@@ -36,33 +36,31 @@ pub fn from_hir(
     })
 }
 
-fn get_message(
-    method_name: &str,
-    fact: &DeprecationEntry,
-    ctx: &AnalysisContext,
-) -> Option<String> {
-    let replacement = replacement_for_name(fact, method_name)?;
-    let deprecated = canonical_name_for(fact, method_name)?;
-    let russian = is_russian_alias(fact, method_name);
-    // Do not advise a replacement this configuration provably does not have.
-    if replacement_absent_from_configuration(replacement, ctx) {
-        return Some(if russian {
-            format!(
-                "Устаревшее \"{}\": рекомендуемой замены \"{}\" в этой конфигурации нет",
-                deprecated, replacement
-            )
-        } else {
-            format!(
-                "Deprecated \"{}\": the recommended replacement \"{}\" is absent from this configuration",
-                deprecated, replacement
-            )
-        });
+/// The replacement is named only where it applies here. Where it does not, a
+/// `Module.Method` replacement this configuration provably lacks is still named, as
+/// absent, since that tells the reader why no fix is offered; any other replacement
+/// that cannot be proven applicable is withheld.
+fn get_message(method_name: &str, fact: &DeprecationEntry, ctx: &BodyContext) -> Option<String> {
+    let replacement = applicable_replacement(fact, method_name, ctx);
+    if replacement.is_none() {
+        if let Some(absent) = replacement_for_name(fact, method_name)
+            .filter(|replacement| replacement_absent_from_configuration(replacement, ctx))
+        {
+            let deprecated = canonical_name_for(fact, method_name)?;
+            return Some(if is_russian_alias(fact, method_name) {
+                format!(
+                    "Устаревшее \"{}\": рекомендуемой замены \"{}\" в этой конфигурации нет",
+                    deprecated, absent
+                )
+            } else {
+                format!(
+                    "Deprecated \"{}\": the recommended replacement \"{}\" is absent from this configuration",
+                    deprecated, absent
+                )
+            });
+        }
     }
-    if russian {
-        Some(format!("Используйте \"{}\" вместо устаревшего \"{}\"", replacement, deprecated))
-    } else {
-        Some(format!("Use \"{}\" instead of deprecated \"{}\"", replacement, deprecated))
-    }
+    global_function_message(method_name, fact, replacement)
 }
 
 #[cfg(test)]
@@ -86,10 +84,11 @@ mod tests {
 
         expect![[r#"
             DeprecatedPlatformApi @ 3:5..3:13
-              message: Используйте "ОбщегоНазначения.СообщитьПользователю" вместо устаревшего "Сообщить"
-              severity: Warning"#]].assert_eq(&format_diags(code, &deprecated_diags));
+              message: Устаревший API "Сообщить"
+              severity: Warning"#]]
+        .assert_eq(&format_diags(code, &deprecated_diags));
         assert_eq!(deprecated_diags[0].severity, Severity::Warning);
-        assert!(deprecated_diags[0].message.contains("СообщитьПользователю"));
+        assert!(!deprecated_diags[0].message.contains("СообщитьПользователю"));
     }
 
     #[test]
@@ -107,10 +106,10 @@ EndProcedure
 
         expect![[r#"
             DeprecatedPlatformApi @ 3:5..3:12
-              message: Use "CommonUse.MessageToUser" instead of deprecated "Message"
+              message: Deprecated API "Message"
               severity: Warning"#]]
         .assert_eq(&format_diags(code, &deprecated_diags));
-        assert!(deprecated_diags[0].message.contains("MessageToUser"));
+        assert!(!deprecated_diags[0].message.contains("MessageToUser"));
     }
 
     #[test]
@@ -147,17 +146,18 @@ EndProcedure
 
         expect![[r#"
             DeprecatedPlatformApi @ 3:5..3:13
-              message: Используйте "ОбщегоНазначения.СообщитьПользователю" вместо устаревшего "Сообщить"
+              message: Устаревший API "Сообщить"
               severity: Warning
             DeprecatedPlatformApi @ 4:5..4:13
-              message: Используйте "ОбщегоНазначения.СообщитьПользователю" вместо устаревшего "Сообщить"
+              message: Устаревший API "Сообщить"
               severity: Warning
             DeprecatedPlatformApi @ 5:5..5:13
-              message: Используйте "ОбщегоНазначения.СообщитьПользователю" вместо устаревшего "Сообщить"
+              message: Устаревший API "Сообщить"
               severity: Warning
             DeprecatedPlatformApi @ 6:5..6:13
-              message: Используйте "ОбщегоНазначения.СообщитьПользователю" вместо устаревшего "Сообщить"
-              severity: Warning"#]].assert_eq(&format_diags(code, &deprecated_diags));
+              message: Устаревший API "Сообщить"
+              severity: Warning"#]]
+        .assert_eq(&format_diags(code, &deprecated_diags));
     }
 
     #[test]
@@ -177,10 +177,10 @@ EndProcedure
             .collect();
         expect![[r#"
             DeprecatedPlatformApi @ 4:9..4:16
-              message: Use "CommonUse.MessageToUser" instead of deprecated "Message"
+              message: Deprecated API "Message"
               severity: Warning"#]]
         .assert_eq(&format_diags(code, &diags));
-        assert!(diags[0].message.contains("MessageToUser"));
+        assert!(!diags[0].message.contains("MessageToUser"));
     }
 
     const CLIENT_SERVER_MODULE_XML: &str = r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
@@ -201,6 +201,7 @@ EndProcedure
     const ABSENT_MESSAGE: &str = "Устаревшее \"Сообщить\": рекомендуемой замены \"ОбщегоНазначения.СообщитьПользователю\" в этой конфигурации нет";
     const NAMED_MESSAGE: &str =
         "Используйте \"ОбщегоНазначения.СообщитьПользователю\" вместо устаревшего \"Сообщить\"";
+    const WITHHELD_MESSAGE: &str = "Устаревший API \"Сообщить\"";
 
     fn deprecated_messages(modules: &[(&str, &str, &str)]) -> Vec<String> {
         check_form_with_common_modules(CALL_SITE, modules)
@@ -228,13 +229,12 @@ EndProcedure
         assert_eq!(messages, vec![NAMED_MESSAGE.to_string()]);
     }
 
-    // Control: a receiver that is not a common module of the configuration keeps its
-    // name. This stops the gate from stripping platform-spelled replacements (a chart
-    // property path, say), whose absence from the configuration proves nothing.
+    // A receiver that is not a common module of the configuration proves neither
+    // absence nor applicability: the replacement is neither called absent nor advised.
     #[test]
-    fn a_receiver_that_is_not_a_common_module_keeps_its_name() {
+    fn a_receiver_that_is_not_a_common_module_withholds_the_replacement() {
         let messages = deprecated_messages(&[]);
-        assert_eq!(messages, vec![NAMED_MESSAGE.to_string()]);
+        assert_eq!(messages, vec![WITHHELD_MESSAGE.to_string()]);
     }
 
     // `Module.Method` reaches only an exported method, so a non-exported one of that
@@ -286,16 +286,17 @@ EndProcedure
     }
 
     // The module body could not be read, so the method may well be declared there:
-    // the replacement keeps its name. Only the unreadable flag differs from the control.
+    // the replacement is not called absent, and as it is not proven either it is
+    // withheld. Only the unreadable flag differs from the control.
     #[test]
-    fn an_unread_module_body_keeps_the_replacement_named() {
+    fn an_unread_module_body_withholds_the_replacement() {
         let control = deprecated_messages_in_configuration(&[]);
         assert_eq!(control, vec![ABSENT_MESSAGE.to_string()]);
 
         let unread = deprecated_messages_in_configuration(&[
             "CommonModules/ОбщегоНазначения/Ext/Module.bsl",
         ]);
-        assert_eq!(unread, vec![NAMED_MESSAGE.to_string()]);
+        assert_eq!(unread, vec![WITHHELD_MESSAGE.to_string()]);
     }
 
     #[test]
@@ -312,8 +313,9 @@ EndProcedure
             .collect();
         expect![[r#"
             DeprecatedPlatformApi @ 2:1..2:9
-              message: Используйте "ОбщегоНазначения.СообщитьПользователю" вместо устаревшего "Сообщить"
-              severity: Warning"#]].assert_eq(&format_diags(code, &diags));
-        assert!(diags[0].message.contains("СообщитьПользователю"));
+              message: Устаревший API "Сообщить"
+              severity: Warning"#]]
+        .assert_eq(&format_diags(code, &diags));
+        assert!(!diags[0].message.contains("СообщитьПользователю"));
     }
 }
