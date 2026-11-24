@@ -212,6 +212,11 @@ pub fn handle_find_references(
         let known = result.hits.len();
         let count = reasons.len();
         let sample = reasons.iter().take(8).map(|reason| &reason.kind).collect::<Vec<_>>();
+        if result.hits.is_empty() {
+            anyhow::bail!(
+                "Metadata references are incomplete: {known} known occurrences; {count} issues; {sample:?}"
+            );
+        }
         tracing::warn!(
             "Metadata references are incomplete: {known} known occurrences; {count} issues; {sample:?}"
         );
@@ -2898,6 +2903,63 @@ mod tests {
             locations.iter().any(|location| location.uri == uri),
             "the known BSL occurrence must survive the incomplete metadata coverage: {locations:?}",
         );
+    }
+
+    #[test]
+    fn find_references_errors_when_partial_metadata_has_no_known_hits() {
+        use base_db::{SourceDatabase as _, SourceRoot, METADATA_SOURCE_ROOT};
+
+        let temp = tempfile::tempdir().expect("temp directory");
+        let xml_path = temp.path().join("Catalogs/Справочник1.xml");
+        std::fs::create_dir_all(xml_path.parent().unwrap()).expect("metadata directory");
+        let xml_text = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../bsl-metadata/fixtures/designer/Catalogs/Справочник1.xml"
+        ));
+        std::fs::write(&xml_path, xml_text).expect("metadata fixture");
+
+        let source =
+            "Процедура Тест()\n    Справочники.Справочник1.НайтиПоКоду(\"x\");\nКонецПроцедуры\n";
+        let source_path = temp.path().join("CommonModules/Тест/Ext/Module.bsl");
+        let uri = lsp_types::Url::from_file_path(&source_path).expect("source URI");
+        let mut state = create_test_state();
+        state.init_empty_source_root();
+        open_source(&mut state, &uri, source);
+
+        let xml_id = state.vfs.write().alloc_file_id(VfsPath::new(xml_path.clone()));
+        {
+            let db = state.analysis_host.raw_database_mut();
+            let mut metadata_files = vfs::file_set::FileSet::new();
+            metadata_files.insert(xml_id, VfsPath::new(xml_path));
+            db.set_source_root(METADATA_SOURCE_ROOT, SourceRoot::new_metadata(metadata_files));
+            db.set_file_source_root(xml_id, METADATA_SOURCE_ROOT);
+            db.set_file_text(xml_id, xml_text);
+            db.set_all_config_paths(vec![(None, temp.path().to_path_buf())], None);
+            db.set_metadata_listing(
+                &temp.path().to_string_lossy(),
+                ide_db::metadata::MetadataListingData::default(),
+            );
+        }
+
+        let line = source.lines().nth(1).expect("reference line");
+        let byte_offset = line.find("Справочник1").expect("metadata reference");
+        let character = line[..byte_offset].encode_utf16().count() as u32;
+        let mut ctx = latency_ctx(&state);
+        ctx.file_paths = FrozenFilePaths::freeze_database(ctx.analysis.database());
+        let result = handle_find_references(
+            &ctx,
+            ReferenceParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position { line: 1, character },
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: lsp_types::ReferenceContext { include_declaration: true },
+            },
+        );
+
+        assert!(result.is_err(), "empty partial metadata references must fail: {result:?}");
     }
 
     fn open_source(state: &mut GlobalState, uri: &lsp_types::Url, source: &str) {
