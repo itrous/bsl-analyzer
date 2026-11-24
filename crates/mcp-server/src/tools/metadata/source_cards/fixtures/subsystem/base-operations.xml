@@ -1,0 +1,11 @@
+<MetaDataObject>
+  <Subsystem uuid="00000000-0000-0000-0000-000000000011">
+    <Properties>
+      <Name>Operations</Name>
+      <ObjectBelonging>Own</ObjectBelonging>
+      <Content><Item>Catalog.Products</Item><Item>CommonCommand.Open</Item></Content>
+      <Picture>CommonPicture.BasePicture</Picture>
+    </Properties>
+    <ChildObjects><Subsystem>Rules</Subsystem></ChildObjects>
+  </Subsystem>
+</MetaDataObject>

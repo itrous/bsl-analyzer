@@ -1,0 +1,30 @@
+{
+  "native_donors": [
+    {
+      "fixture": "module-server.xml",
+      "native_source": ".artifacts/ba023/executor-platform-acceptance/work/D-base-canonical-probe-20261008/captured-hierarchical/CommonModules/УведомленияСервер.xml",
+      "sha256": "44e97b5c9ea4013982859bed98652d943753f7c9bbbc6599f001495677e181cb",
+      "transformation": "none; full native BOM/CRLF descriptor"
+    },
+    {
+      "fixture": "module-client.xml",
+      "native_source": ".artifacts/ba023/executor-platform-acceptance/work/D-base-canonical-probe-20261008/captured-hierarchical/CommonModules/ГлобальныйПоискКлиент.xml",
+      "sha256": "2b41711cdca063b4f30eb70afa0a77947d13ad646b7e6bfea6c05aed859eb2b7",
+      "transformation": "none; full native BOM/CRLF descriptor"
+    },
+    {
+      "fixture": "form-call.xml",
+      "native_source": ".artifacts/ba023/executor-platform-acceptance/work/D-base-canonical-probe-20261008/captured-hierarchical/CommonForms/Звонок.xml",
+      "sha256": "89ec4f0c6050e1a5f90dac68374732081e67d24d783c301301fcc5ac983d992b",
+      "transformation": "none; full native BOM/CRLF descriptor"
+    },
+    {
+      "fixture": "form-settings.xml",
+      "native_source": ".artifacts/ba023/executor-platform-acceptance/work/D-base-canonical-probe-20261008/captured-hierarchical/CommonForms/ОбщиеНастройки.xml",
+      "sha256": "8a86f961017c82cf2d9857b6d069f80e9b9fad39ae21b8412a7ee06ec074ab3e",
+      "transformation": "none; full native BOM/CRLF descriptor"
+    }
+  ],
+  "qualification": "historical native canonical load/update/dump in D canonical-metadata-receipt.json; no new native qualification",
+  "prepared_full_corpus": "../full-corpus copied byte-exact from prepared source-only ee2c packet; composed files remain NOT_NATIVE_VALIDATED"
+}

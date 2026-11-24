@@ -77,7 +77,7 @@ fn three_level_missing_mdo_reports_the_middle_segment() {
     Результат = Документы.НетТакогоДокумента.ПолучитьСсылку();
 КонецПроцедуры
 "#;
-    let (db, file_id) = setup(fixture);
+    let (db, file_id) = setup_with_designer_config(fixture, "/test.bsl");
     assert_eq!(
         unresolved_fields(&db, file_id),
         vec!["НетТакогоДокумента".to_string()],

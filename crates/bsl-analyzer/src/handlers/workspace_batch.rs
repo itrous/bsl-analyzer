@@ -200,6 +200,7 @@ pub fn spawn_workspace_batch(state: &mut GlobalState) {
 /// Whether the active sweep waits for the revision to move before its chunk is
 /// dispatched again — see [`WorkspaceBatchPlan::parked_at`].
 pub(crate) fn workspace_batch_parked(state: &GlobalState) -> bool {
+    let Ok(_read) = state.try_disk_read() else { return true };
     state
         .workspace_batch_plan
         .as_ref()
@@ -218,16 +219,35 @@ fn build_batch_plan(state: &mut GlobalState) -> Option<WorkspaceBatchPlan> {
         return None;
     }
 
+    let disk_read = match state.prepare_disk_read() {
+        Ok(read) => read,
+        Err(_) => {
+            state.workspace_batch_dirty = true;
+            return None;
+        }
+    };
+
     let ext_roots: Vec<PathBuf> = state
         .project
         .as_ref()
         .map(|p| p.extension_paths().iter().map(|(_, path)| path.clone()).collect())
         .unwrap_or_default();
 
-    let file_paths = {
-        let analysis = state.analysis_host.analysis();
-        FrozenFilePaths::freeze_database(analysis.database())
-    };
+    let (file_paths, dispatched) =
+        match salsa::Cancelled::catch(std::panic::AssertUnwindSafe(|| {
+            let analysis = state.analysis_host.analysis();
+            disk_read.register_cancel(analysis.database().cancellation_token());
+            (
+                FrozenFilePaths::freeze_database(analysis.database()),
+                DispatchStamp::of(analysis.database()),
+            )
+        })) {
+            Ok(captured) => captured,
+            Err(_) => {
+                state.workspace_batch_dirty = true;
+                return None;
+            }
+        };
 
     // In-scope closed files only: open buffers are owned by the interactive stream.
     // Sorted for a stable, log-friendly sweep order.
@@ -278,6 +298,7 @@ fn build_batch_plan(state: &mut GlobalState) -> Option<WorkspaceBatchPlan> {
 
     Some(WorkspaceBatchPlan {
         generation,
+        disk_epoch: disk_read.epoch(),
         file_ids: Arc::new(file_ids),
         file_paths,
         config: state.diagnostics_config().clone(),
@@ -293,7 +314,7 @@ fn build_batch_plan(state: &mut GlobalState) -> Option<WorkspaceBatchPlan> {
         mem_budget_mb: batch_mem_budget_mb(),
         chunks_since_trim: 0,
         chunk_retries: 0,
-        dispatched: DispatchStamp::of(state.analysis_host.analysis().database()),
+        dispatched,
         parked_at: None,
         started_at: Instant::now(),
         analysis_guard,
@@ -305,6 +326,13 @@ fn build_batch_plan(state: &mut GlobalState) -> Option<WorkspaceBatchPlan> {
 /// cache, and returns a [`Task::WorkspaceBatchChunk`]; the event loop applies the push,
 /// trims the LRU, and advances the cursor.
 fn dispatch_next_chunk(state: &mut GlobalState) {
+    let Ok(disk_read) = state.prepare_disk_read() else { return };
+    if state.workspace_batch_plan.as_ref().is_some_and(|plan| plan.disk_epoch != disk_read.epoch())
+    {
+        state.reset_workspace_batch();
+        state.mark_workspace_batch_dirty();
+        return;
+    }
     let (
         generation,
         chunk_index,
@@ -338,6 +366,7 @@ fn dispatch_next_chunk(state: &mut GlobalState) {
     };
 
     let analysis = state.analysis_host.analysis();
+    disk_read.register_cancel(analysis.database().cancellation_token());
     {
         let plan = state.workspace_batch_plan.as_mut().expect("plan present when dispatching");
         plan.dispatched = DispatchStamp::of(analysis.database());
@@ -357,7 +386,7 @@ fn dispatch_next_chunk(state: &mut GlobalState) {
             #[cfg(test)]
             g1_wait_at_batch_barrier(&analysis, cancellation_baseline);
             compute_chunk(
-                &analysis,
+                (&analysis,&disk_read),
                 &chunk,
                 &config,
                 (&diagnostics_baseline, workspace_root.as_deref()),
@@ -420,7 +449,7 @@ fn dispatch_next_chunk(state: &mut GlobalState) {
                 }
             },
         };
-        Task::WorkspaceBatchChunk { generation, outcome }
+        Task::DiskReadCompleted{epoch:disk_read.epoch(),task:Box::new(Task::WorkspaceBatchChunk { generation, outcome }),cancelled:Box::new(Task::WorkspaceBatchChunk{generation,outcome:WorkspaceBatchOutcome::Cancelled})}
     });
 
     if spawned.is_err() {
@@ -438,7 +467,7 @@ fn dispatch_next_chunk(state: &mut GlobalState) {
 /// the pull sweep), while a `salsa::Cancelled` — including `PendingWrite` for a file
 /// rewritten mid-sweep — keeps unwinding to abort the whole chunk, which is retried.
 fn compute_chunk(
-    analysis: &ide::Analysis,
+    (analysis, disk_read): (&ide::Analysis, &ide_host_core::WorkspaceDiskRead),
     chunk: &[vfs::FileId],
     config: &DiagnosticsConfigInput,
     baseline: (&ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot, Option<&Path>),
@@ -465,7 +494,12 @@ fn compute_chunk(
         .filter(|_| crate::diagnostics_baseline::defers_scope_line_gate(baseline.0, true));
     let config = config.clone().with_defer_scope_line_gate(late_scope.is_some());
     let computed = match pool {
-        Some(pool) => analysis.workspace_diagnostics_parallel(chunk, config, pool),
+        Some(pool) => analysis.workspace_diagnostics_parallel_with_cancellation(
+            chunk,
+            config,
+            pool,
+            |token| disk_read.register_cancel(token),
+        ),
         None => analysis.workspace_diagnostics(chunk, config),
     };
     computed
@@ -515,6 +549,42 @@ fn compute_chunk(
 #[cfg(test)]
 mod shared_owner_tests {
     use super::*;
+
+    #[test]
+    fn workspace_disk_background_batch_plan_rebuilds_after_epoch_changes() {
+        use base_db::{SourceDatabase, SourceRoot, BSL_SOURCE_ROOT};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("Closed.bsl");
+        let text = "Procedure Saved() EndProcedure";
+        std::fs::write(&path, text).unwrap();
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new(sender);
+        let mut project = project_model::Project::new(root.path()).unwrap();
+        project.config.features.workspace_diagnostics =
+            project_model::WorkspaceDiagnosticsScope::All;
+        state.project = Some(project);
+        state.workspace_root = Some(root.path().to_path_buf());
+        state.vfs_done = true;
+        let id = state.vfs.write().alloc_file_id(vfs::VfsPath::new(path.clone()));
+        let mut files = vfs::FileSet::new();
+        files.insert(id, vfs::VfsPath::new(path));
+        let db = state.analysis_host.raw_database_mut();
+        db.set_source_root(BSL_SOURCE_ROOT, SourceRoot::new_local(files));
+        db.set_file_source_root(id, BSL_SOURCE_ROOT);
+        db.set_file_revision_from_disk(id, base_db::content_revision(text));
+        let plan = build_batch_plan(&mut state).unwrap();
+        assert_eq!(plan.file_ids.as_ref(), &vec![id]);
+        state.workspace_batch_plan = Some(plan);
+        state
+            .workspace_disk_gate()
+            .begin_write(std::time::Duration::ZERO, &|| false)
+            .unwrap()
+            .finish();
+        dispatch_next_chunk(&mut state);
+        assert!(state.workspace_batch_plan.is_none());
+        assert!(state.workspace_batch_dirty);
+        assert!(!state.workspace_batch_in_flight);
+    }
     use crate::global_state::GlobalState;
     use crate::lsp::to_proto::{ClientTags, CodeDescriptions};
     use ide::Analysis;
@@ -634,7 +704,8 @@ mod shared_owner_tests {
         );
 
         let plan = build_batch_plan(&mut state).expect("enabled batch includes the owner file");
-        let expected_uri = lsp_types::Url::from_file_path(&closed_file).unwrap();
+        let expected_uri =
+            lsp_types::Url::from_file_path(std::fs::canonicalize(&closed_file).unwrap()).unwrap();
         assert_eq!(plan.file_ids.len(), 1);
         let file_id = plan.file_ids[0];
         assert_eq!(plan.file_paths.url_for_file_id(file_id).unwrap(), expected_uri);
@@ -643,7 +714,7 @@ mod shared_owner_tests {
         let owner_token = analysis.database().cancellation_token();
         state.workspace_batch_token = Some(owner_token.clone());
         let items = compute_chunk(
-            &analysis,
+            (&analysis, &state.try_disk_read().unwrap()),
             &[file_id],
             &plan.config,
             (&plan.diagnostics_baseline, plan.workspace_root.as_deref()),
@@ -771,11 +842,11 @@ mod shared_owner_tests {
             "the exact open URI binding survives parent and filename case changes after deletion"
         );
         assert_eq!(state.vfs_file_for_url(&alias_uri).unwrap(), file_id);
-        let snapshot = state.snapshot();
+        let snapshot = state.snapshot().unwrap();
         assert_eq!(snapshot.file_id_for_url(&alias_uri).unwrap(), file_id);
         state.open_files.remove(&file_id);
         assert!(
-            state.snapshot().file_id_for_url(&alias_uri).is_err(),
+            state.snapshot().unwrap().file_id_for_url(&alias_uri).is_err(),
             "an unadmitted buffer must not answer through its retained URI binding"
         );
         state.open_files.insert(file_id);
@@ -800,7 +871,7 @@ mod shared_owner_tests {
             "closed overlay is released"
         );
         assert!(
-            state.snapshot().file_id_for_url(&alias_uri).is_err(),
+            state.snapshot().unwrap().file_id_for_url(&alias_uri).is_err(),
             "the closed URI no longer has an active alias binding"
         );
         drop(state);
@@ -823,7 +894,7 @@ mod finality_tests {
         let plan = build_batch_plan(state).expect("the closed module is swept");
         let analysis = state.analysis_host.analysis();
         let mut items = compute_chunk(
-            &analysis,
+            (&analysis, &state.try_disk_read().unwrap()),
             &plan.file_ids,
             &plan.config,
             (&plan.diagnostics_baseline, plan.workspace_root.as_deref()),

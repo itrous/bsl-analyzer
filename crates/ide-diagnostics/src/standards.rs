@@ -69,6 +69,8 @@ pub fn standards(code: DiagnosticCode) -> &'static [u16] {
         DiagnosticCode::BadWords => &[],
         DiagnosticCode::DuplicateStringLiteral => &[],
         DiagnosticCode::DuplicateRegion => &[455],
+        DiagnosticCode::DuplicateInterception => &[],
+        DiagnosticCode::DuplicateMethodDeclaration => &[],
         DiagnosticCode::NonStandardRegion => &[455],
         DiagnosticCode::DuplicatedInsertionIntoCollection => &[],
         DiagnosticCode::ExcessiveAutoTestCheck => &[456],

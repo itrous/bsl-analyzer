@@ -1,0 +1,239 @@
+{
+  "status": "HISTORICAL_NATIVE_REFERENCE_PLUS_SOURCE_ONLY_OVERLAY_NOT_NEW_NATIVE_VALIDATION",
+  "source_ready_sha256": "62877cb0a21c7b5d2b1a39205c050e0a3514c18be9232ea91be3786ddc94689f",
+  "source": ".artifacts/resolve-outstanding-implementation-20261107/final-acceptance/metadata-rename-native-corpus-preparation-20261111/operator-v1/reference-composition",
+  "files": [
+    {
+      "path": "base/Catalogs/BA023Catalog/Ext/ManagerModule.bsl",
+      "sha256": "167db4967d59ea22d2babe9899937bd17300e86e1c9386a39dca26e813e2f7c3",
+      "bytes": 153
+    },
+    {
+      "path": "base/Catalogs/BA023Catalog/Ext/ObjectModule.bsl",
+      "sha256": "167db4967d59ea22d2babe9899937bd17300e86e1c9386a39dca26e813e2f7c3",
+      "bytes": 153
+    },
+    {
+      "path": "base/Catalogs/BA023Catalog.xml",
+      "sha256": "6127e18a4cac141e70eaec274451e48ce7dd95a089fe1af33920363d748e1223",
+      "bytes": 4498
+    },
+    {
+      "path": "base/Catalogs/BA252Other.xml",
+      "sha256": "2fba411c3fa77fadb1150c066deedc25ade8f035387f88a6ff262157be817df4",
+      "bytes": 6014
+    },
+    {
+      "path": "base/Catalogs/BA252Partners/Templates/BA252Layout/Ext/Template.xml",
+      "sha256": "508a8b19b7a094186ba9da6e39be8b2e1f8e4811f281615d0145c5733c2a9289",
+      "bytes": 1268
+    },
+    {
+      "path": "base/Catalogs/BA252Partners/Templates/BA252Layout.xml",
+      "sha256": "faee606f3c726bc95d67387059c04fea2e3b2b154e8365136fbb3a9364b85366",
+      "bytes": 1316
+    },
+    {
+      "path": "base/Catalogs/BA252Partners.xml",
+      "sha256": "41f5509e40df9a3c3e38ad865449ad5b5e0d8b041ac531d86e98f210e9dbe79a",
+      "bytes": 6075
+    },
+    {
+      "path": "base/CommonForms/BA023Managed/Ext/Form/Module.bsl",
+      "sha256": "77d5db9edb81a17aacf0cb39a2a6ced0d31e744f1a61a541d9c13e0a1bb196ca",
+      "bytes": 248
+    },
+    {
+      "path": "base/CommonForms/BA023Managed/Ext/Form.xml",
+      "sha256": "c0823b2d0c48ce4af807a93a1c0ac449f7fe182f5fb31a6a72602ca8a6bdce83",
+      "bytes": 1031
+    },
+    {
+      "path": "base/CommonForms/BA023Managed.xml",
+      "sha256": "a5a9fae83d75d8bc33da5c6679c0265097f5da0be281e51782f457285bb545d9",
+      "bytes": 1496
+    },
+    {
+      "path": "base/CommonForms/BA023Ordinary.xml",
+      "sha256": "3d921d840a89d9634cd1afa232f0b10b14d260e7e7453f54a4a2e4cc376a2e27",
+      "bytes": 1498
+    },
+    {
+      "path": "base/CommonForms/BA252Card/Ext/Form.xml",
+      "sha256": "2ed2f0dfbe9f0a74e054bffa55e385a5c4d6ec3d1a8830f718317e8ae2af39ed",
+      "bytes": 2255
+    },
+    {
+      "path": "base/CommonForms/BA252Card.xml",
+      "sha256": "bcfca74aea36f6592a7130c2ab501fad0509cf186b39a51507b51a4786b202cf",
+      "bytes": 1610
+    },
+    {
+      "path": "base/CommonModules/BA023Common/Ext/Module.bsl",
+      "sha256": "fe899c27726567a534d9af9f0d7df2f220225a01913ef6b2233447f5b2ef229f",
+      "bytes": 92
+    },
+    {
+      "path": "base/CommonModules/BA023Common.xml",
+      "sha256": "5b33e9ca1e40aeca42f92662e8f6e3e82073f96c2a70a5077aa67baae7c9b519",
+      "bytes": 1451
+    },
+    {
+      "path": "base/CommonModules/BA252References/Ext/Module.bsl",
+      "sha256": "4faf9066366522ed2a70e9141099945473b6e5a2c76a8b988657c041f23fffcc",
+      "bytes": 718
+    },
+    {
+      "path": "base/CommonModules/BA252References.xml",
+      "sha256": "0664604e55205e95c2752d84bad33ee7d0a56b7e07cca28f73d9b40721e3fd6d",
+      "bytes": 1599
+    },
+    {
+      "path": "base/ConfigDumpInfo.xml",
+      "sha256": "c3f589ee0bddea6133aad68d767287691947432f1d4e4dbff2bf62ff076e1f99",
+      "bytes": 2286
+    },
+    {
+      "path": "base/Configuration.xml",
+      "sha256": "23db27f76cadb0f8ac06a6ebc73f81c3ae7eeb9a45d49fd5abe369046bf1c092",
+      "bytes": 10690
+    },
+    {
+      "path": "base/Documents/BA095Document/Ext/ManagerModule.bsl",
+      "sha256": "142fea202c2a25f8c4b52c689e841307e0fde0458316dcb590bce52d19ed6780",
+      "bytes": 143
+    },
+    {
+      "path": "base/Documents/BA095Document/Ext/ObjectModule.bsl",
+      "sha256": "c38f51a88badd37d7c9de4ceca88310b7805e5e3d508ee59788bf88a2ddc3b27",
+      "bytes": 408
+    },
+    {
+      "path": "base/Documents/BA095Document.xml",
+      "sha256": "545afc3e9fb6827d12c304fdee2409d3d1b20c4c89521aec4b860abb2bef6823",
+      "bytes": 4230
+    },
+    {
+      "path": "base/ExchangePlans/BA252Exchange/Ext/Content.xml",
+      "sha256": "15770681a43d587a7243afa8be31eea1c4160150aca535120152a28047213792",
+      "bytes": 484
+    },
+    {
+      "path": "base/ExchangePlans/BA252Exchange.xml",
+      "sha256": "fe1659c72db9dda0692c3ebdc69de1995e02f79e48fa4ec027bb5e4e7c8a98ec",
+      "bytes": 12511
+    },
+    {
+      "path": "base/Ext/CommandInterface.xml",
+      "sha256": "53d958e79b08c735cda43f7c3634ab195ee4170486cfd2a8e86ebd9602ec8515",
+      "bytes": 980
+    },
+    {
+      "path": "base/Languages/English.xml",
+      "sha256": "f13c5dea7763803d0218ee31d2e0d45d5abba4fd088ec83509f8fe33494b6ad1",
+      "bytes": 1237
+    },
+    {
+      "path": "extension/Catalogs/BA023Catalog/Ext/ManagerModule.bsl",
+      "sha256": "0847cd9a5a3d27b30ededa59ab556820d4c95c92bd94ad120a30e8fb02faef99",
+      "bytes": 162
+    },
+    {
+      "path": "extension/Catalogs/BA023Catalog/Ext/ObjectModule.bsl",
+      "sha256": "23390d615ad08c211a7df9b06bcd357dcc41cb4e37a110fc2bc21934969d6d8c",
+      "bytes": 133
+    },
+    {
+      "path": "extension/Catalogs/BA023Catalog.xml",
+      "sha256": "0348b3719b73c5a67552a532a22a6ecb3d5dbbef0f8a76bf47e424b17ebac23a",
+      "bytes": 3972
+    },
+    {
+      "path": "extension/Catalogs/BA252Partners.xml",
+      "sha256": "2384e80b21d6114f6b92e1a758854cc8d01eecf5305c78f86907d4ca1e0c76fb",
+      "bytes": 2441
+    },
+    {
+      "path": "extension/CommonForms/BA023_ExtManaged/Ext/Form/Module.bsl",
+      "sha256": "d767b809efa8300212ae3664280f91274017e455bcfe3e80eda67f1099f2124e",
+      "bytes": 260
+    },
+    {
+      "path": "extension/CommonForms/BA023_ExtManaged/Ext/Form.xml",
+      "sha256": "c0823b2d0c48ce4af807a93a1c0ac449f7fe182f5fb31a6a72602ca8a6bdce83",
+      "bytes": 1031
+    },
+    {
+      "path": "extension/CommonForms/BA023_ExtManaged.xml",
+      "sha256": "13b0dbc1a002cee56ec0c0280dcdf0bdba32507255adc32ef9b53d7dce95c863",
+      "bytes": 1500
+    },
+    {
+      "path": "extension/CommonForms/BA023_ExtOrdinary.xml",
+      "sha256": "2c8710f9fd9528982cde011e01862b6ee4313a55ea52c870d41e1deccfb0f1c6",
+      "bytes": 1502
+    },
+    {
+      "path": "extension/CommonForms/BA252OverlayCard/Ext/Form.xml",
+      "sha256": "2ed2f0dfbe9f0a74e054bffa55e385a5c4d6ec3d1a8830f718317e8ae2af39ed",
+      "bytes": 2255
+    },
+    {
+      "path": "extension/CommonForms/BA252OverlayCard.xml",
+      "sha256": "3d3521cdba699f7ed9dc7b172999b95c6c7e0bc80a4ef66a55d04d51c27b97a5",
+      "bytes": 1624
+    },
+    {
+      "path": "extension/CommonModules/BA023_Extra/Ext/Module.bsl",
+      "sha256": "a0eb2b7c2bb840b5156ae376e4988e0894f9928ee15030972256fec91218d48d",
+      "bytes": 98
+    },
+    {
+      "path": "extension/CommonModules/BA023_Extra.xml",
+      "sha256": "d9bd8ead9530a4459eb483b5af5e83d242a35ba47657054bc89b4a66152a1bc8",
+      "bytes": 1454
+    },
+    {
+      "path": "extension/CommonModules/BA252OverlayReferences/Ext/Module.bsl",
+      "sha256": "4faf9066366522ed2a70e9141099945473b6e5a2c76a8b988657c041f23fffcc",
+      "bytes": 718
+    },
+    {
+      "path": "extension/CommonModules/BA252OverlayReferences.xml",
+      "sha256": "29c100b87e985348280202d00edec0ac0a4d5d90ed194668f76a3e0289aae9c1",
+      "bytes": 1606
+    },
+    {
+      "path": "extension/ConfigDumpInfo.xml",
+      "sha256": "9f2e7bb0cf82388ac8dce0d24a949da5209e297994f3b536bb6cb376bafd08ae",
+      "bytes": 2439
+    },
+    {
+      "path": "extension/Configuration.xml",
+      "sha256": "b574660f2440c3ebd4357a5b16c3dfc80ff3b68373a31a65ee39483041321acd",
+      "bytes": 3566
+    },
+    {
+      "path": "extension/Documents/BA095Document/Ext/ManagerModule.bsl",
+      "sha256": "7a46c064a99e73c1c8f6455ce4003267159884f68c5308503dd2124c54d998b5",
+      "bytes": 168
+    },
+    {
+      "path": "extension/Documents/BA095Document/Ext/ObjectModule.bsl",
+      "sha256": "2475c4336076d6dd3671a29a2e7ada0bfc06d9be6ac043078e06ff5d3d01a120",
+      "bytes": 611
+    },
+    {
+      "path": "extension/Documents/BA095Document.xml",
+      "sha256": "1378db9c53b69878eb93acdb9e7aadc0279e40923fba7140162011affc9f4fca",
+      "bytes": 2724
+    },
+    {
+      "path": "extension/Roles/ОсновнаяРоль.xml",
+      "sha256": "036b0068186545b787fdb229a36bb49445967038e04f97f9fae22741ea104fd7",
+      "bytes": 1098
+    }
+  ],
+  "scope": "all46files preserved,32XMLpreflight;14BSLnotrun",
+  "normalizations": "none: byte-exact copy"
+}

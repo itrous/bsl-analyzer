@@ -1,6 +1,7 @@
 pub(crate) mod check_executor;
 pub mod debug;
 pub mod diagnostics;
+mod epf_module_check;
 pub mod event_log;
 pub mod execution;
 pub mod file_request;
