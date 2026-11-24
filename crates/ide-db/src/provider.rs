@@ -27,6 +27,14 @@ pub struct VisibleConfigWithRoot {
 pub trait AnalysisProvider {
     fn configuration(&self) -> Option<Arc<Configuration>>;
 
+    /// Propagate cancellation while a consumer is traversing already-computed facts.
+    fn check_cancellation(&self) {}
+
+    /// Whether the HIR semantic facade serves a platform-help snapshot.
+    fn platform_help_available(&self) -> bool {
+        hir::platform_help_available()
+    }
+
     fn visible_configurations(&self, _file_id: FileId) -> Vec<VisibleConfigWithRoot> {
         self.configuration()
             .map(|cfg| {
@@ -130,6 +138,15 @@ pub trait AnalysisProvider {
         _methods: &[MethodId],
     ) -> bool {
         false
+    }
+
+    fn notify_methods_exported_in_registrations(
+        &self,
+        _file_id: FileId,
+        _methods: &[MethodId],
+        _registrations: &[&NotifyReg],
+    ) -> rustc_hash::FxHashSet<MethodId> {
+        rustc_hash::FxHashSet::default()
     }
 
     /// Whether same-named local methods provide an exported callback in each

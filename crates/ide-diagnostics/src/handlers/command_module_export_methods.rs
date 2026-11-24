@@ -2,6 +2,7 @@ use crate::define_metadata;
 use crate::metadata::*;
 use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
 use ide_db::TextRange;
+use rustc_hash::FxHashMap;
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
     diagnostic_type: DiagnosticType::CodeSmell,
@@ -19,12 +20,11 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
 
 pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     let code = DiagnosticCode::CommandModuleExportMethods;
-    let platform = bsl_platform::PlatformData::instance();
 
     // Without a served platform snapshot no constructor knowledge can distinguish an
     // ordinary export from a handler the platform calls by name, so silence is the only
     // safe verdict. A partial snapshot still identifies ordinary exports.
-    if ctx.is_disabled_with_metadata(code) || platform.help_origin().is_none() {
+    if ctx.is_disabled_with_metadata(code) || !ctx.platform_help_available() {
         return Vec::new();
     }
 
@@ -40,77 +40,122 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     let symbol_tree = ctx.symbol_tree();
     let mut diagnostics = Vec::new();
 
-    for (_, proc) in item_tree.procedures() {
-        if proc.is_export
-            && !registered_on_this_object(
-                ctx,
-                &candidates,
-                &proc.name,
-                hir::MethodId { module, local_id: proc.key },
-                &symbol_tree,
-            )
-        {
-            diagnostics.push(make_diagnostic(proc.name_range, code, ctx));
+    let mut candidates_by_name: FxHashMap<hir::Name, Vec<&hir::NotifyCandidate>> =
+        FxHashMap::default();
+    let mut has_reachable_incomplete_candidate = false;
+    for (index, candidate) in candidates.iter().enumerate() {
+        if index & 0xff == 0 {
+            ctx.check_cancellation();
+        }
+        has_reachable_incomplete_candidate |=
+            candidate.site_reachable && candidate.analysis_incomplete;
+        candidates_by_name
+            .entry(hir::normalize_match_name(&candidate.callback_name))
+            .or_default()
+            .push(candidate);
+    }
+    // A reachable incomplete registration may name any local method, so no export can
+    // safely be classified as unregistered.
+    if has_reachable_incomplete_candidate {
+        return Vec::new();
+    }
+
+    let mut methods_by_name: FxHashMap<hir::Name, Vec<hir::MethodId>> = FxHashMap::default();
+    let mut exemptions_by_name: FxHashMap<hir::Name, LocalHandlerExemptions> = FxHashMap::default();
+    for (index, (_, proc)) in item_tree.procedures().enumerate() {
+        if index & 0xff == 0 {
+            ctx.check_cancellation();
+        }
+        if proc.is_export {
+            let key = hir::normalize_match_name(&proc.name);
+            let methods = methods_by_name.entry(key.clone()).or_insert_with(|| {
+                symbol_tree.find_methods(&proc.name).into_iter().map(|method| method.id).collect()
+            });
+            let exemptions = exemptions_by_name.entry(key.clone()).or_insert_with(|| {
+                local_handler_exemptions(
+                    ctx,
+                    candidates_by_name.get(&key).map_or(&[], Vec::as_slice),
+                    methods,
+                )
+            });
+            if !exemptions.protects(hir::MethodId { module, local_id: proc.key }) {
+                diagnostics.push(make_diagnostic(proc.name_range, code, ctx));
+            }
         }
     }
 
-    for (_, func) in item_tree.functions() {
-        if func.is_export
-            && !registered_on_this_object(
-                ctx,
-                &candidates,
-                &func.name,
-                hir::MethodId { module, local_id: func.key },
-                &symbol_tree,
-            )
-        {
-            diagnostics.push(make_diagnostic(func.name_range, code, ctx));
+    for (index, (_, func)) in item_tree.functions().enumerate() {
+        if index & 0xff == 0 {
+            ctx.check_cancellation();
+        }
+        if func.is_export {
+            let key = hir::normalize_match_name(&func.name);
+            let methods = methods_by_name.entry(key.clone()).or_insert_with(|| {
+                symbol_tree.find_methods(&func.name).into_iter().map(|method| method.id).collect()
+            });
+            let exemptions = exemptions_by_name.entry(key.clone()).or_insert_with(|| {
+                local_handler_exemptions(
+                    ctx,
+                    candidates_by_name.get(&key).map_or(&[], Vec::as_slice),
+                    methods,
+                )
+            });
+            if !exemptions.protects(hir::MethodId { module, local_id: func.key }) {
+                diagnostics.push(make_diagnostic(func.name_range, code, ctx));
+            }
         }
     }
 
     diagnostics
 }
 
-// A normalized ThisObject registration can prove a reference. An unresolved dynamic
-// constructor also prevents a negative verdict when its syntax names this handler.
-fn registered_on_this_object(
-    ctx: &DiagnosticsContext,
-    candidates: &[hir::NotifyCandidate],
-    name: &hir::Name,
-    method: hir::MethodId,
-    symbol_tree: &hir::SymbolTree,
-) -> bool {
-    if candidates.iter().any(|candidate| candidate.site_reachable && candidate.analysis_incomplete)
-    {
-        return true;
+#[derive(Default)]
+struct LocalHandlerExemptions {
+    registered_methods: rustc_hash::FxHashSet<hir::MethodId>,
+    syntax_protected: bool,
+}
+
+impl LocalHandlerExemptions {
+    fn protects(&self, method: hir::MethodId) -> bool {
+        self.syntax_protected || self.registered_methods.contains(&method)
     }
-    let methods =
-        symbol_tree.find_methods(name).into_iter().map(|method| method.id).collect::<Vec<_>>();
+}
+
+// Registration environments are combined here, but method export/environment semantics stay
+// in HIR: the semantic facade computes the eligible method set in one pass per name.
+fn local_handler_exemptions(
+    ctx: &DiagnosticsContext,
+    matching: &[&hir::NotifyCandidate],
+    methods: &[hir::MethodId],
+) -> LocalHandlerExemptions {
     if methods.is_empty() {
-        return false;
+        return LocalHandlerExemptions::default();
     }
 
-    let matching = candidates
-        .iter()
-        .filter(|candidate| candidate.callback_name.eq_ignore_case(name))
-        .collect::<Vec<_>>();
-    if matching.iter().any(|candidate| {
-        candidate.receiver == hir::NotifyCandidateReceiver::ThisObject
-            && candidate.registration.as_ref().is_some_and(|registration| {
-                ctx.notify_method_is_exported_in_registration(registration, method, &methods)
-            })
-    }) {
-        return true;
-    }
-    // Syntax-only candidates and unresolved dynamic arrays are conservative; only a proven
-    // foreign receiver at this exact expression can rule them out. A resolved ThisObject
-    // registration must not fall back after its environment verdict was negative.
-    matching.iter().any(|candidate| {
-        candidate.site_reachable
+    let mut registrations = Vec::new();
+    let mut syntax_protected = false;
+    for (index, candidate) in matching.iter().enumerate() {
+        if index & 0xff == 0 {
+            ctx.check_cancellation();
+        }
+        if candidate.receiver == hir::NotifyCandidateReceiver::ThisObject {
+            if let Some(registration) = candidate.registration.as_ref() {
+                registrations.push(registration);
+            }
+        }
+        // Syntax-only candidates and unresolved dynamic arrays are conservative; only a
+        // proven foreign receiver at this exact expression can rule them out. A resolved
+        // ThisObject registration must not fall back after its environment verdict was negative.
+        syntax_protected |= candidate.site_reachable
             && candidate.protects_local_method
             && (candidate.registration.is_none()
-                || candidate.receiver == hir::NotifyCandidateReceiver::Unknown)
-    })
+                || candidate.receiver == hir::NotifyCandidateReceiver::Unknown);
+    }
+
+    LocalHandlerExemptions {
+        registered_methods: ctx.notify_methods_exported_in_registrations(methods, &registrations),
+        syntax_protected,
+    }
 }
 
 fn make_diagnostic(range: TextRange, code: DiagnosticCode, ctx: &DiagnosticsContext) -> Diagnostic {
@@ -214,6 +259,62 @@ mod tests {
 "#;
 
     #[test]
+    fn many_distinct_callback_names_keep_their_own_export_exemption() {
+        let mut code = String::new();
+        for index in 0..64 {
+            code.push_str(&format!(
+                "&НаКлиенте\nПроцедура Зарегистрировать{index}()\n    О = Новый ОписаниеОповещения(\"Обработчик{index}\", ЭтотОбъект);\nКонецПроцедуры\n\n&НаКлиенте\nПроцедура Обработчик{index}() Экспорт\nКонецПроцедуры\n\n"
+            ));
+        }
+        code.push_str("Процедура ОбычныйЭкспорт() Экспорт\nКонецПроцедуры\n");
+
+        let diagnostics = check_command_at(&code);
+        let reported = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::CommandModuleExportMethods)
+            .collect::<Vec<_>>();
+        assert_eq!(reported.len(), 1, "only the unrelated export is reported: {reported:#?}");
+        let start: usize = reported[0].range.start().into();
+        let end: usize = reported[0].range.end().into();
+        assert_eq!(&code[start..end], "ОбычныйЭкспорт");
+    }
+
+    #[test]
+    fn repeated_conditional_handlers_and_registrations_share_one_semantic_pass() {
+        let mut code = String::new();
+        for index in 0..48 {
+            code.push_str(&format!(
+                "&НаКлиенте\nПроцедура Регистрация{index}()\n    О = Новый ОписаниеОповещения(\"ПовторныйОбработчик\", ЭтотОбъект);\nКонецПроцедуры\n\n"
+            ));
+        }
+        for _ in 0..48 {
+            code.push_str(
+                "#Если Сервер Тогда\n&НаСервере\nПроцедура ПовторныйОбработчик() Экспорт\nКонецПроцедуры\n#Иначе\n&НаКлиенте\nПроцедура ПовторныйОбработчик() Экспорт\nКонецПроцедуры\n#КонецЕсли\n\n",
+            );
+        }
+        code.push_str("Процедура ОбычныйЭкспорт() Экспорт\nКонецПроцедуры\n");
+
+        let diagnostics = check_command_at(&code);
+        let reported = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::CommandModuleExportMethods)
+            .collect::<Vec<_>>();
+        let repeated_handlers = reported
+            .iter()
+            .filter(|diagnostic| {
+                let start: usize = diagnostic.range.start().into();
+                let end: usize = diagnostic.range.end().into();
+                &code[start..end] == "ПовторныйОбработчик"
+            })
+            .count();
+        assert_eq!(
+            repeated_handlers, 48,
+            "only the server-side conditional declarations are unregistered: {reported:#?}"
+        );
+        assert_eq!(reported.len(), 49, "the unrelated export is still reported");
+    }
+
+    #[test]
     fn test_exported_procedure_and_function_detected() {
         let diagnostics = check_at(OBJECT_COMMAND, EXPORTED);
         expect![[r#"
@@ -234,6 +335,7 @@ mod tests {
             let symbol_tree = ctx.symbol_tree();
             let methods = symbol_tree.find_methods(&name);
             let method = methods.first().expect("exported callback method").id;
+            let method_ids = methods.iter().map(|method| method.id).collect::<Vec<_>>();
             let constructor_range = TextRange::new(0.into(), 10.into());
             let foreign_callback_expr = hir::ExprId::from_raw(0.into());
             let unknown_callback_expr = hir::ExprId::from_raw(1.into());
@@ -275,26 +377,21 @@ mod tests {
                 analysis_incomplete: false,
                 registration: None,
             };
-            let site_is_not_disproved_by_other_slot = registered_on_this_object(
+            let site_is_not_disproved_by_other_slot = local_handler_exemptions(
                 ctx,
-                &[foreign_candidate.clone(), unknown_candidate],
-                &name,
-                method,
-                &symbol_tree,
-            );
+                &[&foreign_candidate, &unknown_candidate],
+                &method_ids,
+            )
+            .protects(method);
             assert!(
                 site_is_not_disproved_by_other_slot,
                 "a foreign receiver in slot 1 must not prove an unknown slot 2"
             );
 
             // The exact same foreign receiver does disprove that particular slot.
-            assert!(!registered_on_this_object(
-                ctx,
-                &[foreign_candidate],
-                &name,
-                method,
-                &symbol_tree,
-            ));
+            assert!(
+                !local_handler_exemptions(ctx, &[&foreign_candidate], &method_ids).protects(method)
+            );
             Vec::new()
         });
     }

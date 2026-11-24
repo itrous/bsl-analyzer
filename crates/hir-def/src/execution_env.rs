@@ -581,22 +581,42 @@ pub fn conditional_env_for_node(
     tree: &crate::conditional_tree::ConditionalTree,
     node: Option<crate::conditional_tree::ConditionalIdx>,
 ) -> (EnvFlags, EnvFlags) {
+    conditional_env_for_node_with_work(tree, node, &mut || true)
+        .unwrap_or((EnvFlags::EMPTY, EnvFlags::ALL))
+}
+
+/// Bounded counterpart to [`conditional_env_for_node`]. `spend` is called for each
+/// conditional node and each sibling branch inspected; `None` means the caller's
+/// work budget was exhausted before the environment could be established.
+pub fn conditional_env_for_node_with_work(
+    tree: &crate::conditional_tree::ConditionalTree,
+    node: Option<crate::conditional_tree::ConditionalIdx>,
+    spend: &mut dyn FnMut() -> bool,
+) -> Option<(EnvFlags, EnvFlags)> {
     let mut env = EnvFlags::ALL;
     let mut possible = EnvFlags::ALL;
     let mut cur = node;
     while let Some(idx) = cur {
+        if !spend() {
+            return None;
+        }
         let chain_if = match tree.conditional(idx).kind {
             ConditionalKind::If => idx,
             // ElsIf/Else clauses always point at their chain's `If`.
             ConditionalKind::ElsIf | ConditionalKind::Else => match tree.parent(idx) {
                 Some(parent) => parent,
-                None => return (EnvFlags::EMPTY, EnvFlags::ALL),
+                None => return Some((EnvFlags::EMPTY, EnvFlags::ALL)),
             },
         };
 
         let mut remaining = EnvFlags::ALL;
         let mut possible_remaining = EnvFlags::ALL;
-        for branch in tree.all_branches(chain_if) {
+        for branch in
+            std::iter::once(chain_if).chain(tree.conditional(chain_if).siblings.iter().copied())
+        {
+            if !spend() {
+                return None;
+            }
             let data = tree.conditional(branch);
             let (branch_env, branch_possible) = match data.kind {
                 ConditionalKind::If | ConditionalKind::ElsIf => {
@@ -619,7 +639,7 @@ pub fn conditional_env_for_node(
         }
         cur = tree.parent(chain_if);
     }
-    (env, possible.without(env))
+    Some((env, possible.without(env)))
 }
 
 fn is_compilation_directive(kind: &AnnotationKind) -> bool {

@@ -1277,7 +1277,7 @@ fn dynamic_notify_function_form_uses_only_proven_local_array_state() {
 }
 
 #[test]
-fn unavailable_notify_regs_preserve_previous_signature_exemptions() {
+fn impossible_notify_regs_do_not_protect_signatures_but_other_builds_do() {
     const CALLER: &str = "CommonModules/Caller/Ext/Module.bsl";
     const SOURCE: &str = r#"
 &НаКлиентеНаСервере
@@ -1388,8 +1388,8 @@ fn unavailable_notify_regs_preserve_previous_signature_exemptions() {
         .iter()
         .filter(|diagnostic| diagnostic.code == crate::DiagnosticCode::UnusedParameters)
         .collect();
-    assert_eq!(unused_parameters.len(), 3, "{diagnostics:#?}");
-    for name in ["ЧужойПараметр", "ЧужойПараметрОшибки", "ОбычныйПараметр"]
+    assert_eq!(unused_parameters.len(), 4, "{diagnostics:#?}");
+    for name in ["МёртвыйПараметр", "ЧужойПараметр", "ЧужойПараметрОшибки", "ОбычныйПараметр"]
     {
         assert!(
             unused_parameters.iter().any(|d| d.message.contains(&format!("\"{name}\""))),
@@ -1514,4 +1514,34 @@ fn unread_form_metadata_never_proves_the_form_is_managed() {
         let diagnostics = form_with_unread_dialog(false, false, malformed);
         assert!(diagnostics.is_empty(), "the base form kind is also unknown: {diagnostics:#?}");
     }
+}
+
+/// Repeated same-name same-environment local registrations reuse one verdict instead of
+/// repeating the declaration-environment pass per candidate, while every registration
+/// site keeps its own spelling in the message: a case-variant spelling shares the
+/// verdict and still reports under its own name.
+#[test]
+fn repeated_local_registrations_share_one_verdict_and_keep_site_spellings() {
+    let mut source = String::new();
+    for index in 0..48 {
+        source.push_str(&format!(
+            "&НаКлиенте\nПроцедура Регистрация{index}()\n    О{index} = Новый ОписаниеОповещения(\"Провал\", ЭтотОбъект);\nКонецПроцедуры\n\n"
+        ));
+    }
+    source.push_str("&НаКлиенте\nПроцедура Последняя()\n    О = Новый ОписаниеОповещения(\"провал\", ЭтотОбъект);\nКонецПроцедуры\n\n&НаКлиенте\nПроцедура Провал()\nКонецПроцедуры\n");
+
+    let diagnostics = run_in_command_module(&source, |_, ctx| missing_notify_handler::check(ctx));
+    let missing = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == crate::DiagnosticCode::MissingNotifyHandler)
+        .collect::<Vec<_>>();
+    assert_eq!(missing.len(), 49, "one verdict per registration site: {missing:#?}");
+    assert!(missing.iter().all(|diagnostic| diagnostic.message.starts_with("Добавьте")));
+    let canonical = missing.iter().filter(|d| d.message.contains("\"Провал\"")).count();
+    let lowercase = missing.iter().filter(|d| d.message.contains("\"провал\"")).count();
+    assert_eq!(
+        (canonical, lowercase),
+        (48, 1),
+        "site spellings survive the shared verdict: {missing:#?}"
+    );
 }

@@ -72,6 +72,16 @@ impl<'a> DiagnosticsContext<'a> {
         self.query(|p| p.notify_candidates(self.file_id))
     }
 
+    /// Propagate cancellation while traversing facts already returned by a semantic query.
+    pub fn check_cancellation(&self) {
+        self.query(|p| p.check_cancellation())
+    }
+
+    /// Whether the semantic provider serves platform-help data.
+    pub fn platform_help_available(&self) -> bool {
+        self.query(|p| p.platform_help_available())
+    }
+
     pub fn item_tree(&self) -> Arc<hir::ItemTree> {
         self.query(|p| p.item_tree(self.file_id))
     }
@@ -366,14 +376,13 @@ impl<'a> AnalysisContext<'a> {
         self.query(|p| p.qualified_method_declarations(self.file_id, module_name, method_name))
     }
 
-    pub(crate) fn notify_method_is_exported_in_registration(
+    pub(crate) fn notify_methods_exported_in_registrations(
         &self,
-        registration: &hir::call_graph::NotifyReg,
-        method: hir::MethodId,
         methods: &[hir::MethodId],
-    ) -> bool {
+        registrations: &[&hir::call_graph::NotifyReg],
+    ) -> rustc_hash::FxHashSet<hir::MethodId> {
         self.query(|p| {
-            p.notify_method_is_exported_in_registration(self.file_id, registration, method, methods)
+            p.notify_methods_exported_in_registrations(self.file_id, methods, registrations)
         })
     }
 

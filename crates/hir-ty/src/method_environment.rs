@@ -1,6 +1,7 @@
 use hir_def::call_graph::NotifyReg;
 use hir_def::execution_env::{self, EnvFlags, EnvOptions};
 use hir_def::MethodId;
+use rustc_hash::FxHashSet;
 
 use crate::db::HirDatabase;
 
@@ -80,6 +81,38 @@ pub fn notify_method_is_exported_in_registration(
         && db.interface_method(method).is_some_and(|declaration| declaration.is_export)
         && possible_method_env(db, method, &db.env_options())
             .is_some_and(|environment| environment.intersects(registration.environments.possible))
+}
+
+/// The methods that provide exported handlers in any supplied registration environment.
+///
+/// The HIR identifiers and declaration environments are evaluated once per method; registrations
+/// sharing a callback name are combined through their possible environments.
+pub fn notify_methods_exported_in_registrations(
+    db: &dyn HirDatabase,
+    methods: &[MethodId],
+    registrations: &[&NotifyReg],
+) -> FxHashSet<MethodId> {
+    let mut environments = EnvFlags::EMPTY;
+    for (index, registration) in registrations.iter().enumerate() {
+        if index & 0xff == 0 {
+            db.unwind_if_revision_cancelled();
+        }
+        environments = environments.union(registration.environments.possible);
+    }
+    let options = db.env_options();
+    let mut exported = FxHashSet::default();
+    for (index, &method) in methods.iter().enumerate() {
+        if index & 0xff == 0 {
+            db.unwind_if_revision_cancelled();
+        }
+        if db.interface_method(method).is_some_and(|declaration| declaration.is_export)
+            && possible_method_env(db, method, &options)
+                .is_some_and(|environment| environment.intersects(environments))
+        {
+            exported.insert(method);
+        }
+    }
+    exported
 }
 
 /// Checks conditional declarations in common-module bodies against the registration's

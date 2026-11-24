@@ -92,6 +92,10 @@ impl<'db> SalsaProvider<'db> {
 }
 
 impl AnalysisProvider for SalsaProvider<'_> {
+    fn check_cancellation(&self) {
+        salsa::Database::unwind_if_revision_cancelled(self.db);
+    }
+
     fn notify_method_is_exported_in_registration(
         &self,
         _file_id: FileId,
@@ -100,6 +104,15 @@ impl AnalysisProvider for SalsaProvider<'_> {
         methods: &[hir::MethodId],
     ) -> bool {
         hir::notify_method_is_exported_in_registration(self.db, registration, method, methods)
+    }
+
+    fn notify_methods_exported_in_registrations(
+        &self,
+        _file_id: FileId,
+        methods: &[hir::MethodId],
+        registrations: &[&hir::call_graph::NotifyReg],
+    ) -> rustc_hash::FxHashSet<hir::MethodId> {
+        hir::notify_methods_exported_in_registrations(self.db, methods, registrations)
     }
 
     fn configuration(&self) -> Option<Arc<Configuration>> {

@@ -54,6 +54,11 @@ impl<'a> PlatformNameEntry<'a> {
 
 static PLATFORM_NAME_ENTRIES: OnceLock<Vec<PlatformNameEntry<'static>>> = OnceLock::new();
 
+/// Whether the process-wide platform data currently serves a help snapshot.
+pub fn platform_help_available() -> bool {
+    PlatformData::instance().help_origin().is_some()
+}
+
 /// The platform name surface exposed to IDE consumers through the HIR facade. The platform
 /// snapshot is fixed for the process, so the surface is built once.
 pub fn platform_name_entries() -> &'static [PlatformNameEntry<'static>] {

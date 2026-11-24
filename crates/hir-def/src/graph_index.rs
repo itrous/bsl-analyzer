@@ -607,6 +607,41 @@ pub fn project_batch_method_call_pairs<DB: ConfigsDatabase + Clone + Send>(
     pairs
 }
 
+/// Batch pair projection for the bounded incoming-call index (catch-up): refuse
+/// the whole batch when any module's semantic notify projection stopped at its
+/// work budget (`notify_projection_incomplete`). A partly read summary resolves
+/// to edges indistinguishable from a complete projection, so the rejection
+/// happens before any pair work. Named unknown-array gaps are an intentional
+/// conservative boundary and stay publishable, and modules unchanged since the
+/// base build were already screened by the build gate, so screening the
+/// reprojected batch is sufficient. The error names the offending module.
+pub fn project_batch_method_call_pairs_checked<DB: ConfigsDatabase + Clone + Send>(
+    pool: &rayon::ThreadPool,
+    db: &DB,
+    index: &GraphIndex,
+    batch: &[ModuleId],
+) -> Result<Vec<MethodCallPair>, ModuleId> {
+    let per_module = parallel_per_module(pool, db, batch, |db, module| {
+        let summary = db.module_call_summary(module);
+        if summary.notify_projection_incomplete {
+            return (module, true, Vec::new());
+        }
+        let resolved = resolve_summary_via_index(db, module, &summary, index);
+        (module, false, resolved_summary_method_pairs(&resolved))
+    });
+
+    if let Some((module, _, _)) = per_module.iter().find(|(_, incomplete, _)| *incomplete) {
+        return Err(*module);
+    }
+
+    let mut pairs = Vec::new();
+    let mut seen = FxHashSet::default();
+    for (_, _, module_pairs) in per_module {
+        pairs.extend(module_pairs.into_iter().filter(|pair| seen.insert(*pair)));
+    }
+    Ok(pairs)
+}
+
 /// One module's read-only extraction for the fused call-hierarchy build: its
 /// index declarations plus the retained pair-relevant call-summary subset. Kept
 /// opaque so the fold ([`GraphIndex::insert_extraction`]) stays the only way the

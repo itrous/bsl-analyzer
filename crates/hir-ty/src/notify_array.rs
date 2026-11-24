@@ -7,9 +7,10 @@
 //! state. Type and constructor facts come from the platform snapshot, not syntax lowering.
 
 use bsl_platform::PlatformDataInner;
+#[cfg(test)]
 use cfg::{CfgEdgeType, CfgVertex, ControlFlowGraph};
 use cfg_types::{ExprId, IdConversion};
-use hir_def::body::events::{for_each_expr_child, for_each_stmt_expr_root, EvalPoint};
+use hir_def::body::events::{for_each_stmt_expr_root, EvalPoint};
 use hir_def::body::Body;
 use hir_def::call_graph::NotifyReceiverSyntax;
 use hir_def::execution_env::EnvFlags;
@@ -24,7 +25,7 @@ use crate::call_resolution::{
     CandidateEvaluation, CandidateRejection,
 };
 use crate::infer::{CallArgBinding, InferOwnerResult};
-use crate::notify_targets::NotifyCallbackSlot;
+use crate::notify_targets::{NotifyCallbackSlot, NotifyWorkBudget};
 use bsl_types::builders::Builders;
 use bsl_types::intern::TypeKernelDb;
 
@@ -59,6 +60,13 @@ pub(crate) struct CallbackArguments {
     pub error_receiver: Option<usize>,
 }
 
+/// Test-only equivalent of the reachable statement set production receives from
+/// `notify_targets::reachable_statements_with_budget`.
+///
+/// Production charges its own traversal to the shared budget and passes the resulting set in;
+/// this mirror is uncharged, so the array pass is exercised with the same input shape. The
+/// `reachable_statements_match_the_production_traversal` test pins the two traversals together.
+#[cfg(test)]
 pub(crate) fn reachable_statements(cfg: &ControlFlowGraph) -> FxHashSet<cfg_types::StmtId> {
     let Some(start) = cfg.start() else { return FxHashSet::default() };
     cfg.reachable_vertices(start, CfgEdgeType::is_executable)
@@ -81,6 +89,7 @@ pub(crate) fn reachable_statements(cfg: &ControlFlowGraph) -> FxHashSet<cfg_type
 /// direct right-hand side of an assignment. Aliases, other calls, reassignment, indexed/field
 /// writes, and control-flow blocks invalidate the proof. These constraints trade recall for a
 /// defensible receiver expression and parameter order.
+#[cfg(test)]
 pub(crate) fn collect_notify_array_registrations(
     db: &dyn TypeKernelDb,
     body: &Body,
@@ -89,6 +98,36 @@ pub(crate) fn collect_notify_array_registrations(
     inference: &InferOwnerResult,
     platform: &PlatformDataInner,
 ) -> Vec<NotifyArrayRegistration> {
+    let mut cancel = || {};
+    let mut budget = NotifyWorkBudget::with_limit(&mut cancel, usize::MAX);
+    collect_notify_array_registrations_with_budget(
+        db,
+        body,
+        reachable_stmts,
+        reaching_defs,
+        inference,
+        platform,
+        &mut budget,
+    )
+}
+
+/// Budgeted collection entry point.
+///
+/// Every index entry, statement visit, statement × tracked-variable pair, constructor visit and
+/// handler visit spends from `budget`, so the shared cancellation callback runs periodically while
+/// the pass works. Exhaustion is a hard stop: the returned vector holds only the registrations
+/// proven before it and can therefore be partial. It is a final answer solely while
+/// `NotifyWorkBudget::exhausted` is false; a caller that observes exhaustion must treat the
+/// owner's notification facts as incomplete instead of publishing these registrations as complete.
+pub(crate) fn collect_notify_array_registrations_with_budget(
+    db: &dyn TypeKernelDb,
+    body: &Body,
+    reachable_stmts: &FxHashSet<cfg_types::StmtId>,
+    reaching_defs: Option<&dataflow::reaching_defs::ReachingDefsResult>,
+    inference: &InferOwnerResult,
+    platform: &PlatformDataInner,
+    budget: &mut NotifyWorkBudget<'_>,
+) -> Vec<NotifyArrayRegistration> {
     if body.is_lowering_incomplete() {
         return Vec::new();
     }
@@ -96,27 +135,45 @@ pub(crate) fn collect_notify_array_registrations(
         return Vec::new();
     };
 
-    let name_spellings = local_name_spellings(body);
-    let local_declarations = unique_local_declarations(body);
-    let mut states: FxHashMap<NormName, ArrayState> =
-        local_declarations.keys().map(|&name| (name, ArrayState::Uninitialized)).collect();
+    let Some(name_spellings) = local_name_spellings(body, budget) else { return Vec::new() };
+    let Some(local_declarations) = unique_local_declarations(body, budget) else {
+        return Vec::new();
+    };
+    let mut states: FxHashMap<NormName, ArrayState> = FxHashMap::default();
+    for &name in local_declarations.keys() {
+        if !budget.spend() {
+            return Vec::new();
+        }
+        states.insert(name, ArrayState::Uninitialized);
+    }
     let mut used_before_initialization = FxHashSet::default();
     let mut registrations = Vec::new();
 
     for (position, &stmt_idx) in body.body_stmts_typed().iter().enumerate() {
+        if !budget.spend() {
+            return registrations;
+        }
         let stmt_id = cfg_types::StmtId::from_idx(stmt_idx);
         if !reachable_stmts.contains(&stmt_id) {
             continue;
         }
         let stmt = body.stmt_idx(stmt_idx);
         if is_control_flow(stmt) {
-            let mentioned = stmt_path_names(body, stmt_idx);
+            let Some(mentioned) = stmt_path_names(body, stmt_idx, budget) else {
+                return registrations;
+            };
             for name in mentioned {
+                if !budget.spend() {
+                    return registrations;
+                }
                 if matches!(states.get(&name), Some(ArrayState::Uninitialized)) {
                     used_before_initialization.insert(name);
                 }
             }
             for state in states.values_mut() {
+                if !budget.spend() {
+                    return registrations;
+                }
                 if matches!(state, ArrayState::Known(_)) {
                     *state = ArrayState::Unknown;
                 }
@@ -128,7 +185,11 @@ pub(crate) fn collect_notify_array_registrations(
             if let Some(target_name) = path_name(body, *target) {
                 let key = NormName::intern(target_name.as_str());
                 if let Some((declaration_position, _)) = local_declarations.get(&key) {
-                    if is_empty_array_constructor(body, *value, platform) {
+                    let is_empty_array = is_empty_array_constructor(body, *value, platform, budget);
+                    if budget.exhausted() {
+                        return registrations;
+                    }
+                    if is_empty_array {
                         let state = if *declaration_position < position
                             && !used_before_initialization.contains(&key)
                             && matches!(states.get(&key), Some(ArrayState::Uninitialized))
@@ -138,12 +199,15 @@ pub(crate) fn collect_notify_array_registrations(
                             ArrayState::Unknown
                         };
                         states.insert(key, state);
-                        invalidate_possible_writes(
+                        if !invalidate_possible_writes(
                             &mut states,
                             &name_spellings,
                             reaching_defs,
                             stmt_id,
-                        );
+                            budget,
+                        ) {
+                            return registrations;
+                        }
                         continue;
                     }
                 }
@@ -153,15 +217,24 @@ pub(crate) fn collect_notify_array_registrations(
                 {
                     let array_key = NormName::intern(array_name.as_str());
                     if let Some(ArrayState::Known(elements)) = states.get(&array_key) {
-                        if let Some(binding) = dynamic_callback_binding(
+                        let binding = dynamic_callback_binding(
                             db,
                             inference,
                             body,
                             constructor,
                             elements,
                             platform,
-                        ) {
-                            let handlers = handlers_from_binding(body, constructor, &binding);
+                            budget,
+                        );
+                        if budget.exhausted() {
+                            return registrations;
+                        }
+                        if let Some(binding) = binding {
+                            let handlers =
+                                handlers_from_binding(body, constructor, &binding, budget);
+                            if budget.exhausted() {
+                                return registrations;
+                            }
                             if !handlers.is_empty() {
                                 registrations
                                     .push(NotifyArrayRegistration { constructor, handlers });
@@ -174,13 +247,30 @@ pub(crate) fn collect_notify_array_registrations(
                     *state = ArrayState::Unknown;
                 }
 
-                let mut mentioned = stmt_path_names(body, stmt_idx);
+                let Some(mut mentioned) = stmt_path_names(body, stmt_idx, budget) else {
+                    return registrations;
+                };
                 mentioned.remove(&key);
                 if let Some((_, array_name)) = dynamic_notify_array_call(body, *value, platform) {
                     mentioned.remove(&NormName::intern(array_name.as_str()));
                 }
-                invalidate_or_record_uses(&mut states, &mut used_before_initialization, mentioned);
-                invalidate_possible_writes(&mut states, &name_spellings, reaching_defs, stmt_id);
+                if !invalidate_or_record_uses(
+                    &mut states,
+                    &mut used_before_initialization,
+                    mentioned,
+                    budget,
+                ) {
+                    return registrations;
+                }
+                if !invalidate_possible_writes(
+                    &mut states,
+                    &name_spellings,
+                    reaching_defs,
+                    stmt_id,
+                    budget,
+                ) {
+                    return registrations;
+                }
                 continue;
             }
 
@@ -189,33 +279,68 @@ pub(crate) fn collect_notify_array_registrations(
             {
                 let array_key = NormName::intern(array_name.as_str());
                 if let Some(ArrayState::Known(elements)) = states.get(&array_key) {
-                    if let Some(binding) = dynamic_callback_binding(
+                    let binding = dynamic_callback_binding(
                         db,
                         inference,
                         body,
                         constructor,
                         elements,
                         platform,
-                    ) {
-                        let handlers = handlers_from_binding(body, constructor, &binding);
+                        budget,
+                    );
+                    if budget.exhausted() {
+                        return registrations;
+                    }
+                    if let Some(binding) = binding {
+                        let handlers = handlers_from_binding(body, constructor, &binding, budget);
+                        if budget.exhausted() {
+                            return registrations;
+                        }
                         if !handlers.is_empty() {
                             registrations.push(NotifyArrayRegistration { constructor, handlers });
                         }
                     }
                 }
 
-                let mut mentioned = stmt_path_names(body, stmt_idx);
+                let Some(mut mentioned) = stmt_path_names(body, stmt_idx, budget) else {
+                    return registrations;
+                };
                 mentioned.remove(&array_key);
-                invalidate_or_record_uses(&mut states, &mut used_before_initialization, mentioned);
-                invalidate_possible_writes(&mut states, &name_spellings, reaching_defs, stmt_id);
+                if !invalidate_or_record_uses(
+                    &mut states,
+                    &mut used_before_initialization,
+                    mentioned,
+                    budget,
+                ) {
+                    return registrations;
+                }
+                if !invalidate_possible_writes(
+                    &mut states,
+                    &name_spellings,
+                    reaching_defs,
+                    stmt_id,
+                    budget,
+                ) {
+                    return registrations;
+                }
                 continue;
             }
         }
 
         if let Stmt::Expr(expr) = stmt {
-            if let Some((receiver_name, argument)) = array_add_statement(body, *expr, platform) {
+            if let Some((receiver_name, argument)) =
+                array_add_statement(body, *expr, platform, budget)
+            {
+                if budget.exhausted() {
+                    return registrations;
+                }
                 let key = NormName::intern(receiver_name.as_str());
-                let argument_names = expression_path_names(body, argument);
+                let Some(argument_names) = expression_path_names(body, argument, budget) else {
+                    return registrations;
+                };
+                if !budget.spend_by(argument_names.len()) {
+                    return registrations;
+                }
                 let argument_escapes = argument_names.iter().any(|name| states.contains_key(name));
                 if !argument_escapes {
                     if let Some(ArrayState::Known(elements)) = states.get_mut(&key) {
@@ -227,32 +352,63 @@ pub(crate) fn collect_notify_array_registrations(
                     *state = ArrayState::Unknown;
                 }
 
-                invalidate_or_record_uses(
+                if !invalidate_or_record_uses(
                     &mut states,
                     &mut used_before_initialization,
                     argument_names,
-                );
-                let mut other_names = stmt_path_names(body, stmt_idx);
+                    budget,
+                ) {
+                    return registrations;
+                }
+                let Some(mut other_names) = stmt_path_names(body, stmt_idx, budget) else {
+                    return registrations;
+                };
                 other_names.remove(&key);
-                for name in expression_path_names(body, argument) {
+                let Some(argument_names) = expression_path_names(body, argument, budget) else {
+                    return registrations;
+                };
+                for name in argument_names {
+                    if !budget.spend() {
+                        return registrations;
+                    }
                     other_names.remove(&name);
                 }
-                invalidate_or_record_uses(
+                if !invalidate_or_record_uses(
                     &mut states,
                     &mut used_before_initialization,
                     other_names,
-                );
-                invalidate_possible_writes(&mut states, &name_spellings, reaching_defs, stmt_id);
+                    budget,
+                ) {
+                    return registrations;
+                }
+                if !invalidate_possible_writes(
+                    &mut states,
+                    &name_spellings,
+                    reaching_defs,
+                    stmt_id,
+                    budget,
+                ) {
+                    return registrations;
+                }
                 continue;
             }
         }
 
-        invalidate_or_record_uses(
+        let Some(mentioned) = stmt_path_names(body, stmt_idx, budget) else {
+            return registrations;
+        };
+        if !invalidate_or_record_uses(
             &mut states,
             &mut used_before_initialization,
-            stmt_path_names(body, stmt_idx),
-        );
-        invalidate_possible_writes(&mut states, &name_spellings, reaching_defs, stmt_id);
+            mentioned,
+            budget,
+        ) {
+            return registrations;
+        }
+        if !invalidate_possible_writes(&mut states, &name_spellings, reaching_defs, stmt_id, budget)
+        {
+            return registrations;
+        }
     }
 
     registrations
@@ -263,80 +419,153 @@ fn invalidate_possible_writes(
     name_spellings: &FxHashMap<NormName, Vec<Name>>,
     reaching_defs: &dataflow::reaching_defs::ReachingDefsResult,
     stmt: cfg_types::StmtId,
-) {
+    budget: &mut NotifyWorkBudget<'_>,
+) -> bool {
     for (name, state) in states {
-        if matches!(state, ArrayState::Known(_))
-            && name_spellings.get(name).is_some_and(|spellings| {
-                spellings.iter().any(|spelling| {
-                    !reaching_defs
-                        .possible_writes_at(EvalPoint::Stmt(stmt), spelling.as_str())
-                        .is_empty()
-                })
-            })
-        {
-            *state = ArrayState::Unknown;
+        if !budget.spend() {
+            return false;
+        }
+        if !matches!(state, ArrayState::Known(_)) {
+            continue;
+        }
+        if let Some(spellings) = name_spellings.get(name) {
+            for spelling in spellings {
+                if !budget.spend() {
+                    return false;
+                }
+                if !reaching_defs
+                    .possible_writes_at(EvalPoint::Stmt(stmt), spelling.as_str())
+                    .is_empty()
+                {
+                    *state = ArrayState::Unknown;
+                    break;
+                }
+            }
         }
     }
+    true
 }
 
-fn local_name_spellings(body: &Body) -> FxHashMap<NormName, Vec<Name>> {
+fn local_name_spellings(
+    body: &Body,
+    budget: &mut NotifyWorkBudget<'_>,
+) -> Option<FxHashMap<NormName, Vec<Name>>> {
     let mut spellings: FxHashMap<NormName, Vec<Name>> = FxHashMap::default();
-    let mut add_spelling = |name: &Name| {
-        let names = spellings.entry(NormName::intern(name.as_str())).or_default();
-        if !names.iter().any(|existing| existing == name) {
-            names.push(name.clone());
-        }
-    };
     for (_, binding) in body.bindings_iter() {
-        add_spelling(&binding.name);
+        if !budget.spend() || !add_local_spelling(&mut spellings, &binding.name, budget) {
+            return None;
+        }
     }
     for (_, expr) in body.exprs_iter() {
+        if !budget.spend() {
+            return None;
+        }
         if let Expr::Path(name) = expr {
-            add_spelling(name);
+            if !add_local_spelling(&mut spellings, name, budget) {
+                return None;
+            }
         }
     }
-    spellings
+    Some(spellings)
 }
 
-fn unique_local_declarations(body: &Body) -> FxHashMap<NormName, (usize, Name)> {
+fn add_local_spelling(
+    spellings: &mut FxHashMap<NormName, Vec<Name>>,
+    name: &Name,
+    budget: &mut NotifyWorkBudget<'_>,
+) -> bool {
+    let names = spellings.entry(NormName::intern(name.as_str())).or_default();
+    for existing in names.iter() {
+        if !budget.spend() {
+            return false;
+        }
+        if existing == name {
+            return true;
+        }
+    }
+    names.push(name.clone());
+    true
+}
+
+fn unique_local_declarations(
+    body: &Body,
+    budget: &mut NotifyWorkBudget<'_>,
+) -> Option<FxHashMap<NormName, (usize, Name)>> {
     let mut binding_counts: FxHashMap<NormName, usize> = FxHashMap::default();
     for (_, binding) in body.bindings_iter() {
+        if !budget.spend() {
+            return None;
+        }
         *binding_counts.entry(NormName::intern(binding.name.as_str())).or_default() += 1;
     }
 
-    let parameters: FxHashSet<NormName> =
-        body.params().map(|id| NormName::intern(body.binding(id).name.as_str())).collect();
+    let mut parameters = FxHashSet::default();
+    for id in body.params() {
+        if !budget.spend() {
+            return None;
+        }
+        parameters.insert(NormName::intern(body.binding(id).name.as_str()));
+    }
     let mut declarations: FxHashMap<NormName, Vec<(usize, Name)>> = FxHashMap::default();
     for (position, &stmt_idx) in body.body_stmts_typed().iter().enumerate() {
+        if !budget.spend() {
+            return None;
+        }
         let Stmt::VarDecl { bindings } = body.stmt_idx(stmt_idx) else { continue };
         for &binding in bindings.iter() {
+            if !budget.spend() {
+                return None;
+            }
             let binding = body.binding_idx(binding);
             let name = NormName::intern(binding.name.as_str());
             declarations.entry(name).or_default().push((position, binding.name.clone()));
         }
     }
 
-    declarations
-        .into_iter()
-        .filter_map(|(name, declarations)| {
-            (declarations.len() == 1
-                && binding_counts.get(&name) == Some(&1)
-                && !parameters.contains(&name))
-            .then(|| (name, declarations.into_iter().next().expect("one declaration")))
-        })
-        .collect()
+    let mut unique = FxHashMap::default();
+    for (name, declarations) in declarations {
+        if !budget.spend() {
+            return None;
+        }
+        if declarations.len() == 1
+            && binding_counts.get(&name) == Some(&1)
+            && !parameters.contains(&name)
+        {
+            unique.insert(name, declarations.into_iter().next().expect("one declaration"));
+        }
+    }
+    Some(unique)
 }
 
-fn is_empty_array_constructor(body: &Body, expr: ExprIdx, platform: &PlatformDataInner) -> bool {
+fn is_empty_array_constructor(
+    body: &Body,
+    expr: ExprIdx,
+    platform: &PlatformDataInner,
+    budget: &mut NotifyWorkBudget<'_>,
+) -> bool {
     let Expr::New { type_name: Some(type_name), args } = body.expr_idx(expr) else {
         return false;
     };
     if !args.is_empty() || !resolves_to_type(platform, type_name.as_str(), "Array") {
         return false;
     }
-    platform.get_constructors(type_name.as_str()).iter().any(|constructor| {
-        constructor.parameters.iter().all(|param| param.is_optional || param.is_variadic)
-    })
+    let constructors = platform.get_constructors(type_name.as_str());
+    for constructor in constructors {
+        if !budget.spend() {
+            return false;
+        }
+        let mut all_optional = true;
+        for param in &constructor.parameters {
+            if !budget.spend() {
+                return false;
+            }
+            all_optional &= param.is_optional || param.is_variadic;
+        }
+        if all_optional {
+            return true;
+        }
+    }
+    false
 }
 
 fn dynamic_notify_array_call(
@@ -365,12 +594,21 @@ fn dynamic_callback_binding(
     constructor: ExprId,
     elements: &[ExprId],
     platform: &PlatformDataInner,
+    budget: &mut NotifyWorkBudget<'_>,
 ) -> Option<CallArgBinding> {
+    if !budget.spend() {
+        return None;
+    }
     let Expr::New { type_name: None, args } = body.expr(constructor) else { return None };
     let Expr::Literal(Literal::String(type_name)) = body.expr_idx(*args.first()?) else {
         return None;
     };
-    let constructor_refs = platform.get_constructors(type_name).to_vec();
+    let constructor_refs = platform.get_constructors(type_name);
+    for constructor in &constructor_refs {
+        if !budget.spend_by(constructor.parameters.len().saturating_add(1)) {
+            return None;
+        }
+    }
     let (definite, possible) = inference
         .notify_constructor_registration_envs(constructor)
         .unwrap_or((EnvFlags::EMPTY, EnvFlags::ALL));
@@ -379,11 +617,26 @@ fn dynamic_callback_binding(
     let candidates =
         crate::builtin::candidates::constructor_candidates(db, &constructor_refs, environment)
             .ok()?;
-    let argument_types = elements
-        .iter()
-        .map(|&expr| inference.type_id_of_expr(expr).unwrap_or_else(|| db.unknown()))
-        .collect::<Vec<_>>();
+    if !budget.spend_by(candidates.as_slice().len()) {
+        return None;
+    }
+    let mut argument_types = Vec::with_capacity(elements.len());
+    for &expr in elements {
+        if !budget.spend() {
+            return None;
+        }
+        argument_types.push(inference.type_id_of_expr(expr).unwrap_or_else(|| db.unknown()));
+    }
+    // Resolution compares every argument with each applicable signature. Charge the
+    // cross-product before entering the shared, non-cancellable binding engine.
+    let binding_work = candidates.as_slice().len().saturating_mul(argument_types.len().max(1));
+    if !budget.spend_by(binding_work) {
+        return None;
+    }
     let candidate = crate::call_binding::resolve_binding(db, candidates, &argument_types).semantic;
+    if !budget.spend_by(candidate.resolution.candidates.len()) {
+        return None;
+    }
     Some(CallArgBinding {
         owner: inference.owner(),
         call_expr: constructor,
@@ -393,35 +646,75 @@ fn dynamic_callback_binding(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn callback_arguments_for_binding(
     binding: &CallArgBinding,
 ) -> Option<CallbackArguments> {
+    let mut cancel = || {};
+    let mut budget = NotifyWorkBudget::with_limit(&mut cancel, usize::MAX);
+    callback_arguments_for_binding_with_budget(binding, &mut budget)
+}
+
+pub(crate) fn callback_arguments_for_binding_with_budget(
+    binding: &CallArgBinding,
+    budget: &mut NotifyWorkBudget<'_>,
+) -> Option<CallbackArguments> {
+    if !budget.spend() {
+        return None;
+    }
     let resolution = &binding.candidate.resolution;
     let candidate_ids = match &resolution.selection {
         CallSelection::Unique { candidate } => vec![*candidate],
-        CallSelection::Ambiguous { candidates } => candidates.to_vec(),
-        CallSelection::Rejected(CallRejection::Type) => resolution
-            .candidates
-            .iter()
-            .filter_map(|fact| {
-                matches!(
+        CallSelection::Ambiguous { candidates } => {
+            if !budget.spend_by(candidates.len()) {
+                return None;
+            }
+            candidates.to_vec()
+        }
+        CallSelection::Rejected(CallRejection::Type) => {
+            let mut candidate_ids = Vec::new();
+            for fact in resolution.candidates.iter() {
+                if !budget.spend() {
+                    return None;
+                }
+                if matches!(
                     &fact.disposition,
                     CandidateDisposition::Rejected(CandidateRejection::TypeIncompatible { .. })
-                )
-                .then_some(fact.id)
-            })
-            .collect(),
+                ) {
+                    candidate_ids.push(fact.id);
+                }
+            }
+            candidate_ids
+        }
         CallSelection::Rejected(CallRejection::Arity { .. } | CallRejection::NoCandidates) => {
             return None;
         }
     };
 
-    let candidates = binding.candidate.candidates.as_slice();
+    // Index both sides by identity once: a per-id linear scan of every candidate turns an
+    // overloaded constructor into a quadratic search.
+    let mut facts_by_id = FxHashMap::<crate::call_resolution::CandidateId, _>::default();
+    for fact in resolution.candidates.iter() {
+        if !budget.spend() {
+            return None;
+        }
+        facts_by_id.insert(fact.id, fact);
+    }
+    let mut signatures_by_id = FxHashMap::<crate::call_resolution::CandidateId, _>::default();
+    for signature in binding.candidate.candidates.as_slice() {
+        if !budget.spend() {
+            return None;
+        }
+        signatures_by_id.insert(signature.id, signature);
+    }
     let mut projection = None;
     for candidate_id in candidate_ids {
-        let fact = resolution.candidates.iter().find(|fact| fact.id == candidate_id)?;
-        let signature = candidates.iter().find(|signature| signature.id == candidate_id)?;
-        let current = callback_argument_projection(fact, signature)?;
+        if !budget.spend() {
+            return None;
+        }
+        let fact = *facts_by_id.get(&candidate_id)?;
+        let signature = *signatures_by_id.get(&candidate_id)?;
+        let current = callback_argument_projection(fact, signature, budget)?;
         if projection.is_some_and(|previous| previous != current) {
             return None;
         }
@@ -433,7 +726,11 @@ pub(crate) fn callback_arguments_for_binding(
 fn callback_argument_projection(
     fact: &crate::call_resolution::CandidateFact,
     signature: &crate::call_resolution::CallSignature,
+    budget: &mut NotifyWorkBudget<'_>,
 ) -> Option<CallbackArguments> {
+    if !budget.spend() {
+        return None;
+    }
     let CandidateEvaluation::ArityCompatible { applicability, .. } = &fact.evaluation else {
         return None;
     };
@@ -442,50 +739,67 @@ fn callback_argument_projection(
         | CandidateApplicability::Indeterminate { arguments }
         | CandidateApplicability::Incompatible { arguments } => arguments.as_ref(),
     };
-    let parameters = signature
-        .params
-        .iter()
-        .map(|parameter| bsl_platform::MethodParam {
+    let mut parameters = Vec::with_capacity(signature.params.len());
+    for parameter in signature.params.iter() {
+        if !budget.spend() {
+            return None;
+        }
+        parameters.push(bsl_platform::MethodParam {
             name: parameter.name.clone(),
             param_type: None,
             is_optional: parameter.has_default,
             is_variadic: parameter.mode == CallParamMode::Variadic,
             passing: parameter.passing,
             result_follows_argument_text: parameter.result_follows_argument_text,
-        })
-        .collect::<Vec<_>>();
-    let slots = bsl_platform::callback_description_slots_for_parameters(&parameters)?;
-    let argument_for_parameter = |parameter_index| {
-        let mut matches = evaluations.iter().filter_map(|argument| match argument.parameter {
-            crate::call_resolution::ArgumentParameter::Declared { index, .. }
-                if index == parameter_index =>
-            {
-                Some(argument.index)
-            }
-            _ => None,
         });
-        let argument = matches.next();
-        argument.filter(|_| matches.next().is_none())
+    }
+    if !budget.spend() {
+        return None;
+    }
+    let slots = bsl_platform::callback_description_slots_for_parameters(&parameters)?;
+    let mut argument_for_parameter = |parameter_index| {
+        if !budget.spend() {
+            return None;
+        }
+        let mut found = None;
+        for argument in evaluations {
+            if !budget.spend() {
+                return None;
+            }
+            if matches!(argument.parameter, crate::call_resolution::ArgumentParameter::Declared { index, .. } if index == parameter_index)
+            {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(argument.index);
+            }
+        }
+        found
     };
-    Some(CallbackArguments {
-        handler: argument_for_parameter(slots.handler),
-        receiver: argument_for_parameter(slots.receiver),
-        error_handler: argument_for_parameter(slots.error_handler),
-        error_receiver: argument_for_parameter(slots.error_receiver),
-    })
+    let handler = argument_for_parameter(slots.handler);
+    let receiver = argument_for_parameter(slots.receiver);
+    let error_handler = argument_for_parameter(slots.error_handler);
+    let error_receiver = argument_for_parameter(slots.error_receiver);
+    Some(CallbackArguments { handler, receiver, error_handler, error_receiver })
 }
 
 fn handlers_from_binding(
     body: &Body,
     constructor: ExprId,
     binding: &CallArgBinding,
+    budget: &mut NotifyWorkBudget<'_>,
 ) -> Vec<NotifyArrayHandler> {
-    let Some(arguments) = callback_arguments_for_binding(binding) else { return Vec::new() };
+    let Some(arguments) = callback_arguments_for_binding_with_budget(binding, budget) else {
+        return Vec::new();
+    };
     let mut handlers = Vec::with_capacity(2);
     for (handler, receiver, slot) in [
         (arguments.handler, arguments.receiver, NotifyCallbackSlot::Handler),
         (arguments.error_handler, arguments.error_receiver, NotifyCallbackSlot::ErrorHandler),
     ] {
+        if !budget.spend() {
+            return Vec::new();
+        }
         if let Some(handler) =
             handler_from_bound_arguments(body, constructor, binding, handler, receiver, slot)
         {
@@ -526,6 +840,7 @@ fn array_add_statement(
     body: &Body,
     expr: ExprIdx,
     platform: &PlatformDataInner,
+    budget: &mut NotifyWorkBudget<'_>,
 ) -> Option<(Name, ExprIdx)> {
     let (receiver, method_name, args) = match body.expr_idx(expr) {
         Expr::MethodCall { receiver, method, args } => (*receiver, method.as_str(), args.as_ref()),
@@ -540,6 +855,9 @@ fn array_add_statement(
         return None;
     }
     let method = platform.get_method("Array", method_name)?;
+    if !budget.spend_by(method.parameters.len().saturating_add(1)) {
+        return None;
+    }
     if !eq_ignore_case(method.english_name.as_str(), "Add")
         || method.parameters.len() != 1
         || !accepts_method_argument_count(method, args.len())
@@ -597,8 +915,12 @@ fn invalidate_or_record_uses(
     states: &mut FxHashMap<NormName, ArrayState>,
     used_before_initialization: &mut FxHashSet<NormName>,
     mentioned: FxHashSet<NormName>,
-) {
+    budget: &mut NotifyWorkBudget<'_>,
+) -> bool {
     for name in mentioned {
+        if !budget.spend() {
+            return false;
+        }
         match states.get_mut(&name) {
             Some(ArrayState::Uninitialized) => {
                 used_before_initialization.insert(name);
@@ -609,70 +931,163 @@ fn invalidate_or_record_uses(
             Some(ArrayState::Unknown) | None => {}
         }
     }
+    true
 }
 
-fn stmt_path_names(body: &Body, stmt: StmtIdx) -> FxHashSet<NormName> {
+fn stmt_path_names(
+    body: &Body,
+    stmt: StmtIdx,
+    budget: &mut NotifyWorkBudget<'_>,
+) -> Option<FxHashSet<NormName>> {
+    if !budget.spend() {
+        return None;
+    }
     let mut names = FxHashSet::default();
-    match body.stmt_idx(stmt) {
+    let complete = match body.stmt_idx(stmt) {
         Stmt::If(if_stmt) => {
-            collect_expression_paths(body, if_stmt.condition, &mut names);
-            for (_, branch) in if_stmt.elsif_branches.iter() {
-                collect_statements_paths(body, branch, &mut names);
+            if !collect_expression_paths(body, if_stmt.condition, &mut names, budget) {
+                return None;
             }
-            collect_statements_paths(body, &if_stmt.then_branch, &mut names);
+            for (condition, branch) in if_stmt.elsif_branches.iter() {
+                if !collect_expression_paths(body, *condition, &mut names, budget)
+                    || !collect_statements_paths(body, branch, &mut names, budget)
+                {
+                    return None;
+                }
+            }
+            if !collect_statements_paths(body, &if_stmt.then_branch, &mut names, budget) {
+                return None;
+            }
             if let Some(branch) = &if_stmt.else_branch {
-                collect_statements_paths(body, branch, &mut names);
+                if !collect_statements_paths(body, branch, &mut names, budget) {
+                    return None;
+                }
             }
+            true
         }
         Stmt::PreprocIf(if_stmt) => {
             for branch in if_stmt.branches() {
-                collect_statements_paths(body, branch.stmts, &mut names);
+                if !collect_statements_paths(body, branch.stmts, &mut names, budget) {
+                    return None;
+                }
             }
+            true
         }
         Stmt::While { condition, body: branch } => {
-            collect_expression_paths(body, *condition, &mut names);
-            collect_statements_paths(body, branch, &mut names);
+            collect_expression_paths(body, *condition, &mut names, budget)
+                && collect_statements_paths(body, branch, &mut names, budget)
         }
         Stmt::For { from, to, body: branch, .. } => {
-            collect_expression_paths(body, *from, &mut names);
-            collect_expression_paths(body, *to, &mut names);
-            collect_statements_paths(body, branch, &mut names);
+            collect_expression_paths(body, *from, &mut names, budget)
+                && collect_expression_paths(body, *to, &mut names, budget)
+                && collect_statements_paths(body, branch, &mut names, budget)
         }
         Stmt::ForEach { collection, body: branch, .. } => {
-            collect_expression_paths(body, *collection, &mut names);
-            collect_statements_paths(body, branch, &mut names);
+            collect_expression_paths(body, *collection, &mut names, budget)
+                && collect_statements_paths(body, branch, &mut names, budget)
         }
         Stmt::Try { body: attempt, except } => {
-            collect_statements_paths(body, attempt, &mut names);
-            collect_statements_paths(body, except, &mut names);
+            collect_statements_paths(body, attempt, &mut names, budget)
+                && collect_statements_paths(body, except, &mut names, budget)
         }
         _ => {
+            let mut complete = true;
             for_each_stmt_expr_root(body, stmt, &mut |root| {
-                collect_expression_paths(body, root, &mut names);
+                if !complete {
+                    return;
+                }
+                if !budget.spend() || !collect_expression_paths(body, root, &mut names, budget) {
+                    complete = false;
+                }
             });
+            complete
+        }
+    };
+    complete.then_some(names)
+}
+
+fn collect_statements_paths(
+    body: &Body,
+    statements: &[StmtIdx],
+    names: &mut FxHashSet<NormName>,
+    budget: &mut NotifyWorkBudget<'_>,
+) -> bool {
+    for &stmt in statements {
+        let Some(found) = stmt_path_names(body, stmt, budget) else { return false };
+        for name in found {
+            if !budget.spend() {
+                return false;
+            }
+            names.insert(name);
         }
     }
-    names
+    true
 }
 
-fn collect_statements_paths(body: &Body, statements: &[StmtIdx], names: &mut FxHashSet<NormName>) {
-    for &stmt in statements {
-        names.extend(stmt_path_names(body, stmt));
-    }
-}
-
-fn expression_path_names(body: &Body, expr: ExprIdx) -> FxHashSet<NormName> {
+fn expression_path_names(
+    body: &Body,
+    expr: ExprIdx,
+    budget: &mut NotifyWorkBudget<'_>,
+) -> Option<FxHashSet<NormName>> {
     let mut names = FxHashSet::default();
-    collect_expression_paths(body, expr, &mut names);
-    names
+    collect_expression_paths(body, expr, &mut names, budget).then_some(names)
 }
 
-fn collect_expression_paths(body: &Body, expr: ExprIdx, names: &mut FxHashSet<NormName>) {
+fn collect_expression_paths(
+    body: &Body,
+    expr: ExprIdx,
+    names: &mut FxHashSet<NormName>,
+    budget: &mut NotifyWorkBudget<'_>,
+) -> bool {
+    if !budget.spend() {
+        return false;
+    }
     if let Expr::Path(name) = body.expr_idx(expr) {
         names.insert(NormName::intern(name.as_str()));
-        return;
+        return true;
     }
-    for_each_expr_child(body, expr, &mut |child| collect_expression_paths(body, child, names));
+    let mut visit_child =
+        |child| budget.spend() && collect_expression_paths(body, child, names, budget);
+    match body.expr_idx(expr) {
+        Expr::Missing | Expr::Literal(_) | Expr::Path(_) => true,
+        Expr::BinaryOp { lhs, rhs, .. } => visit_child(*lhs) && visit_child(*rhs),
+        Expr::UnaryOp { expr, .. } | Expr::Await { expr } => visit_child(*expr),
+        Expr::Ternary { condition, then_expr, else_expr } => {
+            visit_child(*condition) && visit_child(*then_expr) && visit_child(*else_expr)
+        }
+        Expr::Call { callee, args } => {
+            if !visit_child(*callee) {
+                return false;
+            }
+            for &arg in args.iter() {
+                if !visit_child(arg) {
+                    return false;
+                }
+            }
+            true
+        }
+        Expr::MethodCall { receiver, args, .. } => {
+            if !visit_child(*receiver) {
+                return false;
+            }
+            for &arg in args.iter() {
+                if !visit_child(arg) {
+                    return false;
+                }
+            }
+            true
+        }
+        Expr::Index { base, index } => visit_child(*base) && visit_child(*index),
+        Expr::Field { base, .. } => visit_child(*base),
+        Expr::New { args, .. } | Expr::Array(args) => {
+            for &arg in args.iter() {
+                if !visit_child(arg) {
+                    return false;
+                }
+            }
+            true
+        }
+    }
 }
 
 #[cfg(test)]
@@ -717,6 +1132,168 @@ mod tests {
 
     fn registrations(source: &str) -> Vec<NotifyArrayRegistration> {
         parsed(source).1
+    }
+
+    #[test]
+    fn reachable_statements_match_the_production_traversal() {
+        let sources = [
+            r#"Процедура Test(Флаг)
+    А = Новый Массив;
+    Если Флаг Тогда
+        А.Добавить("X");
+    Иначе
+        А.Добавить("Y");
+    КонецЕсли;
+    Пока Флаг Цикл
+        Прервать;
+    КонецЦикла;
+КонецПроцедуры"#,
+            r#"Процедура Test()
+    Перейти ~Конец;
+    А = Новый Массив;
+    ~Конец:
+    А.Добавить("X");
+КонецПроцедуры"#,
+            r#"Процедура Test()
+    А = Новый Массив;
+    Возврат;
+    А.Добавить("X");
+КонецПроцедуры"#,
+        ];
+        for source in sources {
+            let parse = parser::parse(source);
+            let bodies = hir_def::ModuleBodies::from_parse(&parse);
+            let body = bodies.iter_bodies().next().expect("fixture declares a method").1;
+            let cfg = cfg::CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), body);
+            let mut cancel = || {};
+            let mut budget = NotifyWorkBudget::with_limit(&mut cancel, usize::MAX);
+            assert_eq!(
+                reachable_statements(&cfg),
+                crate::notify_targets::reachable_statements_with_budget(&cfg, &mut budget)
+                    .expect("unlimited budget"),
+                "{source}"
+            );
+        }
+    }
+
+    fn collection_under_budget(
+        source: &str,
+        work_limit: usize,
+        cancel: &mut dyn FnMut(),
+    ) -> (Vec<NotifyArrayRegistration>, bool) {
+        let parse = parser::parse(source);
+        let bodies = hir_def::ModuleBodies::from_parse(&parse);
+        let body = bodies.iter_bodies().next().expect("fixture declares a method").1;
+        let cfg = cfg::CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), body);
+        let body_arc = std::sync::Arc::new(body.clone());
+        let events = std::sync::Arc::new(hir_def::body::events::BodyEvents::collect(body));
+        let reaching_defs = dataflow::reaching_defs::solve_executable_reaching_definitions(
+            std::sync::Arc::new(cfg.clone()),
+            &body_arc,
+            events,
+            true,
+            dataflow::reaching_defs::RecoveredBody::Solve,
+        );
+        let db = InMemoryDb::new();
+        let inference = crate::infer::InferOwnerResult::ModuleCode(std::sync::Arc::new(
+            crate::infer::ModuleCodeInferenceResult::default(),
+        ));
+        let mut budget = NotifyWorkBudget::with_limit(cancel, work_limit);
+        let registrations = collect_notify_array_registrations_with_budget(
+            &db,
+            body,
+            &reachable_statements(&cfg),
+            reaching_defs.as_deref(),
+            &inference,
+            PlatformDataInner::instance(),
+            &mut budget,
+        );
+        (registrations, budget.exhausted())
+    }
+
+    fn budgeted_collection_exhausts(source: &str, work_limit: usize) -> bool {
+        collection_under_budget(source, work_limit, &mut || {}).1
+    }
+
+    /// A body with `variables` tracked arrays initialized before `statements` reads.
+    fn tracked_array_body(statements: usize, variables: usize) -> String {
+        let mut source = String::from("Процедура Test()\n");
+        for index in 0..variables {
+            source.push_str(&format!("    Перем A{index};\n"));
+        }
+        for index in 0..variables {
+            source.push_str(&format!("    A{index} = Новый Массив;\n"));
+        }
+        for _ in 0..statements {
+            source.push_str("    Значение = A0;\n");
+        }
+        source.push_str("КонецПроцедуры\n");
+        source
+    }
+
+    #[test]
+    fn tracked_arrays_times_statements_spend_the_shared_budget() {
+        let source = tracked_array_body(32, 32);
+
+        assert!(
+            budgeted_collection_exhausts(&source, 2_000),
+            "the body-by-tracked-array scan must stop at its shared budget"
+        );
+    }
+
+    #[test]
+    fn tracked_array_scan_charges_each_statement_times_variable_pair() {
+        let narrow = tracked_array_body(16, 2);
+        let wide = tracked_array_body(16, 64);
+
+        assert!(
+            !budgeted_collection_exhausts(&narrow, 2_000),
+            "two tracked arrays must stay within the budget"
+        );
+        assert!(
+            budgeted_collection_exhausts(&wide, 2_000),
+            "the same statements over sixty-four tracked arrays must exhaust it"
+        );
+    }
+
+    #[test]
+    fn exhausted_collection_returns_only_the_proofs_before_the_stop() {
+        let mut source = String::from(
+            r#"Процедура Test()
+    Перем Параметры;
+    Перем Оповещение;
+    Параметры = Новый Массив;
+    Параметры.Добавить("Готово");
+    Параметры.Добавить(ЭтотОбъект);
+    Оповещение = Новый("CallbackDescription", Параметры);
+"#,
+        );
+        for index in 0..64 {
+            source.push_str(&format!("    Перем A{index};\n"));
+        }
+        for index in 0..64 {
+            source.push_str(&format!("    A{index} = Новый Массив;\n"));
+        }
+        source.push_str("КонецПроцедуры\n");
+
+        let (registrations, exhausted) = collection_under_budget(&source, 1_200, &mut || {});
+        assert!(exhausted, "the tail must exhaust the budget");
+        assert_eq!(registrations.len(), 1, "the head proof must survive the later stop");
+        assert_eq!(registrations[0].handlers.len(), 1);
+        assert_eq!(registrations[0].handlers[0].callback_name.as_str(), "Готово");
+    }
+
+    #[test]
+    fn array_collection_checks_cancellation_while_spending() {
+        let source = tracked_array_body(256, 2);
+        let mut cancellations = 0;
+        let (_, exhausted) = collection_under_budget(&source, 100_000, &mut || cancellations += 1);
+
+        assert!(!exhausted, "the fixture must fit the budget");
+        assert!(
+            cancellations > 0,
+            "the array pass must reach the shared cancellation check while spending"
+        );
     }
 
     #[test]
@@ -1106,6 +1683,24 @@ EndProcedure
 
         let rejected = binding_for_schemas(&[schema], TestResolution::TypeRejected);
         assert_eq!(callback_arguments_for_binding(&rejected), Some(expected));
+    }
+
+    #[test]
+    fn callback_argument_projection_uses_the_callers_budget() {
+        let schema = [
+            "ДополнительныеПараметры",
+            "Модуль",
+            "ИмяПроцедуры",
+            "МодульОбработкиОшибки",
+            "ИмяПроцедурыОбработкиОшибки",
+        ];
+        let binding = binding_for_schemas(&[schema; 32], TestResolution::Ambiguous);
+        let mut checks = 0;
+        let mut cancel = || checks += 1;
+        let mut budget = NotifyWorkBudget::with_limit(&mut cancel, 200);
+        let _ = callback_arguments_for_binding_with_budget(&binding, &mut budget);
+        assert!(budget.exhausted());
+        assert!(checks > 0, "long candidate projections must check cancellation");
     }
 
     #[test]

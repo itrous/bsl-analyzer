@@ -40,6 +40,10 @@ pub struct ModuleCallSummary {
     /// list is module-level uncertainty: consumers must not infer that unlisted local methods
     /// or exports are unused merely because a callback was not recovered from these sites.
     pub notify_dynamic_signature_analysis_incomplete: Vec<DynamicNotifySignatureAnalysisGap>,
+    /// The semantic notify projection stopped at its work budget. This is distinct
+    /// from a named unknown-array alternative: the latter is an intentional
+    /// conservative boundary, not evidence that registrations were only partly read.
+    pub notify_projection_incomplete: bool,
     /// Platform-validated registrations. Raw `hir-def` summaries leave this empty.
     pub notify_regs: Vec<NotifyReg>,
     pub idle_handler_regs: Vec<IdleReg>,
@@ -140,9 +144,12 @@ impl ModuleCallSummary {
             .collect();
 
         let mut seen_notify = FxHashSet::default();
+        // A partial semantic callback projection must not leak a prefix of its
+        // registrations into the atomic incoming-call index as if it were complete.
         let notify_regs = self
             .notify_regs
             .iter()
+            .filter(|_| !self.notify_projection_incomplete)
             .filter(|reg| {
                 matches!(reg.caller, CallerId::Method(_))
                     && !matches!(
@@ -173,7 +180,10 @@ impl ModuleCallSummary {
             notify_additional_signature_handlers: Vec::new(),
             notify_dynamic_signature_handlers: Vec::new(),
             notify_dynamic_signature_handler_sites: Vec::new(),
-            notify_dynamic_signature_analysis_incomplete: Vec::new(),
+            notify_dynamic_signature_analysis_incomplete: self
+                .notify_dynamic_signature_analysis_incomplete
+                .clone(),
+            notify_projection_incomplete: self.notify_projection_incomplete,
             notify_regs,
             idle_handler_regs,
             set_action_regs: Vec::new(),
@@ -968,6 +978,7 @@ pub(crate) fn extract_call_summary_with_cancellation(
         notify_dynamic_signature_handlers,
         notify_dynamic_signature_handler_sites,
         notify_dynamic_signature_analysis_incomplete,
+        notify_projection_incomplete: false,
         notify_regs: Vec::new(),
         idle_handler_regs,
         set_action_regs,
@@ -1248,7 +1259,7 @@ fn extract_from_body(
                 }
             }
             Expr::New { type_name, args } => {
-                if is_notify_constructor_candidate(body, type_name.is_some(), args) {
+                if is_notify_constructor_candidate(body, type_name.as_ref(), args) {
                     notify_candidates.push(NotifyConstructorCandidate {
                         caller,
                         constructor: expr_id,
@@ -1374,7 +1385,7 @@ fn dynamic_notify_array_aliases(
         });
         return Some(Vec::new());
     };
-    let (mut aliases, complete) =
+    let (mut aliases, complete, has_input_alternative) =
         resolver.resolve(name, constructor_range.start(), constructor_range.start(), cancel);
     if !complete {
         incomplete.push(DynamicNotifySignatureAnalysisGap {
@@ -1383,7 +1394,9 @@ fn dynamic_notify_array_aliases(
             constructor_range,
             array_name,
         });
-        return Some(Vec::new());
+        if !has_input_alternative {
+            return Some(Vec::new());
+        }
     }
     if aliases.is_empty() {
         aliases.push(DynamicNotifyArrayAlias {
@@ -1466,6 +1479,7 @@ struct DynamicArrayResolver<'a> {
     calls: Vec<DynamicArrayExpression<'a>>,
     calls_by_name: FxHashMap<NormName, Vec<usize>>,
     relevant_calls_cache: FxHashMap<NormName, std::sync::Arc<[usize]>>,
+    parameters: FxHashSet<NormName>,
     activity_cache: FxHashMap<DynamicNotifyArrayCandidate, bool>,
     uncertainty_cache: FxHashMap<DynamicNotifyArrayCandidate, DynamicArrayUncertainty>,
     remaining: usize,
@@ -1493,11 +1507,18 @@ impl<'a> DynamicArrayResolver<'a> {
             calls: Vec::new(),
             calls_by_name: FxHashMap::default(),
             relevant_calls_cache: FxHashMap::default(),
+            parameters: FxHashSet::default(),
             activity_cache: FxHashMap::default(),
             uncertainty_cache: FxHashMap::default(),
             remaining: DYNAMIC_ARRAY_ALIAS_WORK_BUDGET,
             since_cancel: 0,
         };
+        for parameter in body.params() {
+            if !this.spend(cancel) {
+                return None;
+            }
+            this.parameters.insert(NormName::intern(body.binding(parameter).name.as_str()));
+        }
         let mut branches = Vec::new();
         let mut unclassified = Vec::new();
         for (stmt_id, stmt) in body.stmts_iter() {
@@ -1879,11 +1900,12 @@ impl<'a> DynamicArrayResolver<'a> {
         before: TextSize,
         candidate_end: TextSize,
         cancel: &mut dyn FnMut(),
-    ) -> (Vec<DynamicNotifyArrayAlias>, bool) {
+    ) -> (Vec<DynamicNotifyArrayAlias>, bool, bool) {
         let mut pending = vec![(name, before, candidate_end, true)];
         let mut visited = FxHashSet::default();
         let mut results = Vec::new();
         let mut unresolved_alternative = false;
+        let mut has_input_alternative = false;
         while let Some((current_name, current_before, end_cap, is_root)) = pending.pop() {
             if !visited.insert((current_name, current_before, end_cap)) {
                 continue;
@@ -1893,6 +1915,17 @@ impl<'a> DynamicArrayResolver<'a> {
             let since_cancel = &mut self.since_cancel;
             let Some(all) = assignment_index.get(&current_name) else {
                 unresolved_alternative |= !is_root;
+                if self.parameters.contains(&current_name) {
+                    // The chain runs off the front of the body into the incoming
+                    // parameter: its identity is known and stays recoverable, while
+                    // its arbitrary incoming contents keep the result incomplete.
+                    has_input_alternative = true;
+                    results.push(DynamicNotifyArrayAlias {
+                        array_name: current_name,
+                        array_start: None,
+                        array_end: end_cap,
+                    });
+                }
                 continue;
             };
             let before_end =
@@ -1900,11 +1933,25 @@ impl<'a> DynamicArrayResolver<'a> {
             let assignments = &all[..before_end];
             for _ in assignments {
                 if !Self::spend_fields(remaining, since_cancel, cancel) {
-                    return (Vec::new(), false);
+                    return (Vec::new(), false, false);
                 }
             }
             let Some(&latest) = assignments.last() else {
                 unresolved_alternative |= !is_root;
+                if self.parameters.contains(&current_name) {
+                    // Every write to the parameter sits at or after the read being
+                    // resolved, so the read still sees the incoming value. The value's
+                    // lifetime ends at the first such write: later writes belong to the
+                    // rebound array, which this binding never receives.
+                    has_input_alternative = true;
+                    results.push(DynamicNotifyArrayAlias {
+                        array_name: current_name,
+                        array_start: None,
+                        array_end: all
+                            .first()
+                            .map_or(end_cap, |assignment| end_cap.min(assignment.range.start())),
+                    });
+                }
                 continue;
             };
             let mut selected = vec![latest];
@@ -1915,7 +1962,7 @@ impl<'a> DynamicArrayResolver<'a> {
                 let Some(branch) = site.branch else { continue };
                 for assignment in assignments {
                     if !Self::spend_fields(remaining, since_cancel, cancel) {
-                        return (Vec::new(), false);
+                        return (Vec::new(), false, false);
                     }
                     if branch.contains_range(assignment.range)
                         && selected_ranges.insert(assignment.range)
@@ -1927,7 +1974,7 @@ impl<'a> DynamicArrayResolver<'a> {
                 let mut previous = None;
                 for assignment in assignments {
                     if !Self::spend_fields(remaining, since_cancel, cancel) {
-                        return (Vec::new(), false);
+                        return (Vec::new(), false, false);
                     }
                     if assignment.range.end() <= branch.start()
                         && previous.is_none_or(|old: DynamicArrayAssignment<'_>| {
@@ -1942,11 +1989,22 @@ impl<'a> DynamicArrayResolver<'a> {
                         selected.push(previous);
                         branch_pending.push(previous);
                     }
+                } else if self.parameters.contains(&current_name) {
+                    // The path where this branch is not taken keeps the incoming
+                    // parameter value. Its known local additions remain possible,
+                    // while arbitrary incoming contents keep the result incomplete.
+                    unresolved_alternative = true;
+                    has_input_alternative = true;
+                    results.push(DynamicNotifyArrayAlias {
+                        array_name: current_name,
+                        array_start: None,
+                        array_end: end_cap.min(branch.start()),
+                    });
                 }
             }
             for assignment in selected {
                 if !self.spend(cancel) {
-                    return (Vec::new(), false);
+                    return (Vec::new(), false, false);
                 }
                 let binding_start = assignment.range.start();
                 match assignment.value {
@@ -1957,7 +2015,7 @@ impl<'a> DynamicArrayResolver<'a> {
                             candidate_end,
                             cancel,
                         ) else {
-                            return (Vec::new(), false);
+                            return (Vec::new(), false, false);
                         };
                         results.push(DynamicNotifyArrayAlias {
                             array_name: current_name,
@@ -1974,7 +2032,7 @@ impl<'a> DynamicArrayResolver<'a> {
                                 candidate_end,
                                 cancel,
                             ) else {
-                                return (Vec::new(), false);
+                                return (Vec::new(), false, false);
                             };
                             pending.push((source, binding_start, end_cap.min(source_end), false));
                         }
@@ -1987,7 +2045,7 @@ impl<'a> DynamicArrayResolver<'a> {
         let mut unique = Vec::with_capacity(results.len());
         for alias in results {
             if !self.spend(cancel) {
-                return (Vec::new(), false);
+                return (Vec::new(), false, false);
             }
             if seen.insert(alias) {
                 unique.push(alias);
@@ -1996,7 +2054,7 @@ impl<'a> DynamicArrayResolver<'a> {
         // Keep the historical syntax fallback for unknown-only roots. It is mixed
         // known/unknown alternatives that invalidate the recovered targets.
         let complete = unique.is_empty() || !unresolved_alternative;
-        (unique, complete)
+        (unique, complete, has_input_alternative)
     }
 }
 
@@ -2501,18 +2559,27 @@ fn dynamic_array_uncertain_writes(
     Some(result)
 }
 
-fn is_notify_constructor_candidate(body: &Body, typed: bool, args: &[ExprIdx]) -> bool {
-    if typed {
-        args.iter().any(|&arg| matches!(body.expr_idx(arg), Expr::Literal(Literal::String(_))))
-    } else {
-        // Dynamic array arguments need semantic resolution; the legacy direct-argument
-        // spelling also needs its source sites retained when platform facts are absent.
-        args.len() == 2
-            || (args.len() > 2
+fn is_notify_constructor_candidate(
+    body: &Body,
+    type_name: Option<&Name>,
+    args: &[ExprIdx],
+) -> bool {
+    match type_name {
+        Some(name) => {
+            bsl_platform::is_callback_description_type_name(name.as_str())
+                && args
+                    .iter()
+                    .any(|&arg| matches!(body.expr_idx(arg), Expr::Literal(Literal::String(_))))
+        }
+        None => {
+            // Dynamic callback constructors use a literal type name followed by an array;
+            // retain the legacy direct-argument form for syntax-only protection as well.
+            args.len() >= 2
                 && args
                     .first()
                     .and_then(|&arg| extract_string_literal(body, arg))
-                    .is_some_and(|name| bsl_platform::is_callback_description_type_name(&name)))
+                    .is_some_and(|name| bsl_platform::is_callback_description_type_name(&name))
+        }
     }
 }
 
@@ -2851,6 +2918,7 @@ mod tests {
             notify_dynamic_signature_handlers: Vec::new(),
             notify_dynamic_signature_handler_sites: Vec::new(),
             notify_dynamic_signature_analysis_incomplete: Vec::new(),
+            notify_projection_incomplete: false,
             notify_regs: vec![
                 NotifyReg {
                     caller: CallerId::Method(MethodKey::first("Главная")),
@@ -2978,6 +3046,30 @@ mod tests {
         assert!(subset.name_literal_refs.is_empty());
         assert!(subset.name_literal_ref_sites.is_empty());
         assert!(subset.form_entries.is_empty());
+
+        // Named alias uncertainty is not the semantic-budget exhaustion marker:
+        // keep known callback registrations while preserving the uncertainty data.
+        let mut uncertain_array = summary.clone();
+        uncertain_array.notify_dynamic_signature_analysis_incomplete.push(
+            DynamicNotifySignatureAnalysisGap {
+                caller: CallerId::Method(MethodKey::first("Главная")),
+                constructor: ExprId::from_raw(0.into()),
+                constructor_range: range(120),
+                array_name: Name::new("Параметры"),
+            },
+        );
+        let subset = uncertain_array.method_pair_subset();
+        assert_eq!(subset.notify_regs.len(), 2);
+        assert_eq!(subset.notify_dynamic_signature_analysis_incomplete.len(), 1);
+
+        // Budget exhaustion gets an explicit marker: do not publish its partial
+        // callback-registration prefix as a complete incoming-call projection.
+        uncertain_array.notify_projection_incomplete = true;
+        let subset = uncertain_array.method_pair_subset();
+        assert!(subset.notify_regs.is_empty());
+        assert!(subset.notify_projection_incomplete);
+        assert_eq!(subset.notify_dynamic_signature_analysis_incomplete.len(), 1);
+        assert!(!subset.call_edges.is_empty(), "complete direct calls remain projectable");
     }
 
     #[test]
@@ -3484,7 +3576,7 @@ EndProcedure
     }
 
     #[test]
-    fn raw_summary_keeps_generic_constructor_candidates_unverified() {
+    fn raw_summary_keeps_only_callback_shaped_constructor_candidates_unverified() {
         let code = r#"
 Перем Оповещение;
 Оповещение = Новый ОписаниеОповещения("ОбработатьОповещение", ЭтотОбъект);
@@ -3492,6 +3584,8 @@ EndProcedure
 Procedure Test()
     Notification = New NotifyDescription("HandleResult", ThisObject);
     Other = New UnknownType("AnotherHandler", CommonModule);
+    Structure = New Structure("Key", ThisObject);
+    DynamicStructure = New("Structure", Params);
     Params = New Array;
     Params.Add("DynamicHandler");
     Params.Add(ThisObject);
@@ -3529,11 +3623,11 @@ EndProcedure
             summary.notify_dynamic_signature_handlers.iter().map(Name::as_str).collect::<Vec<_>>(),
             ["DynamicHandler", "DynamicErrorHandler"]
         );
-        assert_eq!(summary.notify_candidates.len(), 7, "{:#?}", summary.notify_candidates);
-        assert!(summary.notify_candidates[..6]
+        assert_eq!(summary.notify_candidates.len(), 6, "{:#?}", summary.notify_candidates);
+        assert!(summary.notify_candidates[..5]
             .iter()
             .all(|candidate| candidate.caller == CallerId::Method(MethodKey::first("Test"))));
-        assert_eq!(summary.notify_candidates[6].caller, CallerId::ModuleCode);
+        assert_eq!(summary.notify_candidates[5].caller, CallerId::ModuleCode);
         assert!(summary
             .notify_candidates
             .iter()
@@ -3558,6 +3652,120 @@ EndProcedure
                 .iter()
                 .any(|name| name.as_str() == "ВозможныйОбработчик"),
             "passing a same-named member may change the array: {summary:#?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_callback_array_input_value_is_an_alternative_to_branch_assignment() {
+        let code = r#"
+Процедура Регистрация(А, Флаг)
+    А.Добавить("H");
+    А.Добавить(ЭтотОбъект);
+    Если Флаг Тогда
+        А = Новый Массив;
+        А.Добавить("Другой");
+        А.Добавить(ЭтотОбъект);
+    КонецЕсли;
+    О = Новый("CallbackDescription", А);
+КонецПроцедуры
+Процедура H(Параметр) Экспорт
+    Сообщить("Обработка");
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        let handlers: FxHashSet<_> =
+            summary.notify_dynamic_signature_handlers.iter().map(Name::as_str).collect();
+        assert!(
+            handlers.contains("H"),
+            "the untaken branch preserves the input array: {summary:#?}"
+        );
+        assert!(
+            handlers.contains("Другой"),
+            "the taken branch contributes its fresh array too: {summary:#?}"
+        );
+        assert_eq!(
+            summary.notify_dynamic_signature_analysis_incomplete.len(),
+            1,
+            "the unknown incoming array may contain additional handlers"
+        );
+    }
+
+    #[test]
+    fn dynamic_callback_array_input_survives_branch_via_local_alias() {
+        let code = r#"
+Процедура Регистрация(А, Флаг)
+    Копия = А;
+    Копия.Добавить("H");
+    Копия.Добавить(ЭтотОбъект);
+    Если Флаг Тогда
+        Копия = Новый Массив;
+        Копия.Добавить("Другой");
+        Копия.Добавить(ЭтотОбъект);
+    КонецЕсли;
+    О = Новый("CallbackDescription", Копия);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        let handlers: FxHashSet<_> =
+            summary.notify_dynamic_signature_handlers.iter().map(Name::as_str).collect();
+        assert!(
+            handlers.contains("H"),
+            "the untaken branch keeps the input array reached through the alias: {summary:#?}"
+        );
+        assert!(
+            handlers.contains("Другой"),
+            "the taken branch still contributes its fresh array: {summary:#?}"
+        );
+        assert_eq!(
+            summary.notify_dynamic_signature_analysis_incomplete.len(),
+            1,
+            "the incoming array may carry additional handlers"
+        );
+
+        // An opaque local in the same place is not the incoming array: without a known
+        // identity the branch alternatives cannot be combined, and the known one is dropped.
+        let local_source = code.replace(
+            "Процедура Регистрация(А, Флаг)",
+            "Процедура Регистрация(Флаг)\n    Перем А;\n    А = ПолучитьМассив();",
+        );
+        let summary = parse_and_extract(&local_source);
+        assert!(
+            summary.notify_dynamic_signature_handlers.is_empty(),
+            "an opaque local alternative cannot keep sibling aliases: {summary:#?}"
+        );
+        assert_eq!(summary.notify_dynamic_signature_analysis_incomplete.len(), 1);
+    }
+
+    #[test]
+    fn dynamic_callback_array_input_reached_when_parameter_reassigned_after_aliasing() {
+        let code = r#"
+Процедура Регистрация(А, Флаг)
+    Копия = А;
+    Копия.Добавить("H");
+    Копия.Добавить(ЭтотОбъект);
+    Если Флаг Тогда
+        А = Новый Массив;
+        А.Добавить("ИзА");
+        А.Добавить(ЭтотОбъект);
+    КонецЕсли;
+    О = Новый("CallbackDescription", Копия);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        let handlers: FxHashSet<_> =
+            summary.notify_dynamic_signature_handlers.iter().map(Name::as_str).collect();
+        assert!(
+            handlers.contains("H"),
+            "the alias bound before the branch keeps the input array: {summary:#?}"
+        );
+        assert!(
+            !handlers.contains("ИзА"),
+            "the branch rebinds the parameter itself, and the alias bound earlier keeps the old value: {summary:#?}"
+        );
+        assert_eq!(
+            summary.notify_dynamic_signature_analysis_incomplete.len(),
+            1,
+            "the incoming array may carry additional handlers"
         );
     }
 

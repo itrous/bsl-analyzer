@@ -4,7 +4,7 @@ use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
 #[cfg(test)]
 use hir::ModuleId;
 use hir::Name;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
     diagnostic_type: crate::metadata::DiagnosticType::Error,
@@ -49,9 +49,15 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     let local_unprovable = metadata.form.as_deref().is_some_and(|form| form.has_base_form());
 
     let mut diagnostics = Vec::new();
-    let mut reported_slots: Vec<(syntax::TextRange, Option<Name>, Name)> = Vec::new();
+    let mut reported_slots = FxHashSet::default();
     let mut module_verdicts = FxHashMap::default();
-    for candidate in notify_candidates.iter() {
+    // Same-name same-environment local registrations share one semantic verdict, so repeated
+    // registrations never repeat the declaration-environment work per candidate.
+    let mut local_verdicts = FxHashMap::default();
+    for (candidate_index, candidate) in notify_candidates.iter().enumerate() {
+        if candidate_index & 0xff == 0 {
+            ctx.check_cancellation();
+        }
         let Some(reg) = candidate.registration.as_ref() else { continue };
         // Weaving can normalize a current module receiver to ThisObject; keep the
         // registration target's module identity for base/extension lookup.
@@ -59,7 +65,11 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
             hir::NotifyCandidateReceiver::ThisObject
                 if let hir::call_graph::NotifyTarget::Module(module_name) = &reg.target =>
             {
-                let key = (module_name.clone(), reg.callback_name.clone(), reg.environments);
+                let key = (
+                    hir::normalize_match_name(module_name),
+                    hir::normalize_match_name(&reg.callback_name),
+                    reg.environments,
+                );
                 let verdict = *module_verdicts
                     .entry(key)
                     .or_insert_with(|| module_verdict(ctx, module_name, &reg.callback_name, reg));
@@ -68,10 +78,19 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
                 })
             }
             hir::NotifyCandidateReceiver::ThisObject if local_unprovable => None,
-            hir::NotifyCandidateReceiver::ThisObject => local_verdict(ctx, &reg.callback_name, reg)
-                .map(|v| (v, reg.callback_name.to_string())),
+            hir::NotifyCandidateReceiver::ThisObject => {
+                let key = (hir::normalize_match_name(&reg.callback_name), reg.environments);
+                let verdict = *local_verdicts
+                    .entry(key)
+                    .or_insert_with(|| local_verdict(ctx, &reg.callback_name, reg));
+                verdict.map(|v| (v, reg.callback_name.to_string()))
+            }
             hir::NotifyCandidateReceiver::ForeignModule(module_name) => {
-                let key = (module_name.clone(), reg.callback_name.clone(), reg.environments);
+                let key = (
+                    hir::normalize_match_name(module_name),
+                    hir::normalize_match_name(&reg.callback_name),
+                    reg.environments,
+                );
                 let verdict = *module_verdicts
                     .entry(key)
                     .or_insert_with(|| module_verdict(ctx, module_name, &reg.callback_name, reg));
@@ -93,18 +112,14 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
             ) => Some(module.clone()),
             _ => None,
         };
-        if reported_slots.iter().any(|(range, previous_module, previous_name)| {
-            *range == reg.range
-                && previous_name.eq_ignore_case(&reg.callback_name)
-                && match (previous_module, &module) {
-                    (Some(left), Some(right)) => left.eq_ignore_case(right),
-                    (None, None) => true,
-                    _ => false,
-                }
-        }) {
+        let slot = (
+            reg.range,
+            module.as_ref().map(hir::normalize_match_name),
+            hir::normalize_match_name(&reg.callback_name),
+        );
+        if !reported_slots.insert(slot) {
             continue;
         }
-        reported_slots.push((reg.range, module, reg.callback_name.clone()));
         diagnostics.push(Diagnostic {
             code,
             message,

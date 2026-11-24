@@ -1,5 +1,5 @@
 use hir::{
-    graph_index::{project_batch_method_call_pairs, GraphIndex},
+    graph_index::{project_batch_method_call_pairs_checked, GraphIndex},
     MethodCallPair, ModuleId,
 };
 
@@ -28,13 +28,14 @@ pub fn reproject_call_hierarchy_index_modules(
             open_batch,
             &pool,
             |db| {
-                let pairs = project_batch_method_call_pairs(&pool, db, graph_index, batch);
+                let pairs = project_batch_method_call_pairs_checked(&pool, db, graph_index, batch)
+                    .map_err(CallHierarchyIndexBuildError::IncompleteNotifyProjection)?;
                 let mut refreshed_layouts = GraphIndex::new();
                 refreshed_layouts.add_batch(&pool, db, batch);
-                (pairs, refreshed_layouts)
+                Ok::<_, CallHierarchyIndexBuildError>((pairs, refreshed_layouts))
             },
             |_release| {},
-        );
+        )?;
         let by_module = MethodCallPair::group_by_caller_module(&pairs);
         for &module in batch {
             let layout_hash = refreshed_layouts
@@ -57,7 +58,7 @@ mod tests {
 
     use super::*;
     use crate::RootDatabaseImpl;
-    use hir::MethodId;
+    use hir::{DefDatabase, MethodId};
 
     const ROOT: SourceRootId = SourceRootId(0);
 
@@ -97,6 +98,52 @@ mod tests {
         assert_eq!(projections[0].module, changed_module);
         assert!(projections[0].pairs.is_empty());
         assert_eq!(*batches.borrow(), vec![vec![changed_module]]);
+    }
+
+    #[test]
+    fn catch_up_accepts_named_unknown_array_gap_without_marking_projection_truncated() {
+        // Given: a caller whose incoming array has a known local callback plus an
+        // unknown input-value alternative, which is an intentional analysis boundary.
+        let changed_module = ModuleId::new(FileId(0));
+        let unchanged_module = ModuleId::new(FileId(1));
+        let modules = [changed_module, unchanged_module];
+        let source = r#"
+Процедура Первый(А, Флаг)
+    А.Добавить("H");
+    А.Добавить(ЭтотОбъект);
+    Если Флаг Тогда
+        А = Новый Массив;
+        А.Добавить("Другой");
+        А.Добавить(ЭтотОбъект);
+    КонецЕсли;
+    О = Новый("CallbackDescription", А);
+КонецПроцедуры
+Процедура H(Параметр) Экспорт
+КонецПроцедуры
+"#;
+        let target = "Процедура Второй()\nКонецПроцедуры";
+        let db = batch_database(&modules, source, target);
+        let summary = db.module_call_summary(changed_module);
+        assert!(!summary.notify_projection_incomplete);
+        assert!(!summary.notify_dynamic_signature_analysis_incomplete.is_empty());
+        let mut graph_index = GraphIndex::new();
+        for &module in &modules {
+            graph_index.add_module(&db, module);
+        }
+        let mut open_batch = |_batch: &[ModuleId]| batch_database(&modules, source, target);
+
+        // When: catch-up reprojects the changed module through the checked path.
+        let projections = reproject_call_hierarchy_index_modules(
+            &graph_index,
+            1,
+            &[changed_module],
+            &mut open_batch,
+        )
+        .expect("named unknown-array uncertainty is not budget truncation");
+
+        // Then: the generation remains projectable despite the descriptive gap.
+        assert_eq!(projections.len(), 1);
+        assert_eq!(projections[0].module, changed_module);
     }
 
     #[test]

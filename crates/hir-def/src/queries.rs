@@ -77,8 +77,9 @@ mod heap_estimate {
 
     pub(super) fn module_call_summary_heap(v: &Arc<ModuleCallSummary>) -> usize {
         use crate::call_graph::{
-            CallEdge, DynamicNotifySignatureHandler, FormEventEntry, IdleReg, MethodSummary,
-            NameLiteralRefSite, NotifyConstructorCandidate, NotifyReg, NotifyTarget, SetActionReg,
+            CallEdge, DynamicNotifySignatureAnalysisGap, DynamicNotifySignatureHandler,
+            FormEventEntry, IdleReg, MethodSummary, NameLiteralRefSite, NotifyConstructorCandidate,
+            NotifyReg, NotifyTarget, SetActionReg,
         };
 
         let s = &**v;
@@ -110,6 +111,12 @@ mod heap_estimate {
         );
         for site in &s.notify_dynamic_signature_handler_sites {
             bytes += name_bytes(&site.handler_name);
+        }
+        bytes += vec_bytes::<DynamicNotifySignatureAnalysisGap>(
+            s.notify_dynamic_signature_analysis_incomplete.len(),
+        );
+        for gap in &s.notify_dynamic_signature_analysis_incomplete {
+            bytes += name_bytes(&gap.array_name);
         }
         bytes += vec_bytes::<NotifyReg>(s.notify_regs.len());
         for r in &s.notify_regs {

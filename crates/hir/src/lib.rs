@@ -25,7 +25,7 @@ pub use hir_ty::{is_form_items_collection_ty, FORM_ITEMS_TYPE_EN, FORM_ITEMS_TYP
 pub use hir_ty::{
     method_has_form_context, notify_handler_availability_for_method_bodies_in_registration,
     notify_handler_availability_in_registration, notify_method_is_exported_in_registration,
-    owner_has_form_context, NotifyHandlerAvailability,
+    notify_methods_exported_in_registrations, owner_has_form_context, NotifyHandlerAvailability,
 };
 pub use hir_ty::{PlatformMethodHandle, PlatformMethodOrigin};
 pub use name_classify::{classify_token, NameClass};
@@ -38,8 +38,9 @@ pub use type_facade::{
     kernel_type_is_boolean, kernel_type_is_fixed_structure, kernel_type_is_form_data_structure,
     kernel_type_is_metadata_reference, kernel_type_is_structure, kernel_type_label,
     kernel_union_member_labels, module_implicit_field_names, module_implicit_fields,
-    platform_name_entries, root_metadata_object_type, root_metadata_ref_type,
-    root_object_manager_type, Field, HirFieldOrigin, PlatformNameEntry, PlatformNameKind, Type,
+    platform_help_available, platform_name_entries, root_metadata_object_type,
+    root_metadata_ref_type, root_object_manager_type, Field, HirFieldOrigin, PlatformNameEntry,
+    PlatformNameKind, Type,
 };
 
 pub use hir_def::execution_env;
@@ -977,6 +978,149 @@ mod tests {
         db.set_file_text(file_id, source);
 
         (db, file_id)
+    }
+
+    #[test]
+    fn conditional_range_sort_charges_the_budget_before_an_uncancelled_sort() {
+        const REGIONS: usize = 4096;
+        let mut source = String::from("&НаКлиенте\nПроцедура Зарегистрировать()\n");
+        for _ in 0..REGIONS {
+            source.push_str("#Если Сервер Тогда\n#КонецЕсли\n");
+        }
+        source.push_str(
+            "    Описание = Новый ОписаниеОповещения(\"Обработчик\", ЭтотОбъект);\n\n\
+             КонецПроцедуры\n\n&НаКлиенте\nПроцедура Обработчик(Параметр)\nКонецПроцедуры\n",
+        );
+        let (db, file_id) = create_db_with_file(&source);
+
+        // The filter (one candidate) and the index entries (one per region) leave
+        // sort_work(REGIONS) − 1: the log-linear charge must exhaust exactly there,
+        // before the sort runs, while the uncharged linear passes would still fit.
+        let sort_charge = REGIONS * 12; // ceil(log2(REGIONS)) merge levels
+        let exhausted = semantic_notify_facts_with_work_limit(
+            &db,
+            base_db::FileIdInput::new(&db, file_id),
+            REGIONS + sort_charge,
+        );
+        assert!(exhausted.summary.notify_projection_incomplete);
+
+        // The same module finishes inside the default work limit.
+        let complete = semantic_notify_facts_with_work_limit(
+            &db,
+            base_db::FileIdInput::new(&db, file_id),
+            131_072,
+        );
+        assert!(!complete.summary.notify_projection_incomplete);
+    }
+
+    #[test]
+    fn notify_projection_with_zero_budget_does_not_mark_a_module_without_candidates_incomplete() {
+        let source = r#"
+Процедура Первый()
+    Значение = 1;
+КонецПроцедуры
+Процедура Второй()
+    Значение = 2;
+КонецПроцедуры
+Процедура Третий()
+    Значение = 3;
+КонецПроцедуры
+"#;
+        let (db, file_id) = create_db_with_file(source);
+        let facts =
+            semantic_notify_facts_with_work_limit(&db, base_db::FileIdInput::new(&db, file_id), 0);
+        assert!(!facts.summary.notify_projection_incomplete);
+        assert!(facts.summary.notify_regs.is_empty());
+        assert!(facts.notify_candidates.is_empty());
+    }
+
+    #[test]
+    fn named_dynamic_array_gap_does_not_mark_budget_exhaustion() {
+        let source = r#"
+Процедура Зарегистрировать(Параметры, Флаг)
+    Параметры.Добавить("Обработчик");
+    Параметры.Добавить(ЭтотОбъект);
+    Если Флаг Тогда
+        Параметры = Новый Массив;
+        Параметры.Добавить("Другой");
+        Параметры.Добавить(ЭтотОбъект);
+    КонецЕсли;
+    Описание = Новый("CallbackDescription", Параметры);
+КонецПроцедуры
+"#;
+        let (db, file_id) = create_db_with_file(source);
+        let facts = semantic_notify_facts_with_work_limit(
+            &db,
+            base_db::FileIdInput::new(&db, file_id),
+            100_000,
+        );
+        assert!(!facts.summary.notify_projection_incomplete);
+        assert!(
+            !facts.summary.notify_dynamic_signature_analysis_incomplete.is_empty(),
+            "the source-level unknown array is still reported as a named gap"
+        );
+    }
+
+    #[test]
+    fn notify_projection_budget_exhaustion_is_distinct_from_named_array_gaps() {
+        let source = r#"
+Процедура Зарегистрировать()
+    Описание = Новый ОписаниеОповещения("Обработчик", ЭтотОбъект);
+КонецПроцедуры
+"#;
+        let (db, file_id) = create_db_with_file(source);
+        let facts =
+            semantic_notify_facts_with_work_limit(&db, base_db::FileIdInput::new(&db, file_id), 0);
+        assert!(facts.summary.notify_projection_incomplete);
+        assert!(facts.summary.notify_regs.is_empty());
+        assert!(facts.notify_candidates.iter().any(|candidate| {
+            candidate.analysis_incomplete
+                && candidate.signature_protection() == NotifySignatureProtection::Indeterminate
+        }));
+    }
+
+    #[test]
+    fn notify_signature_protection_distinguishes_alternative_and_impossible_builds() {
+        let source = r#"
+&НаКлиенте
+Процедура Зарегистрировать()
+#Если МобильныйКлиент Тогда
+    Описание = Новый ОписаниеОповещения("Возможный", ЭтотОбъект);
+#КонецЕсли
+#Если Сервер И Не Сервер Тогда
+    Описание = Новый ОписаниеОповещения("Невозможный", ЭтотОбъект);
+#КонецЕсли
+КонецПроцедуры
+
+&НаКлиенте
+Процедура Возможный(Параметр)
+КонецПроцедуры
+
+&НаКлиенте
+Процедура Невозможный(Параметр)
+КонецПроцедуры
+"#;
+        let (db, file_id) = create_db_with_file(source);
+        let facts = semantic_notify_facts_with_work_limit(
+            &db,
+            base_db::FileIdInput::new(&db, file_id),
+            100_000,
+        );
+        let possible = facts
+            .notify_candidates
+            .iter()
+            .find(|candidate| candidate.callback_name.as_str() == "Возможный")
+            .expect("the alternate mobile build retains the callback candidate");
+        assert!(possible.site_reachable, "another valid build compiles this branch: {possible:#?}");
+        assert_eq!(possible.signature_protection(), NotifySignatureProtection::Protected);
+
+        let impossible = facts
+            .notify_candidates
+            .iter()
+            .find(|candidate| candidate.callback_name.as_str() == "Невозможный")
+            .expect("the semantically contradictory branch remains visible for the verdict");
+        assert!(!impossible.site_reachable, "no environment compiles this branch: {impossible:#?}");
+        assert_eq!(impossible.signature_protection(), NotifySignatureProtection::NotProtected);
     }
 
     #[test]
