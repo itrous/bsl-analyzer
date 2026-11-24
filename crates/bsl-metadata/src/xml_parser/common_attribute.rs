@@ -5,11 +5,10 @@ use crate::common_attribute::{
     classify_content_reference, CommonAttribute, CommonAttributeUse,
     ConfigurationExtensionsSeparation, ContentTarget, SeparatedDataUse,
 };
-use crate::enums::ObjectBelonging;
 use crate::error::{MetadataError, Result};
 use crate::metadata_object::AttributeType;
 
-use super::helpers::{child_text, find_child, find_mdo_element, parse_xml};
+use super::helpers::{child_text, find_child, find_mdo_element, parse_object_belonging, parse_xml};
 use super::type_parser::parse_type_xml;
 use uuid::Uuid;
 
@@ -60,11 +59,7 @@ pub fn parse_common_attribute_xml(xml: &str) -> Result<CommonAttribute> {
         }
         _ => None,
     };
-    let object_belonging = match child_text(props, "ObjectBelonging").map(str::trim) {
-        None | Some("Own") | Some("Native") => ObjectBelonging::Own,
-        Some("Adopted") => ObjectBelonging::Adopted,
-        Some(_) => ObjectBelonging::Unknown,
-    };
+    let object_belonging = parse_object_belonging(props);
 
     let mut content = FxHashMap::default();
     let mut unattributed_members = false;
@@ -131,6 +126,7 @@ pub fn parse_common_attribute_xml(xml: &str) -> Result<CommonAttribute> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::enums::ObjectBelonging;
     use crate::metadata_object::MdoType;
 
     const SEPARATOR: &str = include_str!(

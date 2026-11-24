@@ -1,0 +1,76 @@
+{
+  "source": ".artifacts/issue379-native/g1-20261010T233319Z-f946153f/native-exports/canonical-base-v1/base",
+  "producer_platform": "8.3.27.1989",
+  "compatible_mode": "Version8_3_27",
+  "content": "complete existing own canonical G1 export, XML and BSL unchanged",
+  "files": {
+    "Catalogs/BaseCatalog.xml": {
+      "sha256": "eaabd12e8504888e6511a770c0c830a561452972ffb597e86de61d918e7bf208",
+      "bytes": 4490
+    },
+    "CommonAttributes/AreaNoAuto.xml": {
+      "sha256": "dc0549d2e093140da58623f350328e0428faa76505022e31c0dd93c1c749bcba",
+      "bytes": 2663
+    },
+    "CommonAttributes/AreaUse.xml": {
+      "sha256": "20ea4256cf984500186ca79400ce45798ca1fcec8fe2aebadc7a62d0e376978d",
+      "bytes": 2653
+    },
+    "CommonAttributes/OrdinaryAuto.xml": {
+      "sha256": "929870a2aa90378ad090aca2b3adc3168736fb1f93f3340818417bcf7d64ef49",
+      "bytes": 2557
+    },
+    "CommonAttributes/OtherNoAuto.xml": {
+      "sha256": "30115a64513276eae970ab9a76232b84464c5f96db6394658930f4bbe1c1d5a9",
+      "bytes": 2681
+    },
+    "CommonAttributes/OtherUse.xml": {
+      "sha256": "6ebed477c5c4ff587615810c1829d58ca55582049cad3aee18d750e6151da020",
+      "bytes": 2671
+    },
+    "ConfigDumpInfo.xml": {
+      "sha256": "c1e67172cbf9246710c4b10cb5306c5518ce8f7a867ff14a509578f8edd35897",
+      "bytes": 3004
+    },
+    "Configuration.xml": {
+      "sha256": "865b435fa6ff968a5c550e0e04f3e2b9555f0eecfa5acabe7b0975074fc35d12",
+      "bytes": 10905
+    },
+    "Ext/OrdinaryApplicationModule.bsl": {
+      "sha256": "95b91fe3bb464dbd23fd4fa1f6288088c9c5c34dd0f82a7413bb306dac013a57",
+      "bytes": 7890
+    },
+    "Ext/SessionModule.bsl": {
+      "sha256": "c7d99a8affe69aac148afbeaf364693126d78d15512803bb965fee7d4389b9c0",
+      "bytes": 520
+    },
+    "InformationRegisters/BaseRegister.xml": {
+      "sha256": "b8d8b57a8531dc395910b9011df84d079f8983d78456bcfe1ee3c6d61f0defbf",
+      "bytes": 11946
+    },
+    "Languages/English.xml": {
+      "sha256": "f13c5dea7763803d0218ee31d2e0d45d5abba4fd088ec83509f8fe33494b6ad1",
+      "bytes": 1237
+    },
+    "SessionParameters/AreaNoAutoValue.xml": {
+      "sha256": "c38993cc0e87527df7e2ec211a61f78a3158f476320f68e44c11c5682126068f",
+      "bytes": 1355
+    },
+    "SessionParameters/AreaUseValue.xml": {
+      "sha256": "5d92e26448d0e1e70e7ae5de4545b26e643c7b1de8513ed085732920be7d8201",
+      "bytes": 1352
+    },
+    "SessionParameters/OtherNoAutoValue.xml": {
+      "sha256": "787cc45692f9dec8feb4000a9918d9fdb476e3831477b4cb0a09710f6b49b75d",
+      "bytes": 1356
+    },
+    "SessionParameters/OtherUseValue.xml": {
+      "sha256": "f688b7bb48fc6a7f096074f3029bb43ece9fca95b826bc32ba362d63cdd79b19",
+      "bytes": 1353
+    },
+    "SessionParameters/UseSeparation.xml": {
+      "sha256": "69b5c3ca3cd75c2544ef811e9bfc93ffbd0f28890d3ad60191abc57c28d9b878",
+      "bytes": 1169
+    }
+  }
+}

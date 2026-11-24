@@ -10,6 +10,9 @@ use std::time::Duration;
 
 #[derive(Default)]
 struct SearchDriftPlan {
+    input_entries: Vec<crate::change_hub::ChangeEntry>,
+    input_rescan: bool,
+    disk_epoch: u64,
     dirty_paths: Vec<PathBuf>,
     removed_paths: Vec<PathBuf>,
     removed_subtrees: Vec<PathBuf>,
@@ -691,12 +694,18 @@ impl SharedState {
         rescan_required: bool,
         graph: &GraphState,
     ) -> SearchDriftPlan {
+        let mut plan = SearchDriftPlan {
+            input_entries: entries.to_vec(),
+            input_rescan: rescan_required,
+            ..SearchDriftPlan::default()
+        };
+        let Ok(disk_read) = engine.disk_gate.try_read() else { return plan };
+        plan.disk_epoch = disk_read.epoch();
         if !graph.validate_workspace_scope() {
             return SearchDriftPlan { preparation_stopping: true, ..SearchDriftPlan::default() };
         }
         let class =
             crate::drift_classify::classify_drift(entries, &std::collections::HashSet::new(), None);
-        let mut plan = SearchDriftPlan::default();
         plan.removed_paths.extend(class.bsl_removed.iter().map(|path| path.raw.clone()));
         plan.removed_subtrees.extend(
             entries
@@ -939,6 +948,23 @@ impl SharedState {
         plan: &mut SearchDriftPlan,
         graph: &GraphState,
     ) -> super::WorkspaceSearchApply<bool, bsl_search::SearchError> {
+        let Ok(disk_read) = shared.disk_gate.try_read() else {
+            return super::WorkspaceSearchApply::TransientRefusal;
+        };
+        if plan.disk_epoch != disk_read.epoch() {
+            let loss_token = plan.loss_token;
+            *plan = Self::prepare_search_drift(
+                shared,
+                stop,
+                &plan.input_entries,
+                plan.input_rescan,
+                graph,
+            );
+            plan.loss_token = loss_token;
+            if plan.disk_epoch != disk_read.epoch() {
+                return super::WorkspaceSearchApply::TransientRefusal;
+            }
+        }
         if !graph.validate_workspace_scope() {
             return super::WorkspaceSearchApply::Stopping;
         }
@@ -1703,6 +1729,38 @@ mod tests {
             &crate::graph::GraphState::disabled(),
         );
         assert!(lock.exists(), "a plan with work skipped the lease fence");
+    }
+
+    #[test]
+    fn disk_transaction_reprepares_old_search_drift_before_publishing() {
+        let dir = tempdir().unwrap();
+        let shared = crate::state::shared_engine(Some(
+            SearchEngine::fts_only(&dir.path().join("search.db")).unwrap(),
+        ));
+        let lease = crate::workspace_lease::WorkspaceLease::claim(dir.path());
+        let lock = crate::cache::WorkspaceCacheLayout::for_workspace(dir.path()).lease_lock_path();
+        std::fs::remove_file(&lock).unwrap();
+        let mut plan = SearchDriftPlan {
+            dirty_keys: vec![bsl_search::FileKey::configuration("old.bsl")],
+            ..Default::default()
+        };
+        shared
+            .disk_gate
+            .begin_write(std::time::Duration::from_secs(1), &|| false)
+            .unwrap()
+            .finish();
+        assert!(matches!(
+            SharedState::apply_prepared_search_drift(
+                &shared,
+                &crate::state::OwnerStop::default(),
+                &lease,
+                &mut plan,
+                &crate::graph::GraphState::disabled(),
+            ),
+            crate::state::WorkspaceSearchApply::Applied(true)
+        ));
+        assert!(plan.dirty_keys.is_empty());
+        assert!(!lock.exists(), "an old preparation must not enter cache publication");
     }
 
     #[test]

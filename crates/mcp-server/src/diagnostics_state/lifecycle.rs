@@ -305,6 +305,7 @@ pub(super) struct Inner {
 /// Handle to the workspace diagnostics database. Cheap to clone (shared `Arc`s).
 #[derive(Clone)]
 pub(crate) struct DiagnosticsState {
+    pub(crate) disk_gate: ide_host_core::WorkspaceDiskGate,
     pub(super) inner: Arc<ide::FairMutex<Inner>>,
     pub(super) scan: Arc<Mutex<Option<ScanCache>>>,
     pub(super) last_access: Arc<Mutex<Instant>>,
@@ -609,6 +610,37 @@ impl DiagnosticsState {
         }
     }
 
+    pub(crate) fn publish_disk_transaction(
+        &self,
+        writer: &ide_host_core::WorkspaceDiskWrite,
+    ) -> Result<ide_host_core::WorkspaceSnapshot, String> {
+        if !writer.is_for(&self.disk_gate) {
+            return Err("filesystem transaction belongs to another workspace".to_owned());
+        }
+        let root = self.workspace_root.as_deref().ok_or("workspace has no disk owner")?;
+        let built = Self::catch_build(|| {
+            Self::build_resident_with_catalog(root, &self.excluded, self.catalog.clone())
+        })?;
+        if !built.scan_clean {
+            return Err("terminal workspace rescan could not read the whole source tree".to_owned());
+        }
+        if config_identity_now(root) != built.config_fp {
+            return Err("workspace configuration changed during its terminal rescan".to_owned());
+        }
+        {
+            let mut inner = lock_inner(&self.inner);
+            inner.build_attempt = inner.build_attempt.wrapping_add(1);
+            inner.invalid_configuration = None;
+            self.publish_build_success(&mut inner, built);
+        }
+        *lock_recover(&self.scan) = None;
+        if let Some(hub) = &self.change_hub {
+            hub.reconcile_after_disk_transaction();
+        }
+        self.workspace_snapshot()
+            .map_err(|_| "terminal owner publication is unavailable".to_owned())
+    }
+
     pub(crate) fn workspace_generation(&self) -> Result<u64, DiagnosticsStatus> {
         let inner = lock_inner(&self.inner);
         match &inner.status {
@@ -649,6 +681,7 @@ impl DiagnosticsState {
     /// Freeze disk publications when the live project no longer validates, while leaving
     /// the already-built resident and its generation available to existing readers.
     pub(crate) fn freeze_invalid_project(&self) -> bool {
+        let Ok(_disk_read) = self.disk_gate.try_read() else { return false };
         if !self.last_good_on_invalid {
             return false;
         }
@@ -741,6 +774,7 @@ impl DiagnosticsState {
 
     fn with_status(status: DiagnosticsStatus, workspace_root: Option<PathBuf>) -> Self {
         Self {
+            disk_gate: Default::default(),
             inner: Arc::new(ide::FairMutex::new(Inner {
                 status,
                 resident: None,
@@ -812,16 +846,21 @@ impl DiagnosticsState {
     /// Attach the daemon's change hub so drift is served event-driven (drain-on-read)
     /// while the watcher is healthy, with the scan as the reconcile/fallback oracle.
     pub(crate) fn with_change_hub(mut self, hub: WorkspaceChangeHub) -> Self {
+        self.disk_gate = hub.disk_gate();
         self.change_hub = Some(hub);
         self
     }
 
     pub(crate) fn status(&self) -> DiagnosticsStatus {
+        if self.disk_gate.recovery_required() {
+            return DiagnosticsStatus::Failed(super::DISK_RECOVERY_REQUIRED.to_owned());
+        }
         lock_inner(&self.inner).status.clone()
     }
 
     /// A lifecycle snapshot for the `status` action and the enriched `loading` envelope.
     pub(crate) fn status_report(&self) -> StatusReport {
+        let recovery = self.disk_gate.recovery_required();
         let inner = lock_inner(&self.inner);
         let (state, files) = match &inner.status {
             DiagnosticsStatus::Disabled => ("disabled", None),
@@ -862,16 +901,16 @@ impl DiagnosticsState {
             }
         });
         StatusReport {
-            state,
+            state: if recovery { "failed" } else { state },
             generation: inner.generation,
             files,
             unread_files: inner.resident.as_ref().map(|r| r.unread_count()),
             reload: inner.reload.label(),
-            error,
+            error: if recovery { Some(super::DISK_RECOVERY_REQUIRED.to_owned()) } else { error },
             elapsed_ms: inner.loading_since.map(|t| millis(t.elapsed())),
             failed_age_ms: inner.failed_at.map(|at| millis(now.saturating_duration_since(at))),
             attempts: inner.failed_attempts,
-            retry_after_ms,
+            retry_after_ms: if recovery { None } else { retry_after_ms },
             watch,
         }
     }
@@ -1017,6 +1056,13 @@ impl DiagnosticsState {
     where
         F: FnOnce(&mut DiagnosticsResident, u64) -> R,
     {
+        let Ok(_disk_read) = self.disk_gate.try_read() else {
+            return if self.disk_gate.recovery_required() {
+                ResidentOutcome::Failed(super::DISK_RECOVERY_REQUIRED.to_owned())
+            } else {
+                ResidentOutcome::Loading
+            };
+        };
         *lock_recover(&self.last_access) = Instant::now();
         // Freshness is handled before taking the lock: an incremental apply needs the
         // same mutex and it is non-reentrant. A full rebuild runs off-thread and this
@@ -1176,6 +1222,14 @@ impl DiagnosticsState {
     /// database that is right there, eviction unable to drop it and the hub cursor never
     /// released. A retired attempt publishes NOTHING and says so in the log.
     fn run_load(&self, attempt: u64) {
+        let Ok(_disk_read) = self.disk_gate.try_read() else {
+            let mut inner = lock_inner(&self.inner);
+            if inner.build_attempt == attempt {
+                inner.status = DiagnosticsStatus::Idle;
+                inner.loading_since = None;
+            }
+            return;
+        };
         let Some(root) = self.workspace_root.clone() else {
             return;
         };
@@ -1339,6 +1393,10 @@ impl DiagnosticsState {
     /// then swap it in under the write lock. Keeps the old resident served until the
     /// swap; on failure the old one stays and `reload` is flagged failed.
     fn run_reload(&self) {
+        let Ok(_disk_read) = self.disk_gate.try_read() else {
+            lock_inner(&self.inner).reload = ReloadState::Idle;
+            return;
+        };
         if self.freeze_if_invalid_or_frozen() {
             return;
         }
@@ -1533,6 +1591,9 @@ impl DiagnosticsState {
         let project = crate::project::at(root)
             .map_err(|e| anyhow::anyhow!("invalid project at {}: {e}", root.display()))?;
         let snapshot = ProjectSnapshot::from_project_excluding(&project, excluded);
+        let dependency_fingerprint = (!snapshot.semantic_dependency_roots().is_empty())
+            .then(|| crate::graph::scan::semantic_dependency_fingerprint(&snapshot))
+            .flatten();
         // Taken BEFORE the walk, because `WorkspaceRoots::build` canonicalises against the disk
         // rather than reading the already-loaded project: built afterwards, it could describe a
         // retargeted symlink the walk never saw, and then the table and `by_path` would be two
@@ -1633,6 +1694,7 @@ impl DiagnosticsState {
             ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot::load(&project);
         Ok(ResidentBuild {
             resident: DiagnosticsResident {
+                dependency_fingerprint,
                 db: ide_host_core::WorkspaceBackend::from_database_with_catalog(db, catalog),
                 #[cfg(test)]
                 read_trims: 0,
@@ -1703,7 +1765,11 @@ impl DiagnosticsState {
             return;
         }
         if !hub.ensure_scope(
-            &crate::change_hub::watch_targets_for(root, scan_roots),
+            &crate::change_hub::watch_targets_for(root, &{
+                let mut roots = scan_roots.to_vec();
+                roots.extend(live.semantic_dependency_roots());
+                roots
+            }),
             &live.user_excluded,
             declaration_epoch,
         ) {

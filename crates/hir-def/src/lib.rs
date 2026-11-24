@@ -3,6 +3,7 @@ pub mod call_graph;
 pub mod call_hierarchy_index;
 pub mod catch_class;
 pub mod common_module_ref;
+pub mod compilation_context;
 pub mod conditional_tree;
 pub mod configs;
 pub mod docs;

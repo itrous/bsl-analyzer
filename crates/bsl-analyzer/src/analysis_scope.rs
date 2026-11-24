@@ -52,6 +52,14 @@ impl ScopeState {
 }
 
 impl GlobalState {
+    pub(crate) fn abort_scope_build(&mut self, generation: u64) {
+        if matches!(self.analysis_scope,ScopeState::Loading{generation:current} if current==generation)
+        {
+            self.analysis_scope = ScopeState::Failed { generation };
+            self.scope_build_queued = true;
+        }
+    }
+
     fn scope_diff_base(&self) -> Option<String> {
         self.project.as_ref()?.config.analysis.diff_base.clone()
     }
@@ -90,6 +98,8 @@ impl GlobalState {
         if !self.task_pool.pool.has_capacity() {
             return;
         }
+
+        let Ok(disk_read) = self.prepare_disk_read() else { return };
 
         self.scope_generation = self.scope_generation.wrapping_add(1);
         let generation = self.scope_generation;
@@ -133,7 +143,15 @@ impl GlobalState {
                 generation,
                 "analysis scope build finished"
             );
-            Task::AnalysisScopeReady { generation, result, identity }
+            Task::DiskReadCompleted {
+                epoch: disk_read.epoch(),
+                task: Box::new(Task::AnalysisScopeReady { generation, result, identity }),
+                cancelled: Box::new(Task::AnalysisScopeReady {
+                    generation,
+                    result: Err("workspace disk epoch changed".into()),
+                    identity: None,
+                }),
+            }
         });
 
         match spawned {
@@ -204,6 +222,7 @@ impl GlobalState {
     /// stale with no event to notice it. Comparing resolved OIDs is a few
     /// milliseconds, so the 60s idle cadence is essentially free.
     pub fn check_scope_ref_drift(&mut self) {
+        let Ok(_disk_read) = self.prepare_disk_read() else { return };
         if self.scope_diff_base().is_none() || self.analysis_scope.is_loading() {
             return;
         }
@@ -301,6 +320,42 @@ mod tests {
             Path::new("/repo"),
             [("Module.bsl".to_string(), None)],
         ))
+    }
+
+    #[test]
+    fn workspace_disk_background_stale_scope_requeues_without_replacing_filter() {
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new(sender);
+        let accepted = test_scope();
+        state.analysis_scope = ScopeState::Ready { generation: 1, scope: accepted.clone() };
+        state.apply_scope_to_config();
+        state.analysis_scope = ScopeState::Loading { generation: 2 };
+        let epoch = state.try_disk_read().unwrap().epoch();
+        state
+            .workspace_disk_gate()
+            .begin_write(std::time::Duration::ZERO, &|| false)
+            .unwrap()
+            .finish();
+        crate::server::handle_task(
+            &mut state,
+            crate::global_state::Task::DiskReadCompleted {
+                epoch,
+                task: Box::new(crate::global_state::Task::AnalysisScopeReady {
+                    generation: 2,
+                    result: Ok(test_scope()),
+                    identity: None,
+                }),
+                cancelled: Box::new(crate::global_state::Task::AnalysisScopeReady {
+                    generation: 2,
+                    result: Err("superseded".into()),
+                    identity: None,
+                }),
+            },
+        )
+        .unwrap();
+        assert!(!state.analysis_scope.is_loading());
+        assert!(state.scope_build_queued);
+        assert!(Arc::ptr_eq(state.diagnostics_config().scope.as_ref().unwrap(), &accepted));
     }
 
     #[test]

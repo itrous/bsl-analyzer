@@ -97,15 +97,19 @@ impl ItemsCollection {
     }
 }
 
-/// The form of this module when it is an ORDINARY form whose dialog was read from its
-/// sidecar - the only case where the module knows its controls.
-fn ordinary_form_with_known_dialog(db: &dyn HirDatabase, resolver: &Resolver) -> Option<Arc<Form>> {
-    let module_id = resolver.module_id()?;
+fn form_of_body(db: &dyn HirDatabase, resolver: &Resolver) -> Option<Arc<Form>> {
+    let module_id = resolver.body_module_id()?;
     let metadata = db.module_metadata(module_id);
     if metadata.module_type != bsl_metadata::ModuleType::FormModule {
         return None;
     }
-    metadata.form.clone().filter(|form| form.is_ordinary() && form.ordinary_dialog_known)
+    metadata.form.clone()
+}
+
+/// The form of this module when it is an ORDINARY form whose dialog was read from its
+/// sidecar - the only case where the module knows its controls.
+fn ordinary_form_with_known_dialog(db: &dyn HirDatabase, resolver: &Resolver) -> Option<Arc<Form>> {
+    form_of_body(db, resolver).filter(|form| form.is_ordinary() && form.ordinary_dialog_known)
 }
 
 /// The bare `ЭлементыФормы` / `Controls` of an ordinary form module whose dialog is
@@ -141,7 +145,7 @@ fn no_body_changes_items(
     resolver: &Resolver,
     collection: ItemsCollection,
 ) -> bool {
-    let Some(module_id) = resolver.module_id() else { return false };
+    let Some(module_id) = resolver.body_module_id() else { return false };
     let source_root = db.file_source_root_input(module_id.file_id).source_root_id(db);
     let index = db.module_index(source_root);
     // An extension can add controls that the base dialog does not describe, even
@@ -238,10 +242,7 @@ fn body_may_change_items(body: &hir_def::Body, collection: ItemsCollection) -> b
 /// The form of this module when it is a MANAGED form the dump describes — the only
 /// case where the module knows its items.
 fn managed_form_with_items(db: &dyn HirDatabase, resolver: &Resolver) -> Option<Arc<Form>> {
-    if !crate::this_object::is_managed_form_module(db, resolver) {
-        return None;
-    }
-    db.module_metadata(resolver.module_id()?).form.clone()
+    form_of_body(db, resolver).filter(|form| form.is_managed())
 }
 
 /// Whether a miss on this managed form's `Элементы` is a real defect: the dump
@@ -344,7 +345,7 @@ pub fn lower_form_element_for_file(
     lower_form_element(db, form, element, &obj_resolver)
 }
 
-fn row_typeid_of_tabular_section_target(
+pub(crate) fn row_typeid_of_tabular_section_target(
     db: &dyn TypeKernelDb,
     target: &FormBindingTargetFacet,
 ) -> Option<TypeId> {
@@ -421,7 +422,17 @@ fn resolve_data_path(
         current_id = info.ty;
     }
 
-    let target = match db.lookup_type(current_id) {
+    let target = data_path_value_target(db, current_id)?;
+
+    let path: Arc<[String]> = segments.iter().map(|n| n.as_str().to_string()).collect();
+    Some(FormBindingFacet::new(path, target))
+}
+
+pub(crate) fn data_path_value_target(
+    db: &dyn TypeKernelDb,
+    current_id: TypeId,
+) -> Option<FormBindingTargetFacet> {
+    Some(match db.lookup_type(current_id) {
         TypeKind::MetadataRef(facet) => match &facet.kind {
             MetadataKind::TabularSection { parent } => {
                 let (owner, section) = facet.name.as_str().rsplit_once('.')?;
@@ -440,10 +451,7 @@ fn resolve_data_path(
             }
         }
         _ => FormBindingTargetFacet::Attribute { ty: current_id },
-    };
-
-    let path: Arc<[String]> = segments.iter().map(|n| n.as_str().to_string()).collect();
-    Some(FormBindingFacet::new(path, target))
+    })
 }
 
 #[cfg(test)]

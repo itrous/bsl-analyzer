@@ -30,7 +30,7 @@ uri: bsl-analyzer://contract
 
 ```jsonc
 {
-  "contract_version": "3.5",
+  "contract_version": "3.6",
   "build_version": "0.2.80",
   "mcp": {
     "profiles": {
@@ -52,7 +52,7 @@ uri: bsl-analyzer://contract
           {
             "name": "references",
             "actions": [],
-            "output_schema_version": "1",
+            "output_schema_version": "2",
             "params": [{ "name": "symbol", "type": "string", "required": false }]
           }
         ]
@@ -120,6 +120,17 @@ uri: bsl-analyzer://contract
   расписанием повтора, а не как вечное `"loading"`. Инструмент `debug` получает
   необязательный параметр `target` — идентификатор остановленного предмета для
   `continue` и `step`, если остановлено несколько.
+
+- В контракте `3.6` source `metadata` добавляет действие `template` и selectors
+  `form_name`, `template_name`, `predefined_code`, `root_id`. `references` публикует
+  `output_schema_version="2"`: ответ `schema_version="2"` допускает `outcome="partial"`,
+  подтверждённые ссылки, `metadata_incomplete_reasons` и `metadata_issues_total`.
+  Неполный metadata walk сообщает `total_is_lower_bound=true` и
+  `narrowing_comparable=false`; он не является доказанным нулём или полным списком.
+  Общий конверт resident loading/failed и вложенные `location` сохраняют свою
+  версию `"1"`. Изменение additive; обязательность параметров уже существующих
+  действий не меняется. Отказ source-only действия в infobase mode предшествует
+  проверке его source-параметров, а обязательные параметры проверяются до loading.
 
 - `tools` — то, что сервер отдаёт в `tools/list` при обычном запуске;
   `opt_in_tools` — то, что эта же сборка умеет, но отдаёт только по явному

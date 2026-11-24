@@ -59,24 +59,39 @@ pub async fn check_syntax(
         if crate::tools::check_executor::has_module_syntax(code) {
             return Ok(crate::tools::check_executor::context_required(
                 &selected_name,
-                selected.check_executor().is_some(),
+                selected.check_executor().is_some()
+                    || (selected.epf_module_check() && selected.http_client().is_some()),
             ));
         }
     }
     if input_kind == check_contract::InputKind::Module {
-        let Some(profile) = selected.check_executor() else {
-            return Ok(crate::tools::check_executor::unsupported(&selected_name));
-        };
-        return crate::tools::check_executor::check(
-            profile,
-            &selected_name,
-            code,
-            input_kind,
-            module_type,
-            context,
-            ct,
-        )
-        .await;
+        if let Some(profile) = selected.check_executor() {
+            return crate::tools::check_executor::check(
+                profile,
+                &selected_name,
+                code,
+                input_kind,
+                module_type,
+                context,
+                ct,
+            )
+            .await;
+        }
+        if selected.epf_module_check() {
+            if let Some(client) = selected.http_client() {
+                return super::epf_module_check::check(
+                    client,
+                    &selected_name,
+                    code,
+                    module_type,
+                    context,
+                    max_output_tokens,
+                    ct,
+                )
+                .await;
+            }
+        }
+        return Ok(crate::tools::check_executor::unsupported(&selected_name));
     }
     let Some(client) = selected.http_client() else {
         return Ok(crate::tools::check_executor::unsupported(&selected_name));
@@ -125,20 +140,64 @@ pub async fn execute_code(
 
     let request = onec_client::ExecuteRequest { code: code.to_string() };
 
-    let result = client
-        .execute_code(&request)
-        .await
-        .map_err(|e| McpError::internal_error(format!("Ошибка выполнения кода в 1С: {e}"), None))?;
+    let result = match client.execute_code(&request).await {
+        Ok(result) => result,
+        Err(onec_client::Error::UnknownExecutionState(error)) => {
+            return Ok(unknown_execution_result(error.is_timeout(), max_output_tokens));
+        }
+        Err(error) => {
+            return Err(McpError::internal_error(
+                format!("Ошибка выполнения кода в 1С: {error}"),
+                None,
+            ))
+        }
+    };
 
+    Ok(format_execute_result(result, max_output_tokens))
+}
+
+fn unknown_execution_result(timed_out: bool, max_output_tokens: usize) -> CallToolResult {
+    let body = serde_json::json!({
+        "status": "unknown_execution_state",
+        "success": null,
+        "failure": { "code": if timed_out { "timeout" } else { "transport_error" } },
+        "retry_performed": false,
+    });
+    let mut text = "Исход выполнения неизвестен: HTTP-ожидание прервано. Операция могла продолжиться на сервере. Проверьте её результат перед повторным запуском; автоматический повтор не выполнялся.".to_owned();
+    let text_tokens = max_output_tokens
+        .saturating_sub(crate::tools::response::serialized_bytes(&body).div_ceil(4));
+    crate::tools::response::truncate_text_to_budget(
+        &mut text,
+        text_tokens,
+        "Исход неизвестен; автоматического повтора нет.",
+    );
+    let mut response = crate::tools::response::structured_with_text(text, body);
+    response.is_error = Some(true);
+    response
+}
+
+fn execute_text(result: &onec_client::ExecuteResult, truncated: bool) -> String {
     let mut out = if result.success {
         "✓ Код выполнен успешно".to_string()
     } else {
-        let error = result.error.unwrap_or_default();
+        let error = result.error.as_deref().unwrap_or_default();
         format!("✗ Ошибка выполнения:\n{error}")
     };
 
     if let Some(ms) = result.duration_ms {
         out.push_str(&format!("\nВремя: {ms} мс"));
+    }
+
+    match &result.messages {
+        Some(messages) if !messages.is_empty() => {
+            out.push_str("\n\nСообщения:\n");
+            for message in messages {
+                out.push_str(&message.text);
+                out.push('\n');
+            }
+        }
+        None => out.push_str("\nКанал сообщений недоступен в этой версии HTTP-сервиса."),
+        _ => {}
     }
 
     if let Some(ref ctx) = result.context {
@@ -154,7 +213,65 @@ pub async fn execute_code(
         }
     }
 
-    Ok(text_within_budget(out, max_output_tokens, BUDGET_NOTE))
+    if truncated {
+        out.push_str(BUDGET_NOTE);
+    }
+    out
+}
+
+fn format_execute_result(
+    mut result: onec_client::ExecuteResult,
+    max_output_tokens: usize,
+) -> CallToolResult {
+    let mut truncated = result.messages_truncated;
+    let budget = max_output_tokens.saturating_mul(4);
+    loop {
+        let text = execute_text(&result, truncated);
+        let mut body = serde_json::to_value(&result).expect("execution DTO is serializable");
+        body["truncated"] = truncated.into();
+        if text.len() + crate::tools::response::serialized_bytes(&body) <= budget {
+            let mut response = crate::tools::response::structured_with_text(text, body);
+            response.is_error = Some(!result.success);
+            return response;
+        }
+        truncated = true;
+        if let Some(context) = result.context.as_mut().filter(|context| !context.is_empty()) {
+            let last = context.keys().next_back().cloned().unwrap();
+            context.remove(&last);
+        } else if let Some(messages) =
+            result.messages.as_mut().filter(|messages| !messages.is_empty())
+        {
+            result.messages_truncated = true;
+            if messages.len() > 1 {
+                messages.pop();
+            } else if !messages[0].text.is_empty() {
+                halve_text(&mut messages[0].text);
+            } else {
+                messages.clear();
+            }
+        } else if let Some(error) = result.error.as_mut().filter(|error| !error.is_empty()) {
+            halve_text(error);
+        } else {
+            // The status and explicit truncation marker are the floor for very small budgets.
+            let text = if result.success {
+                "Выполнено; вывод усечён."
+            } else {
+                "Ошибка; вывод усечён."
+            };
+            let body = serde_json::json!({"success":result.success,"truncated":true});
+            let mut response = crate::tools::response::structured_with_text(text.into(), body);
+            response.is_error = Some(!result.success);
+            return response;
+        }
+    }
+}
+
+fn halve_text(text: &mut String) {
+    let mut end = text.len() / 2;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
 }
 
 pub async fn eval_expression(
@@ -237,6 +354,101 @@ fn test_shared_state() -> SharedState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_producer_module_parses_with_message_collection() {
+        let parsed = parser::parse(include_str!(
+            "../../../../extension/src/HTTPServices/BSLAnalyzerService/Ext/Module.bsl"
+        ));
+        assert!(parsed.errors().is_empty(), "{:?}", parsed.errors());
+    }
+
+    #[test]
+    fn run_transport_failure_distinguishes_timeout_from_unknown_execution_outcome() {
+        for (timed_out, code) in [(true, "timeout"), (false, "transport_error")] {
+            let response = unknown_execution_result(timed_out, 250);
+            assert_eq!(response.is_error, Some(true));
+            let body = response.structured_content.unwrap();
+            assert_eq!(body["status"], "unknown_execution_state");
+            assert_eq!(body["success"], serde_json::Value::Null);
+            assert_eq!(body["failure"]["code"], code);
+            assert_eq!(body["retry_performed"], false);
+            assert!(
+                response.content[0].as_text().unwrap().text.len()
+                    + crate::tools::response::serialized_bytes(&body)
+                    <= 1000
+            );
+        }
+    }
+
+    fn run_result(
+        success: bool,
+        messages: Option<Vec<onec_client::ExecuteMessage>>,
+    ) -> onec_client::ExecuteResult {
+        onec_client::ExecuteResult {
+            success,
+            error: (!success).then(|| "Ошибка после сообщения".into()),
+            context: None,
+            duration_ms: Some(1),
+            messages,
+            messages_truncated: false,
+        }
+    }
+
+    #[test]
+    fn run_messages_and_failure_remain_ordered_and_separate_in_both_outputs() {
+        for success in [true, false] {
+            let result = format_execute_result(
+                run_result(
+                    success,
+                    Some(vec![
+                        onec_client::ExecuteMessage { text: "Первое".into() },
+                        onec_client::ExecuteMessage { text: "Второе".into() },
+                    ]),
+                ),
+                6000,
+            );
+            assert_eq!(result.is_error, Some(!success));
+            let body = result.structured_content.unwrap();
+            assert_eq!(body["success"], success);
+            assert_eq!(body["messages"][0]["text"], "Первое");
+            assert_eq!(body["messages"][1]["text"], "Второе");
+            let text = result.content[0].as_text().unwrap().text.as_str();
+            assert!(text.find("Первое").unwrap() < text.find("Второе").unwrap());
+            assert_eq!(text.contains("Ошибка после сообщения"), !success);
+        }
+    }
+
+    #[test]
+    fn run_output_fits_combined_budget_and_preserves_failure_and_truncation() {
+        let result = format_execute_result(
+            run_result(false, Some(vec![onec_client::ExecuteMessage { text: "я".repeat(10_000) }])),
+            250,
+        );
+        assert_eq!(result.is_error, Some(true));
+        let body = result.structured_content.unwrap();
+        assert_eq!(body["success"], false);
+        assert_eq!(body["messages_truncated"], true);
+        assert_eq!(body["truncated"], true);
+        let text = &result.content[0].as_text().unwrap().text;
+        assert!(text.contains("Ошибка после сообщения"));
+        assert!(text.ends_with(BUDGET_NOTE));
+        assert!(text.len() + crate::tools::response::serialized_bytes(&body) <= 1000);
+    }
+
+    #[test]
+    fn run_legacy_and_supported_empty_messages_are_distinct() {
+        let legacy = format_execute_result(run_result(true, None), 6000);
+        assert!(legacy.structured_content.unwrap()["messages"].is_null());
+        assert!(legacy.content[0].as_text().unwrap().text.contains("недоступен"));
+        let empty = format_execute_result(run_result(true, Some(vec![])), 6000);
+        assert_eq!(empty.structured_content.unwrap()["messages"], serde_json::json!([]));
+        assert!(!empty.content[0].as_text().unwrap().text.contains("недоступен"));
+        let mut producer_cut = run_result(true, Some(vec![]));
+        producer_cut.messages_truncated = true;
+        let result = format_execute_result(producer_cut, 6000);
+        assert_eq!(result.structured_content.unwrap()["truncated"], true);
+    }
 
     #[tokio::test]
     async fn optional_http_only_connection_routes_preflight_and_unsupported_without_fallback() {

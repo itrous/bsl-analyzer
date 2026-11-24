@@ -123,6 +123,9 @@ impl LoweringContext<'_> {
             "resolved column type from scope"
         );
 
+        let (metadata_references, metadata_issues) =
+            self.scope.metadata_column_references(&name_tokens);
+        self.source_map.record_metadata_columns(metadata_references, metadata_issues);
         let ref_range = name_span(&ident_ranges, node.text_range());
 
         // Decided before the column is typed, and independently of whether it resolves: the

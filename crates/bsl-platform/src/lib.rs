@@ -1,3 +1,4 @@
+mod call_effects;
 pub mod capability;
 mod db;
 pub mod deprecation;
@@ -23,6 +24,7 @@ pub use standard_mdo_attributes::{
     StandardAttrSpec, StandardKind,
 };
 
+pub use call_effects::{CallValueEffect, CallValueEffectTarget};
 pub use db::{
     docs_gap_synthesized_member_types, find_prefixed_method, find_prefixed_methods,
     global_function_query, global_member_method_query, global_property_query,
