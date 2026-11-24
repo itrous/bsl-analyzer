@@ -3,21 +3,26 @@ mod command;
 mod common_attribute;
 mod common_module;
 mod constant;
+pub mod content_inspection;
 mod defined_type;
 mod enum_parser;
 mod event_subscription;
 mod form;
+pub mod form_inspection;
 mod form_sidecar;
 pub(crate) mod helpers;
 mod http_service;
 mod integration_service;
 mod predefined_parser;
+pub(crate) mod read_properties;
 mod register;
 mod role;
 mod scheduled_job;
 mod standard_attributes;
 mod subsystem;
 mod type_parser;
+pub(crate) use type_parser::parse_type_xml as parse_type_description;
+pub(crate) use type_parser::parse_xml_type_token;
 mod web_service;
 
 pub use catalog::{
@@ -868,6 +873,7 @@ mod tests {
     <InformationRegister uuid="12345678-1234-1234-1234-123456789012">
         <Properties>
             <Name>Курсы</Name>
+            <WriteMode>RecorderSubordinate</WriteMode>
             <InformationRegisterPeriodicity>Second</InformationRegisterPeriodicity>
         </Properties>
     </InformationRegister>
@@ -891,6 +897,7 @@ mod tests {
     <InformationRegister uuid="12345678-1234-1234-1234-123456789012">
         <Properties>
             <Name>Настройки</Name>
+            <WriteMode>Independent</WriteMode>
             <InformationRegisterPeriodicity>Nonperiodical</InformationRegisterPeriodicity>
         </Properties>
     </InformationRegister>
@@ -902,9 +909,9 @@ mod tests {
         let attr_names: Vec<&str> = attrs.iter().map(|a| a.name()).collect();
 
         assert!(!attr_names.contains(&"Период"));
-        assert!(attr_names.contains(&"Активность"));
-        assert!(attr_names.contains(&"НомерСтроки"));
-        assert!(attr_names.contains(&"Регистратор"));
+        assert!(!attr_names.contains(&"Активность"));
+        assert!(!attr_names.contains(&"НомерСтроки"));
+        assert!(!attr_names.contains(&"Регистратор"));
     }
 
     /// The synthesiser is the single owner of the register's standard attributes, so it is
@@ -914,7 +921,7 @@ mod tests {
     fn register_standard_attribute_synthesis_carries_english_names() {
         let xml = r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
 <InformationRegister uuid="12345678-1234-1234-1234-123456789012">
-<Properties><Name>Курсы</Name><InformationRegisterPeriodicity>Second</InformationRegisterPeriodicity></Properties>
+<Properties><Name>Курсы</Name><WriteMode>RecorderSubordinate</WriteMode><InformationRegisterPeriodicity>Second</InformationRegisterPeriodicity></Properties>
 </InformationRegister></MetaDataObject>"#;
 
         let register = parse_information_register_xml(xml).unwrap();
@@ -970,6 +977,7 @@ mod tests {
         <Properties>
             <Name>Папки</Name>
             <Hierarchical>true</Hierarchical>
+            <HierarchyType>HierarchyFoldersAndItems</HierarchyType>
         </Properties>
     </Catalog>
 </MetaDataObject>"#;

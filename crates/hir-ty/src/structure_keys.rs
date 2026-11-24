@@ -39,6 +39,8 @@ pub(crate) enum ValueSource {
     Literal(StructureShape),
     /// The value is a scalar literal — typed directly and stably.
     Scalar(ScalarKind),
+    /// A constructor's written type is stable across inference iterations.
+    Constructed(hir_def::Name),
     /// A type already resolved elsewhere — used by Stage 2 to inject a callee summary's field types
     /// (an interned `TypeId`, never an `ExprId`; the summary itself is computed stably).
     Resolved(TypeId),
@@ -414,6 +416,25 @@ pub(crate) fn as_method_call<'b>(
     }
 }
 
+/// The possible output write of `Свойство`: even an unresolved receiver can replace
+/// the local, while only a known structure supplies the written value's type.
+pub(crate) fn property_out_arg(
+    body: &Body,
+    expr: hir_def::hir::ExprIdx,
+) -> Option<(ExprId, &hir_def::Name, Option<&str>)> {
+    let (receiver, method, args) = as_method_call(body, body.expr_idx(expr))?;
+    if !crate::method_lookup::is_platform_name(method, "Свойство", "Property") || args.len() != 2
+    {
+        return None;
+    }
+    let Expr::Path(output) = body.expr_idx(args[1]) else { return None };
+    let key = match body.expr_idx(args[0]) {
+        Expr::Literal(Literal::String(key)) => Some(key.as_str()),
+        _ => None,
+    };
+    Some((receiver, output, key))
+}
+
 /// Materialise the typed structure for `local_lower` using value types known so far.
 pub(crate) fn materialize(
     db: &dyn HirDatabase,
@@ -465,6 +486,9 @@ pub(crate) fn shape_to_projection(
                     None => db.structure(None),
                 },
                 ValueSource::Scalar(kind) => scalar_type(db, *kind),
+                ValueSource::Constructed(name) => {
+                    crate::lower::type_string::lower_constructed_type_name_typeid(db, name.as_str())
+                }
                 ValueSource::Resolved(t) => *t,
                 ValueSource::Unknown => db.unknown(),
             };
@@ -517,11 +541,14 @@ fn value_source_of(body: &Body, expr: ExprId, depth: usize) -> ValueSource {
     if let Some(nested) = constructor_shape_of(body, expr, depth + 1) {
         return ValueSource::Literal(nested);
     }
-    match scalar_kind_of(body, expr) {
-        Some(kind) => ValueSource::Scalar(kind),
+    if let Some(kind) = scalar_kind_of(body, expr) {
+        return ValueSource::Scalar(kind);
+    }
+    match body.expr(expr) {
+        Expr::New { type_name: Some(name), .. } => ValueSource::Constructed(name.clone()),
         // A non-literal value (variable, call, …): surface the key name but do not pin a type, so
         // the structure's interned type stays stable across inference iterations.
-        None => ValueSource::Unknown,
+        _ => ValueSource::Unknown,
     }
 }
 

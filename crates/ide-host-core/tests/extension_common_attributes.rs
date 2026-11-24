@@ -1426,6 +1426,89 @@ fn refresh_matches_fresh_full_fallback_and_repairs_partial_common_metadata() {
     assert!(fields.iter().any(|field| field.name == "OrdinaryAuto"));
 }
 
+#[test]
+fn source_property_origins_follow_actual_files_before_adopted_overlay() {
+    let temp = tempfile::tempdir().expect("source roots");
+    let base = temp.path().join("base");
+    let extension = temp.path().join("extension");
+    for root in [&base, &extension] {
+        fs::create_dir_all(root.join("Catalogs")).unwrap();
+        fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+    }
+    fs::write(
+        base.join("Catalogs/BaseFile.xml"),
+        include_str!("fixtures/property_origins/base.xml"),
+    )
+    .unwrap();
+    fs::write(
+        extension.join("Catalogs/OverlayFile.xml"),
+        include_str!("fixtures/property_origins/adopted.xml"),
+    )
+    .unwrap();
+    let workspace = WorkspaceConfigsSnapshot::from_paths(vec![
+        (None, base.clone()),
+        (Some("SelectedOrigin".into()), extension.clone()),
+    ]);
+    let (fallback, _) = host_for(workspace.clone(), &[], false);
+    let (mut prepared, _) = host_for(workspace, &[], true);
+    prepared.raw_database_mut().use_prepared_metadata_inputs();
+    let compose = |host: &AnalysisHost| {
+        let base = host.raw_database().configuration_for_root(&base);
+        let extension = host.raw_database().configuration_for_root(&extension);
+        assert_ne!(extension.name(), "SelectedOrigin");
+        base.merged_with_extension(
+            &extension,
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+            Some(base.common_attribute_set()),
+        )
+    };
+    let full = compose(&fallback);
+    let prepared = compose(&prepared);
+    let find = |config: &bsl_metadata::Configuration| {
+        config
+            .find_metadata_object(bsl_metadata::MdoType::Catalog, "SharedCatalog")
+            .unwrap()
+            .clone()
+    };
+    let object = find(&full);
+    assert_eq!(object, find(&prepared));
+    let field = object
+        .read_properties
+        .members
+        .iter()
+        .find(|member| member.path == ["Attribute", "Field"])
+        .expect("declared field");
+    assert_eq!(
+        field.choice.property_origins["ChoiceParameters"],
+        format!(":{}", std::path::Path::new("Catalogs").join("BaseFile.xml").display())
+    );
+    assert_eq!(
+        field.choice.property_origins["FillChecking"],
+        format!(
+            "SelectedOrigin:{}",
+            std::path::Path::new("Catalogs").join("OverlayFile.xml").display()
+        )
+    );
+    assert_eq!(field.choice.fill_checking.as_deref(), Some("ShowError"));
+    assert!(field.choice.choice_parameters.is_some());
+
+    let unknown_owner = RootDatabaseImpl::new().configuration_for_root(&base);
+    let legacy = bsl_metadata::load_from_directory(&base).unwrap();
+    for config in [&*unknown_owner, &legacy] {
+        let object = find(config);
+        assert!(object
+            .read_properties
+            .members
+            .iter()
+            .any(|member| { !member.choice.property_origins.is_empty() }));
+        assert!(object
+            .read_properties
+            .members
+            .iter()
+            .all(|member| { member.choice.property_origins.values().all(String::is_empty) }));
+    }
+}
+
 fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
     fs::create_dir_all(to).expect("create fixture directory");
     for entry in fs::read_dir(from).expect("read fixture directory") {

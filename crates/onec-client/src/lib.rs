@@ -1,3 +1,9 @@
+mod epf_module;
+
+pub use epf_module::{
+    EpfModuleCheckResult, EpfModulePosition, EPF_MODULE_RESPONSE_BYTES, EPF_MODULE_TIMEOUT_MS,
+};
+
 use reqwest::header;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -7,13 +13,25 @@ use std::time::Duration;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("HTTP request failed: {0}")]
-    Request(#[from] reqwest::Error),
+    Request(#[source] reqwest::Error),
+
+    #[error("unknown_execution_state: HTTP execution transport failed; the operation may still be running; do not retry automatically")]
+    UnknownExecutionState(#[source] reqwest::Error),
+
+    #[error("1C connection '{connection}': HTTP 404 with an empty body; the HTTP service or endpoint may be missing or unpublished; check the selected connection and service publication")]
+    EndpointUnavailable { connection: String },
 
     #[error("invalid JSON response from 1C: {0}")]
     Decode(#[from] serde_json::Error),
 
     #[error("1C returned status {status}: {body}")]
     Status { status: u16, body: String },
+
+    #[error("EPF module check stopped before HTTP ({code}); no remote carrier was created")]
+    ModuleCheckBeforeRequest { code: &'static str },
+
+    #[error("Invalid EPF module check acknowledgement ({code}); remote cleanup is unconfirmed")]
+    ModuleCheckProtocol { code: &'static str },
 
     #[error("{0}")]
     Validation(String),
@@ -25,6 +43,23 @@ pub struct Client {
     user: Option<String>,
     password: Option<String>,
     http: reqwest::Client,
+    execute_http: reqwest::Client,
+    execute_timeout: Duration,
+    connection_name: String,
+}
+
+/// Default execute budget, retained for profiles without an explicit override.
+pub const DEFAULT_EXECUTE_TIMEOUT_MS: u64 = 30_000;
+
+/// Validate a finite execute budget before constructing or forwarding a profile.
+pub fn validate_execute_timeout_ms(timeout_ms: u64) -> Result<Duration, Error> {
+    let timeout = Duration::from_millis(timeout_ms);
+    if timeout.is_zero() || std::time::Instant::now().checked_add(timeout).is_none() {
+        return Err(Error::Validation(
+            "execute_timeout_ms must be a positive finite duration".into(),
+        ));
+    }
+    Ok(timeout)
 }
 
 /// Process-wide HTTP client: building one makes the TLS verifier read the system root
@@ -42,6 +77,23 @@ fn build_http() -> Result<reqwest::Client, reqwest::Error> {
     headers.insert(header::CONNECTION, header::HeaderValue::from_static("close"));
 
     reqwest::Client::builder().timeout(Duration::from_secs(30)).default_headers(headers).build()
+}
+
+/// Process-wide client for `/execute`, shared for the same reason as [`SHARED_HTTP`].
+static SHARED_EXECUTE_HTTP: Mutex<Option<reqwest::Client>> = Mutex::new(None);
+
+/// An execute request runs arbitrary code on the server, so a transport failure must never
+/// replay it and a redirect must never carry its body and credentials elsewhere.
+fn build_execute_http() -> Result<reqwest::Client, reqwest::Error> {
+    let mut headers = header::HeaderMap::new();
+    headers.insert(header::CONNECTION, header::HeaderValue::from_static("close"));
+
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .retry(reqwest::retry::never())
+        .redirect(reqwest::redirect::Policy::none())
+        .default_headers(headers)
+        .build()
 }
 
 /// Returns the client held in `slot`, building it on first use. A failed build leaves the slot
@@ -69,6 +121,8 @@ impl Client {
     /// builds it again.
     pub fn new(base_url: &str, user: &str, password: &str) -> Self {
         let http = shared_or_build(&SHARED_HTTP, build_http).expect("failed to build HTTP client");
+        let execute_http = shared_or_build(&SHARED_EXECUTE_HTTP, build_execute_http)
+            .expect("failed to build HTTP client");
 
         let (user, password) = if user.is_empty() {
             (None, None)
@@ -76,7 +130,27 @@ impl Client {
             (Some(user.to_string()), Some(password.to_string()))
         };
 
-        Self { base_url: base_url.trim_end_matches('/').to_string(), user, password, http }
+        Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            user,
+            password,
+            http,
+            execute_http,
+            execute_timeout: Duration::from_millis(DEFAULT_EXECUTE_TIMEOUT_MS),
+            connection_name: "default".into(),
+        }
+    }
+
+    /// Configure only the execute budget; read/query/check requests retain their timeout.
+    pub fn with_execute_timeout_ms(mut self, timeout_ms: u64) -> Result<Self, Error> {
+        self.execute_timeout = validate_execute_timeout_ms(timeout_ms)?;
+        Ok(self)
+    }
+
+    /// Attach the selected public profile name to endpoint diagnostics without exposing its URL.
+    pub fn with_connection_name(mut self, connection: &str) -> Self {
+        self.connection_name = self.redact_error_body(connection.to_owned());
+        self
     }
 
     pub async fn execute_query(&self, request: &QueryRequest) -> Result<QueryResult, Error> {
@@ -129,22 +203,65 @@ impl Client {
         body: &T,
     ) -> Result<R, Error> {
         let url = format!("{}{}", self.base_url, endpoint);
-        let mut req = self.http.post(&url).json(body);
+        let executing = endpoint == "/execute";
+        let http = if executing { &self.execute_http } else { &self.http };
+        let mut req = http.post(&url).json(body);
+        if executing {
+            req = req.timeout(self.execute_timeout);
+        }
 
         if let Some(ref user) = self.user {
             req = req.basic_auth(user, self.password.as_deref());
         }
 
-        let resp = req.send().await?;
+        let transport_error = |error: reqwest::Error| {
+            let error = error.without_url();
+            if executing {
+                Error::UnknownExecutionState(error)
+            } else {
+                Error::Request(error)
+            }
+        };
+        let resp = req.send().await.map_err(transport_error)?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            let body = if body.len() > 4096 { body[..4096].to_string() } else { body };
+            let body = resp.text().await.map_err(transport_error)?;
+            if status.as_u16() == 404 && body.trim().is_empty() {
+                return Err(Error::EndpointUnavailable {
+                    connection: self.connection_name.clone(),
+                });
+            }
+            let mut body = self.redact_error_body(body);
+            let mut end = body.len().min(4096);
+            while !body.is_char_boundary(end) {
+                end -= 1;
+            }
+            body.truncate(end);
             return Err(Error::Status { status: status.as_u16(), body });
         }
 
-        let body = resp.bytes().await?;
+        let body = resp.bytes().await.map_err(transport_error)?;
         decode_json(&body)
+    }
+
+    fn redact_error_body(&self, mut body: String) -> String {
+        // A server/proxy can echo a redirected or credential-bearing URL unrelated to base_url.
+        for prefix in ["http://", "https://"] {
+            while let Some(start) = body.to_ascii_lowercase().find(prefix) {
+                let tail = &body[start..];
+                let end = start
+                    + tail
+                        .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>'))
+                        .unwrap_or(tail.len());
+                body.replace_range(start..end, "<endpoint>");
+            }
+        }
+        for credential in [self.user.as_deref(), self.password.as_deref()].into_iter().flatten() {
+            if !credential.is_empty() {
+                body = body.replace(credential, "<redacted>");
+            }
+        }
+        body
     }
 }
 
@@ -197,12 +314,23 @@ pub struct ExecuteRequest {
     pub code: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ExecuteResult {
     pub success: bool,
     pub error: Option<String>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
     pub duration_ms: Option<u64>,
+    /// Absent on legacy producers; an empty array confirms supported but empty output.
+    #[serde(default)]
+    pub messages: Option<Vec<ExecuteMessage>>,
+    #[serde(default)]
+    pub messages_truncated: bool,
+}
+
+/// A user message in producer order, independent from the final execution status.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ExecuteMessage {
+    pub text: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -282,6 +410,17 @@ pub struct MetadataStructureResult {
     pub name: String,
     pub full_name: String,
     pub synonym: String,
+    /// Absent on legacy producers, independently from confirmed empty properties.
+    #[serde(default)]
+    pub read_properties: Option<serde_json::Value>,
+    #[serde(default)]
+    pub enum_values: Option<Vec<MetadataEnumValue>>,
+    /// Runtime accounts, independently from configured XML Item identifiers.
+    /// Missing means unavailable on the producer; an empty array is confirmed empty.
+    #[serde(default)]
+    pub predefined_accounts: Option<Vec<MetadataPredefinedAccount>>,
+    #[serde(default)]
+    pub predefined_unread: bool,
     #[serde(rename = "СтандартныеРеквизиты", default)]
     pub standard_attributes: Vec<MetadataStructureItem>,
     #[serde(rename = "Реквизиты", default)]
@@ -292,6 +431,71 @@ pub struct MetadataStructureResult {
     pub resources: Vec<MetadataStructureItem>,
     #[serde(rename = "ТабличныеЧасти", default)]
     pub tabular_sections: Vec<MetadataTabularSection>,
+}
+
+/// Identity of an infobase reference, never a configured PredefinedData Item UUID.
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct MetadataAccountReference {
+    #[serde(default)]
+    pub uuid: Option<String>,
+    #[serde(default)]
+    pub parent_uuid: Option<String>,
+    /// `Some(true)` distinguishes a root account from an unread parent.
+    #[serde(default)]
+    pub parent_known_empty: Option<bool>,
+}
+
+/// An accounting flag addressed by its configured technical name.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct MetadataAccountingFlag {
+    pub name: String,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+/// One row of the account's native extra-dimension table, in native row order.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct MetadataAccountDimension {
+    #[serde(default)]
+    pub predefined_name: Option<String>,
+    #[serde(default)]
+    pub runtime_ref_uuid: Option<String>,
+    #[serde(default)]
+    pub turnover: Option<bool>,
+    #[serde(default)]
+    pub predefined: Option<bool>,
+    #[serde(default)]
+    pub accounting_flags: Option<Vec<MetadataAccountingFlag>>,
+}
+
+/// A live predefined account. Its name is technical; runtime UUIDs stay separate
+/// from source metadata identities and every unread property remains unknown.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct MetadataPredefinedAccount {
+    pub name: String,
+    #[serde(default)]
+    pub runtime_reference: MetadataAccountReference,
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub account_type: Option<String>,
+    #[serde(default)]
+    pub off_balance: Option<bool>,
+    #[serde(default)]
+    pub order: Option<String>,
+    #[serde(default)]
+    pub accounting_flags: Option<Vec<MetadataAccountingFlag>>,
+    #[serde(default)]
+    pub ext_dimension_types: Option<Vec<MetadataAccountDimension>>,
+}
+
+/// An enumeration value reported by live metadata, preserving its technical name.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct MetadataEnumValue {
+    pub name: String,
+    pub synonym: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -456,6 +660,237 @@ mod tests {
         assert_eq!(shared_or_build(&slot, || Err("must not rebuild")), Ok(7));
     }
 
+    fn http_response(
+        status: &str,
+        body: &str,
+        delay: Duration,
+    ) -> (String, std::thread::JoinHandle<usize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut request = [0; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("POST /execute ") || request.starts_with("POST /query "));
+            std::thread::sleep(delay);
+            let _ = stream.write_all(response.as_bytes());
+            listener.set_nonblocking(true).unwrap();
+            let mut count = 1;
+            let until = std::time::Instant::now() + Duration::from_millis(100);
+            while std::time::Instant::now() < until {
+                match listener.accept() {
+                    Ok(_) => count += 1,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(error) => panic!("test server failed: {error}"),
+                }
+            }
+            count
+        });
+        (url, handle)
+    }
+
+    #[test]
+    fn execute_budget_defaults_and_validation() {
+        let client = Client::new("http://localhost", "", "");
+        assert_eq!(client.execute_timeout, Duration::from_secs(30));
+        assert!(client.with_execute_timeout_ms(0).is_err());
+        assert_eq!(validate_execute_timeout_ms(60_000).unwrap(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn execute_messages_distinguish_legacy_empty_and_failure_output() {
+        let legacy: ExecuteResult = decode_json(br#"{"success":true}"#).unwrap();
+        assert!(legacy.messages.is_none());
+        let empty: ExecuteResult = decode_json(br#"{"success":true,"messages":[]}"#).unwrap();
+        assert!(empty.messages.unwrap().is_empty());
+        let failure: ExecuteResult = decode_json(br#"{"success":false,"error":"failed","messages":[{"text":"first"},{"text":"second"}],"messages_truncated":true}"#).unwrap();
+        assert!(!failure.success);
+        assert_eq!(
+            failure.messages.unwrap().iter().map(|item| item.text.as_str()).collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert!(failure.messages_truncated);
+    }
+
+    #[tokio::test]
+    #[ignore = "31-second HTTP integration probe; run explicitly with --ignored"]
+    async fn execute_can_complete_after_the_legacy_thirty_second_budget() {
+        let (url, server) = http_response("200 OK", r#"{"success":true}"#, Duration::from_secs(31));
+        let result = Client::new(&url, "", "")
+            .with_execute_timeout_ms(45_000)
+            .unwrap()
+            .execute_code(&ExecuteRequest { code: "x=1;".into() })
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(server.join().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_timeout_has_unknown_outcome_and_no_retry_while_server_continues() {
+        let (url, server) =
+            http_response("200 OK", r#"{"success":true}"#, Duration::from_millis(150));
+        let error = Client::new(&url, "private-user", "private-password")
+            .with_execute_timeout_ms(25)
+            .unwrap()
+            .execute_code(&ExecuteRequest { code: "x=1;".into() })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::UnknownExecutionState(_)));
+        assert!(error.to_string().contains("unknown_execution_state"));
+        assert!(!error.to_string().contains(&url));
+        assert_eq!(server.join().unwrap(), 1, "the independent server marker completes once");
+    }
+
+    #[tokio::test]
+    async fn execute_short_success_and_server_failure_are_terminal() {
+        for (status, success) in [("200 OK", true), ("500 Internal Server Error", false)] {
+            let (url, server) = http_response(status, r#"{"success":true}"#, Duration::ZERO);
+            let result = Client::new(&url, "", "")
+                .execute_code(&ExecuteRequest { code: "x=1;".into() })
+                .await;
+            if success {
+                assert!(result.unwrap().success);
+            } else {
+                assert!(matches!(result, Err(Error::Status { status: 500, .. })));
+            }
+            assert_eq!(server.join().unwrap(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_does_not_follow_a_redirect_to_a_second_run() {
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let status = format!(
+            "307 Temporary Redirect\r\nLocation: http://{}/execute",
+            target.local_addr().unwrap()
+        );
+        let (url, server) = http_response(&status, "", Duration::ZERO);
+        let result =
+            Client::new(&url, "", "").execute_code(&ExecuteRequest { code: "x=1;".into() }).await;
+        assert!(matches!(result, Err(Error::Status { status: 307, .. })));
+        assert_eq!(server.join().unwrap(), 1);
+        target.set_nonblocking(true).unwrap();
+        assert_eq!(target.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[tokio::test]
+    async fn read_query_keeps_its_existing_redirect_policy() {
+        let (target_url, target) = http_response(
+            "200 OK",
+            r#"{"columns":[],"rows":[],"total":0,"truncated":false}"#,
+            Duration::ZERO,
+        );
+        let status = format!("307 Temporary Redirect\r\nLocation: {target_url}/query");
+        let (url, redirect) = http_response(&status, "", Duration::ZERO);
+        let result = Client::new(&url, "", "")
+            .execute_query(&QueryRequest {
+                query: "SELECT 1".into(),
+                limit: 1,
+                parameters: HashMap::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.total, 0);
+        assert_eq!(redirect.join().unwrap(), 1);
+        assert_eq!(target.join().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_404_names_connection_without_disclosing_endpoint_or_credentials() {
+        let (url, server) = http_response("404 Not Found", "", Duration::ZERO);
+        let error = Client::new(&url, "private-user", "private-password")
+            .with_connection_name("test-base")
+            .execute_code(&ExecuteRequest { code: "x=1;".into() })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::EndpointUnavailable { .. }));
+        let text = error.to_string();
+        assert!(text.contains("test-base") && text.contains("unpublished"));
+        for secret in [&url, "private-user", "private-password"] {
+            assert!(!text.contains(secret));
+        }
+        assert_eq!(server.join().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn endpoint_profile_diagnostic_redacts_urls_and_configured_credentials() {
+        for name in [
+            "https://private-user:private-password@private.example/base?token=value",
+            "profile-private-user-private-password",
+        ] {
+            let (url, server) = http_response("404 Not Found", "", Duration::ZERO);
+            let error = Client::new(&url, "private-user", "private-password")
+                .with_connection_name(name)
+                .execute_code(&ExecuteRequest { code: "x=1;".into() })
+                .await
+                .unwrap_err();
+            assert_eq!(server.join().unwrap(), 1);
+            assert!(matches!(error, Error::EndpointUnavailable { .. }));
+            let message = error.to_string();
+            for secret in ["private-user", "private-password", "private.example", "token=value"] {
+                assert!(!message.contains(secret), "profile diagnostic disclosed {secret}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn nonempty_query_404_retains_ordinary_status_without_publication_advice() {
+        let (url, server) =
+            http_response("404 Not Found", "unknown query parameter", Duration::ZERO);
+        let error = Client::new(&url, "", "")
+            .execute_query(&QueryRequest {
+                query: "SELECT 1".into(),
+                limit: 1,
+                parameters: HashMap::new(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(server.join().unwrap(), 1);
+        let Error::Status { status, body } = error else {
+            panic!("a nonempty query error must preserve its HTTP status");
+        };
+        assert_eq!(status, 404);
+        assert_eq!(body, "unknown query parameter");
+    }
+
+    #[tokio::test]
+    async fn ordinary_http_error_is_utf8_safe_and_redacts_private_endpoints() {
+        let body = format!("{} {}", "x".repeat(4094), "я".repeat(100));
+        let (url, server) = http_response("400 Bad Request", &body, Duration::ZERO);
+        let error = Client::new(&url, "", "")
+            .execute_code(&ExecuteRequest { code: "x=1;".into() })
+            .await
+            .unwrap_err();
+        let Error::Status { status, body } = error else {
+            panic!("expected ordinary status");
+        };
+        assert_eq!(status, 400);
+        assert_eq!(body.len(), 4095, "the cap must not split a multibyte character");
+        assert_eq!(server.join().unwrap(), 1);
+        let client = Client::new("https://internal.example/base", "user", "password-value");
+        let redacted = client.redact_error_body("https://user:password-value@other.example/private?token=x password-value https://internal.example/base HTTP://upper.example/private HtTpS://mixed.example/private".into());
+        for secret in [
+            "other.example",
+            "internal.example",
+            "password-value",
+            "token=x",
+            "upper.example",
+            "mixed.example",
+        ] {
+            assert!(!redacted.contains(secret));
+        }
+    }
+
     #[test]
     fn metadata_list_omits_empty_mask() {
         let request =
@@ -475,6 +910,51 @@ mod tests {
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["meta_type"], "Catalogs");
         assert_eq!(value["name"], "Организации");
+    }
+
+    #[test]
+    fn live_metadata_read_properties_distinguish_legacy_and_confirmed_values() {
+        let mut value =
+            serde_json::json!({"name":"Test", "full_name":"Catalog.Test", "synonym":"Test"});
+        let legacy: MetadataStructureResult = serde_json::from_value(value.clone()).unwrap();
+        assert!(legacy.read_properties.is_none());
+        assert!(legacy.enum_values.is_none());
+        value["read_properties"] = serde_json::json!({"hierarchical":false,"code_length":0});
+        value["enum_values"] = serde_json::json!([]);
+        let current: MetadataStructureResult = serde_json::from_value(value).unwrap();
+        assert_eq!(current.read_properties.unwrap()["hierarchical"], false);
+        assert!(current.enum_values.unwrap().is_empty());
+    }
+
+    #[test]
+    fn metadata_predefined_accounts_preserve_runtime_and_unknown_identities() {
+        let mut fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/live_predefined_accounts.json"))
+                .unwrap();
+        let current: MetadataStructureResult = serde_json::from_value(fixture.clone()).unwrap();
+        let accounts = current.predefined_accounts.unwrap();
+        assert_eq!(accounts[0].runtime_reference.parent_known_empty, Some(true));
+        assert!(accounts[0].runtime_reference.parent_uuid.is_none());
+        assert_eq!(accounts[1].runtime_reference.parent_uuid, accounts[0].runtime_reference.uuid);
+        assert_eq!(accounts[0].accounting_flags.as_ref().unwrap()[0].enabled, Some(false));
+        let dimensions = accounts[0].ext_dimension_types.as_ref().unwrap();
+        assert_eq!(
+            dimensions[0].predefined_name.as_deref(),
+            Some("ChartOfCharacteristicTypes.OwnKinds.Second")
+        );
+        assert_eq!(dimensions[1].turnover, Some(true));
+        fixture["predefined_accounts"][0]["runtime_reference"] = serde_json::json!({});
+        let unknown: MetadataStructureResult = serde_json::from_value(fixture.clone()).unwrap();
+        assert!(unknown.predefined_accounts.unwrap()[0]
+            .runtime_reference
+            .parent_known_empty
+            .is_none());
+        fixture["predefined_accounts"] = serde_json::json!([]);
+        let empty: MetadataStructureResult = serde_json::from_value(fixture.clone()).unwrap();
+        assert!(empty.predefined_accounts.unwrap().is_empty());
+        fixture.as_object_mut().unwrap().remove("predefined_accounts");
+        let legacy: MetadataStructureResult = serde_json::from_value(fixture).unwrap();
+        assert!(legacy.predefined_accounts.is_none());
     }
 
     #[test]

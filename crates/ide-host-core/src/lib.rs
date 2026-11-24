@@ -6,11 +6,16 @@
 //! the host once benefits LSP, MCP, and CLI alike.
 
 pub mod diagnostics_baseline;
+mod disk_gate;
 mod load;
 mod metadata;
 mod project_config;
 mod workspace;
 
+pub use disk_gate::{
+    WorkspaceDiskBusy, WorkspaceDiskGate, WorkspaceDiskObservation, WorkspaceDiskRead,
+    WorkspaceDiskWrite, WorkspaceDiskWriteError,
+};
 pub use load::{
     apply_source_batch, build_source_root, register_files_disk_backed, set_file_text_source,
     BatchTextSource, FileTextSource, SourceBatchChange, SourceBatchEffects,

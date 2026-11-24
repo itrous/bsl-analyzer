@@ -1,0 +1,50 @@
+<document xmlns="http://v8.1c.ru/8.2/data/spreadsheet" xmlns:style="http://v8.1c.ru/8.1/data/ui/style" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:v8ui="http://v8.1c.ru/8.1/data/ui" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+	<columns>
+		<size>5</size>
+	</columns>
+	<rowsItem>
+		<index>0</index>
+		<row>
+			<c>
+				<i>3</i>
+				<c>
+					<f>1</f>
+					<parameter>Title</parameter>
+				</c>
+			</c>
+			<c>
+				<c>
+					<f>2</f>
+					<tl>
+						<v8:item>
+							<v8:lang>#</v8:lang>
+							<v8:content>[Partner]: [Amount]</v8:content>
+						</v8:item>
+					</tl>
+				</c>
+			</c>
+		</row>
+	</rowsItem>
+	<defaultFormatIndex>3</defaultFormatIndex>
+	<height>2</height>
+	<vgRows>2</vgRows>
+	<namedItem xsi:type="NamedItemCells">
+		<name>Header</name>
+		<area>
+			<type>Rows</type>
+			<beginRow>0</beginRow>
+			<endRow>1</endRow>
+			<beginColumn>-1</beginColumn>
+			<endColumn>-1</endColumn>
+		</area>
+	</namedItem>
+	<format>
+		<fillType>Parameter</fillType>
+	</format>
+	<format>
+		<fillType>Template</fillType>
+	</format>
+	<format>
+		<width>72</width>
+	</format>
+</document>

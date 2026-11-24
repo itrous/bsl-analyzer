@@ -61,13 +61,13 @@ pub type SdblHirEntries = Arc<Vec<(SdblExprId, Arc<sdbl_hir::SdblPackage>)>>;
 /// vector backbone. The per-entry `SdblQueryInfo` (which pins a slice of the green
 /// SDBL AST) is not deeply traversed, so this under-counts the AST payload; the
 /// lowered HIR is accounted instead by [`sdbl_hir_for_file_heap`].
-fn all_sdbl_in_file_heap(v: &Arc<SdblInFile>) -> usize {
+pub(crate) fn all_sdbl_in_file_heap(v: &Arc<SdblInFile>) -> usize {
     crate::heap_estimate::vec_bytes::<(SdblExprId, syntax::SdblQueryInfo)>(v.len())
 }
 
 /// Approximate live heap bytes for Salsa's `memory_usage` report: the entries
 /// vector plus each uniquely-owned [`sdbl_hir::SdblPackage`]'s estimated heap.
-fn sdbl_hir_for_file_heap(v: &SdblHirEntries) -> usize {
+pub(crate) fn sdbl_hir_for_file_heap(v: &SdblHirEntries) -> usize {
     let mut bytes =
         crate::heap_estimate::vec_bytes::<(SdblExprId, Arc<sdbl_hir::SdblPackage>)>(v.len());
     for (_, package) in v.iter() {
@@ -86,6 +86,12 @@ pub fn all_sdbl_in_file_query<'db>(
     let module_id = ModuleId::new(file_id);
 
     let module_bodies = db.module_bodies(module_id);
+    let result = queries_in_bodies(&module_bodies);
+    tracing::debug!(count = result.len(), "Collected SDBL from HIR");
+    Arc::new(result)
+}
+
+pub(crate) fn queries_in_bodies(module_bodies: &crate::ModuleBodies) -> SdblInFile {
     let mut result = Vec::new();
 
     for (local_id, lowered) in module_bodies.iter_lower_results() {
@@ -106,8 +112,7 @@ pub fn all_sdbl_in_file_query<'db>(
 
     result.sort_by_key(|(_, query_info)| query_info.bsl_literal_range.start());
 
-    tracing::debug!(count = result.len(), "Collected SDBL from HIR");
-    Arc::new(result)
+    result
 }
 
 /// Lowered SDBL of one body's query literals. Resolves metadata per-MDO instead
@@ -115,7 +120,7 @@ pub fn all_sdbl_in_file_query<'db>(
 /// object does not re-lower these queries; gated on visible config presence
 /// to keep "no config => no validation" — a standalone module must not flag
 /// every table.
-fn lower_body_queries(
+pub(crate) fn lower_body_queries(
     db: &dyn ConfigsDatabase,
     file_id: FileId,
     body: &crate::Body,

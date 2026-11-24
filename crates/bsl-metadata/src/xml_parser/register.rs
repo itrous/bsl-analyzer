@@ -73,6 +73,7 @@ fn parse_register_xml(xml: &str, mdo_type: MdoType) -> Result<Register> {
                 &mut attributes,
                 &object_name,
                 periodicity_str.as_deref(),
+                recorder_subordinate,
             );
         }
         MdoType::AccumulationRegister => {
@@ -104,7 +105,7 @@ fn parse_register_xml(xml: &str, mdo_type: MdoType) -> Result<Register> {
     let periodicity = parse_periodicity(periodicity_str.as_deref(), mdo_type);
     let register_type = parse_register_type(register_type_str.as_deref(), mdo_type);
 
-    let register = Register::builder()
+    let mut register = Register::builder()
         .uuid(uuid)
         .extension_ownership(belonging, target)
         .name(object_name)
@@ -120,6 +121,7 @@ fn parse_register_xml(xml: &str, mdo_type: MdoType) -> Result<Register> {
         .correspondence(correspondence)
         .chart_of_accounts(chart_of_accounts)
         .build();
+    register.set_read_properties(super::read_properties::parse_read_properties(mdo));
 
     tracing::debug!(
         register_name = %register.name(),

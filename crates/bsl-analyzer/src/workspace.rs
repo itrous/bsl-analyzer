@@ -249,6 +249,24 @@ impl GlobalState {
             }],
         })];
         let mut watch = vec![0];
+        let dependencies = project.semantic_dependency_roots();
+        if !dependencies.is_empty() {
+            load.push(loader::Entry::Directories(loader::Directories {
+                extensions: Vec::new(),
+                include: dependencies.into_iter().map(paths::AbsPathBuf::assert_utf8).collect(),
+                exclude: Vec::new(),
+                hard_exclude: stdx::path_exclusion::ExcludedPaths::clone(&self.source_exclusions),
+                rules: vec![loader::FileRule {
+                    extensions: project_model::SOURCE_EXTENSIONS
+                        .iter()
+                        .chain(project_model::METADATA_WATCHED_EXTENSIONS)
+                        .map(|extension| (*extension).to_string())
+                        .collect(),
+                    load_mode: loader::LoadMode::WatchOnly,
+                }],
+            }));
+            watch.push(load.len() - 1);
+        }
         if !config_files.is_empty() {
             load.push(loader::Entry::Files(config_files));
             watch.push(load.len() - 1);

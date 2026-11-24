@@ -21,6 +21,7 @@ use syntax::{
     Parse, SyntaxKind, SyntaxNode, TextRange, TextSize,
 };
 
+use crate::sdbl_cache::{all_sdbl_in_file_heap, sdbl_hir_for_file_heap};
 use crate::{
     extension_merge::{extract_change_and_validate, strip_directives, Segment},
     item_tree::ItemTree,
@@ -263,6 +264,62 @@ pub fn module_bodies_effective<'db>(
         None => db.file_text(base),
     };
     Arc::new(ModuleBodies::from_parse_with_text(&parse, &source_text))
+}
+
+/// Base-method identities whose bodies compile from the extension's replacements.
+pub fn changed_method_keys(
+    db: &dyn crate::DefDatabase,
+    eid: EffectiveModuleId<'_>,
+) -> rustc_hash::FxHashSet<crate::MethodKey> {
+    let extension = db.parse(eid.ext_file(db));
+    let targets: rustc_hash::FxHashSet<String> = extension
+        .syntax_node()
+        .children()
+        .filter(|node| matches!(node.kind(), SyntaxKind::PROCEDURE_DEF | SyntaxKind::FUNCTION_DEF))
+        .filter_map(|node| extract_change_and_validate(&node))
+        .map(|change| change.target.fold_lower())
+        .collect();
+    module_interface_effective(db, eid)
+        .methods()
+        .filter(|method| targets.contains(&method.name.as_str().fold_lower()))
+        .map(|method| method.id.local_id)
+        .collect()
+}
+
+/// Query literals in the effective text, with the same identities as its lowered bodies.
+#[salsa::tracked(lru = 128, heap_size = all_sdbl_in_file_heap, returns(clone))]
+pub fn all_sdbl_in_effective_file<'db>(
+    db: &'db dyn crate::DefDatabase,
+    eid: EffectiveModuleId<'db>,
+) -> Arc<crate::sdbl_cache::SdblInFile> {
+    Arc::new(crate::sdbl_cache::queries_in_bodies(&module_bodies_effective(db, eid)))
+}
+
+/// Query types and diagnostics resolved in each effective body's compilation context.
+#[salsa::tracked(lru = 64, heap_size = sdbl_hir_for_file_heap, returns(clone))]
+pub fn sdbl_hir_for_effective_file<'db>(
+    db: &'db dyn crate::ConfigsDatabase,
+    eid: EffectiveModuleId<'db>,
+) -> crate::sdbl_cache::SdblHirEntries {
+    let changed = changed_method_keys(db, eid);
+    let bodies = module_bodies_effective(db, eid);
+    let mut result = Vec::new();
+    for (method, body) in bodies.iter_bodies() {
+        let context = if changed.contains(&method) { eid.ext_file(db) } else { eid.base_file(db) };
+        result.extend(
+            crate::sdbl_cache::lower_body_queries(db, context, body)
+                .into_iter()
+                .map(|(expr, package)| (crate::SdblExprId::from_method(method, expr), package)),
+        );
+    }
+    if let Some(body) = bodies.module_code() {
+        result.extend(
+            crate::sdbl_cache::lower_body_queries(db, eid.base_file(db), body)
+                .into_iter()
+                .map(|(expr, package)| (crate::SdblExprId::from_module_code(expr), package)),
+        );
+    }
+    Arc::new(result)
 }
 
 #[cfg(test)]

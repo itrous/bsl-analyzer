@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use base_db::{content_revision, read_disk_text, SourceDatabase, SourceRoot, METADATA_SOURCE_ROOT};
+use bsl_conventions::DirTree as _;
 use ide_db::metadata::{
     CommonAttributeEntry, CommonModuleEntry, DefinedTypeEntry, EventSubscriptionEntry,
     HTTPServiceEntry, IntegrationServiceEntry, MdoEntry, MetadataListingData, RoleEntry,
@@ -23,6 +24,9 @@ use vfs::{file_set::FileSet, FileId, Vfs, VfsPath};
 use ide::RootDatabaseImpl;
 
 use crate::AnalysisHost;
+
+mod inspection_inputs;
+mod owner_sources;
 
 /// A lock-flavour-neutral handle to the consumer's VFS. The metadata policy does its
 /// expensive discovery and disk reads *outside* this, then acquires a mutable [`Vfs`]
@@ -48,12 +52,14 @@ struct RootStructureListing {
 pub fn bootstrap_metadata_substrate(db: &mut RootDatabaseImpl, vfs: &impl VfsWrite) {
     let start = Instant::now();
 
+    owner_sources::prepare(db, vfs, None);
     let snapshot = db.workspace_configs_snapshot();
     // Discovery reads through the user's exclusions, so nothing inside them is listed,
     // probed or registered.
     let tree = bsl_metadata::ScopedFs::new(&snapshot.source_exclusions);
-    let config_paths = db.all_config_paths();
-    if config_paths.is_empty() {
+    let prepared_roots = snapshot.prepared_roots();
+    if prepared_roots.is_empty() {
+        db.set_ordinary_form_fingerprints(std::sync::Arc::new(Vec::new()));
         return;
     }
 
@@ -61,6 +67,8 @@ pub fn bootstrap_metadata_substrate(db: &mut RootDatabaseImpl, vfs: &impl VfsWri
     // read or interned.
     struct RootDiscovery {
         root_string: String,
+        header: Option<PathBuf>,
+        read_metadata: Vec<PathBuf>,
         mdos: Vec<bsl_metadata::DiscoveredMdo>,
         defined_types: Vec<bsl_metadata::DiscoveredDefinedType>,
         common_modules: Vec<bsl_metadata::DiscoveredCommonModule>,
@@ -76,10 +84,9 @@ pub fn bootstrap_metadata_substrate(db: &mut RootDatabaseImpl, vfs: &impl VfsWri
 
     // Discover every root's structure WITHOUT the vfs lock — discovery walks
     // and stats the filesystem but never touches the vfs.
-    let discoveries: Vec<RootDiscovery> = config_paths
+    let discoveries: Vec<RootDiscovery> = prepared_roots
         .iter()
-        .zip(&snapshot.kinds)
-        .map(|((_, root_path), kind)| {
+        .map(|(kind, root_path, _)| {
             let mut mdos = bsl_metadata::discover_metadata_structure(root_path, &tree);
             mdos.extend(bsl_metadata::discover_register_structure(root_path, &tree));
             // An export root lists nothing by collection: its one object is
@@ -91,6 +98,12 @@ pub fn bootstrap_metadata_substrate(db: &mut RootDatabaseImpl, vfs: &impl VfsWri
             }
             RootDiscovery {
                 root_string: root_path.to_string_lossy().to_string(),
+                header: bsl_conventions::find_stored_child_ci_in(
+                    &tree,
+                    root_path,
+                    bsl_conventions::ConventionalName::ConfigurationXml.canonical(),
+                ),
+                read_metadata: bsl_metadata::loader::discover_read_metadata_files(root_path, &tree),
                 mdos,
                 defined_types: bsl_metadata::discover_defined_type_structure(root_path, &tree),
                 common_modules: bsl_metadata::discover_common_module_structure(root_path, &tree),
@@ -118,6 +131,8 @@ pub fn bootstrap_metadata_substrate(db: &mut RootDatabaseImpl, vfs: &impl VfsWri
     // root(0), read elsewhere — not hashed here.)
     let mut to_read: Vec<PathBuf> = Vec::new();
     for d in &discoveries {
+        to_read.extend(d.header.iter().cloned());
+        to_read.extend(d.read_metadata.iter().cloned());
         for m in &d.mdos {
             to_read.push(m.main.clone());
             if let Some(p) = &m.predefined {
@@ -140,6 +155,11 @@ pub fn bootstrap_metadata_substrate(db: &mut RootDatabaseImpl, vfs: &impl VfsWri
             }
         }
     }
+    inspection_inputs::bootstrap_fingerprints(
+        db,
+        discoveries.iter().flat_map(|d| d.read_metadata.iter().cloned()),
+    );
+    to_read.retain(|path| !inspection_inputs::is_binary(path));
     let revisions_by_path: HashMap<PathBuf, u64> = {
         use rayon::prelude::*;
         to_read
@@ -162,6 +182,24 @@ pub fn bootstrap_metadata_substrate(db: &mut RootDatabaseImpl, vfs: &impl VfsWri
     // `intern_metadata_file` returns `None` and the MDO is dropped.
     vfs.with_write(|vfs| {
         for d in discoveries {
+            if let Some(header) = &d.header {
+                intern_metadata_file(
+                    vfs,
+                    header,
+                    &revisions_by_path,
+                    &mut metadata_file_set,
+                    &mut revisions,
+                );
+            }
+            for file in &d.read_metadata {
+                intern_metadata_file(
+                    vfs,
+                    file,
+                    &revisions_by_path,
+                    &mut metadata_file_set,
+                    &mut revisions,
+                );
+            }
             let mut entries = Vec::with_capacity(d.mdos.len());
             for m in d.mdos {
                 let Some(main) = intern_metadata_file(
@@ -428,13 +466,14 @@ pub fn refresh_metadata_substrate(
         return false;
     }
 
+    let owner_sources_changed = owner_sources::prepare(db, vfs, Some(changed_paths));
     let snapshot = db.workspace_configs_snapshot();
     // Discovery reads through the user's exclusions, so nothing inside them is listed,
     // probed or registered.
     let tree = bsl_metadata::ScopedFs::new(&snapshot.source_exclusions);
-    let config_paths = db.all_config_paths();
+    let prepared_roots = snapshot.prepared_roots();
     let mut affected: Vec<(PathBuf, ide_db::metadata::RootKind)> = Vec::new();
-    for ((_, root), kind) in config_paths.iter().zip(&snapshot.kinds) {
+    for (kind, root, _) in &prepared_roots {
         if !affected.iter().any(|(r, _)| r == root)
             && changed_paths.iter().any(|p| p.starts_with(root))
         {
@@ -442,10 +481,16 @@ pub fn refresh_metadata_substrate(
         }
     }
     if affected.is_empty() {
-        return false;
+        return owner_sources_changed;
     }
 
     let changed_set: HashSet<&Path> = changed_paths.iter().map(|p| p.as_path()).collect();
+    let fingerprints_changed = inspection_inputs::refresh_fingerprints(
+        db,
+        affected.iter().map(|(root, _)| root.clone()),
+        &tree,
+        changed_paths,
+    );
 
     let mut metadata_file_set = {
         let db = &*db;
@@ -454,11 +499,70 @@ pub fn refresh_metadata_substrate(
     let files_before = metadata_file_set.len();
 
     let mut new_file_ids: Vec<FileId> = Vec::new();
+    let mut unread_headers: Vec<FileId> = Vec::new();
+    let mut read_structure_changed = false;
     let mut revisions: Vec<(FileId, u64)> = Vec::new();
     let mut listings: Vec<RootStructureListing> = Vec::new();
 
     vfs.with_write(|vfs| {
         for (root, kind) in &affected {
+            for path in changed_paths {
+                if bsl_metadata::loader::is_read_metadata_file(root, path)
+                    && tree.kind_of(path).is_none()
+                {
+                    if let Some(id) = vfs.file_id(&VfsPath::new(path.clone())) {
+                        read_structure_changed |= metadata_file_set.remove(id).is_some();
+                        unread_headers.push(id);
+                    }
+                }
+            }
+            for path in bsl_metadata::loader::discover_read_metadata_files(root, &tree) {
+                if inspection_inputs::is_binary(&path) {
+                    continue;
+                }
+                enroll_refresh(
+                    vfs,
+                    &path,
+                    &changed_set,
+                    &mut metadata_file_set,
+                    &mut new_file_ids,
+                    &mut revisions,
+                );
+            }
+            if let Some(header) = bsl_conventions::find_stored_child_ci_in(
+                &tree,
+                root,
+                bsl_conventions::ConventionalName::ConfigurationXml.canonical(),
+            ) {
+                if enroll_refresh(
+                    vfs,
+                    &header,
+                    &changed_set,
+                    &mut metadata_file_set,
+                    &mut new_file_ids,
+                    &mut revisions,
+                )
+                .is_none()
+                {
+                    if let Some(id) = vfs.file_id(&VfsPath::new(header)) {
+                        unread_headers.push(id);
+                    }
+                }
+            } else {
+                for changed in changed_paths {
+                    if changed.parent() == Some(root.as_path())
+                        && changed.file_name().is_some_and(|name| {
+                            name.to_string_lossy().eq_ignore_ascii_case(
+                                bsl_conventions::ConventionalName::ConfigurationXml.canonical(),
+                            )
+                        })
+                    {
+                        if let Some(id) = vfs.file_id(&VfsPath::new(changed.clone())) {
+                            unread_headers.push(id);
+                        }
+                    }
+                }
+            }
             let mut discovered = bsl_metadata::discover_metadata_structure(root, &tree);
             discovered.extend(bsl_metadata::discover_register_structure(root, &tree));
             if let ide_db::metadata::RootKind::External(external) = kind {
@@ -692,8 +796,12 @@ pub fn refresh_metadata_substrate(
     let reread = revisions.len();
     let added = new_file_ids.len();
 
-    let mut changed = false;
-    if metadata_file_set.len() != files_before {
+    let mut changed = fingerprints_changed || owner_sources_changed;
+    for id in unread_headers {
+        db.set_file_unreadable(id);
+        changed = true;
+    }
+    if metadata_file_set.len() != files_before || read_structure_changed {
         db.set_source_root(METADATA_SOURCE_ROOT, SourceRoot::new_metadata(metadata_file_set));
         changed = true;
     }
@@ -907,6 +1015,218 @@ mod tests {
     </Catalog>
 </MetaDataObject>"#
         )
+    }
+
+    #[test]
+    fn configuration_header_uses_prepared_inputs_in_empty_roots_and_invalidates_per_root() {
+        use crate::workspace::{EditorView, WorkspaceSnapshot};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("base");
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let header = |name: &str, compatibility: &str, modality: &str| {
+            format!("<MetaDataObject><Configuration><Properties><Name>{name}</Name><CompatibilityMode>{compatibility}</CompatibilityMode><ModalityUseMode>{modality}</ModalityUseMode></Properties></Configuration></MetaDataObject>")
+        };
+        std::fs::write(root.join("CONFIGURATION.XML"), header("Base", "Version8_2_16", "Use"))
+            .unwrap();
+        std::fs::write(
+            other.join("Configuration.xml"),
+            header("Other", "Version8_3_27", "DontUse"),
+        )
+        .unwrap();
+        let mut host = AnalysisHost::default();
+        host.raw_database_mut().set_all_config_paths(
+            vec![(None, root.clone()), (Some("Other".into()), other.clone())],
+            None,
+        );
+        let vfs = TestVfs(RefCell::new(Vfs::default()));
+        host.bootstrap_metadata_substrate(&vfs);
+        let snapshot = WorkspaceSnapshot::capture(host.raw_database(), 1);
+        let mut view = EditorView::new(snapshot.clone());
+        for file in snapshot.files.iter().filter(|file| file.root_id == METADATA_SOURCE_ROOT) {
+            let text = std::fs::read_to_string(&file.path).unwrap();
+            SourceDatabase::set_file_text(view.database_mut(), file.file_id, &text);
+        }
+        let input = snapshot
+            .files
+            .iter()
+            .find(|file| file.path.ends_with("CONFIGURATION.XML"))
+            .unwrap()
+            .file_id;
+        std::fs::rename(root.join("CONFIGURATION.XML"), root.join("hidden.xml")).unwrap();
+        let value = view.database().configuration_for_root(&root);
+        assert_eq!(value.name(), "Base");
+        assert_eq!(value.compatibility_mode(), Some("Version8_2_16"));
+        assert_eq!(value.modality_use_mode(), Some("Use"));
+        assert!(value.metadata_objects().is_empty());
+        SourceDatabase::set_file_text(
+            view.database_mut(),
+            input,
+            &header("Base", "Version8_3_27", "DontUse"),
+        );
+        let updated = view.database().configuration_for_root(&root);
+        assert_eq!(updated.compatibility_mode(), Some("Version8_3_27"));
+        assert_eq!(updated.modality_use_mode(), Some("DontUse"));
+        let independent = view.database().configuration_for_root(&other);
+        assert_eq!(independent.name(), "Other");
+        assert_eq!(independent.compatibility_mode(), Some("Version8_3_27"));
+    }
+
+    #[test]
+    fn prepared_exchange_content_refreshes_and_distinguishes_deleted_from_empty() {
+        use bsl_metadata::MdoType;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let main = root.join("ExchangePlans/Sync.xml");
+        let content = root.join("ExchangePlans/Sync/Ext/Content.xml");
+        std::fs::create_dir_all(content.parent().unwrap()).unwrap();
+        std::fs::write(&main,"<MetaDataObject><ExchangePlan><Properties><Name>Sync</Name></Properties></ExchangePlan></MetaDataObject>").unwrap();
+        std::fs::write(&content,"<ExchangePlanContent><Item><Metadata>Catalog.Items</Metadata><AutoRecord>Allow</AutoRecord></Item></ExchangePlanContent>").unwrap();
+        let mut host = AnalysisHost::default();
+        host.raw_database_mut().set_all_config_paths(vec![(None, root.to_path_buf())], None);
+        host.raw_database_mut().use_prepared_metadata_inputs();
+        let vfs = TestVfs(RefCell::new(Vfs::default()));
+        host.bootstrap_metadata_substrate(&vfs);
+        let value = host
+            .raw_database()
+            .resolve_metadata_object_across_roots(MdoType::ExchangePlan, "Sync")
+            .unwrap();
+        assert_eq!(
+            value.read_properties.exchange_plan_content.as_ref().unwrap()[0].auto_record.as_deref(),
+            Some("Allow")
+        );
+        assert!(value.read_properties.exchange_plan_content_complete);
+        std::fs::write(&content, "<ExchangePlanContent/>").unwrap();
+        assert!(host.refresh_metadata_substrate(&vfs, std::slice::from_ref(&content)));
+        let value = host
+            .raw_database()
+            .resolve_metadata_object_across_roots(MdoType::ExchangePlan, "Sync")
+            .unwrap();
+        assert_eq!(value.read_properties.exchange_plan_content, Some(vec![]));
+        std::fs::remove_file(&content).unwrap();
+        assert!(host.refresh_metadata_substrate(&vfs, std::slice::from_ref(&content)));
+        let value = host
+            .raw_database()
+            .resolve_metadata_object_across_roots(MdoType::ExchangePlan, "Sync")
+            .unwrap();
+        assert!(value.read_properties.exchange_plan_content.is_none());
+        assert!(!value.read_properties.exchange_plan_content_complete);
+    }
+
+    #[test]
+    fn prepared_functional_options_keep_roots_separate_and_refresh_deletions() {
+        use bsl_metadata::read_object::ReadObjectKind;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let other = dir.path().join("other");
+        let xml = |location: &str| {
+            format!("<MetaDataObject><FunctionalOption><Properties><Name>Feature</Name><Synonym/><Location>{location}</Location><PrivilegedGetMode>true</PrivilegedGetMode><Content/></Properties></FunctionalOption></MetaDataObject>")
+        };
+        for (root, location) in [(&base, "Constant.Base"), (&other, "Constant.Other")] {
+            std::fs::create_dir_all(root.join("FunctionalOptions")).unwrap();
+            std::fs::write(root.join("FunctionalOptions/Feature.xml"), xml(location)).unwrap();
+        }
+        let mut host = AnalysisHost::default();
+        host.raw_database_mut().set_all_config_paths(
+            vec![(None, base.clone()), (Some("Other".into()), other.clone())],
+            None,
+        );
+        host.raw_database_mut().use_prepared_metadata_inputs();
+        let vfs = TestVfs(RefCell::new(Vfs::default()));
+        host.bootstrap_metadata_substrate(&vfs);
+        let base_config = host.raw_database().configuration_for_root(&base);
+        let other_config = host.raw_database().configuration_for_root(&other);
+        assert_eq!(
+            base_config
+                .find_read_object(ReadObjectKind::FunctionalOption, "Feature")
+                .unwrap()
+                .location
+                .as_deref(),
+            Some("Constant.Base")
+        );
+        assert_eq!(
+            other_config
+                .find_read_object(ReadObjectKind::FunctionalOption, "Feature")
+                .unwrap()
+                .location
+                .as_deref(),
+            Some("Constant.Other")
+        );
+        let path = base.join("FunctionalOptions/Feature.xml");
+        std::fs::write(&path, xml("Constant.Updated")).unwrap();
+        assert!(host.refresh_metadata_substrate(&vfs, std::slice::from_ref(&path)));
+        let updated = host.raw_database().configuration_for_root(&base);
+        assert_eq!(
+            updated
+                .find_read_object(ReadObjectKind::FunctionalOption, "Feature")
+                .unwrap()
+                .location
+                .as_deref(),
+            Some("Constant.Updated")
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert!(host.refresh_metadata_substrate(&vfs, std::slice::from_ref(&path)));
+        assert!(host.raw_database().configuration_for_root(&base).read_objects().is_empty());
+        assert_eq!(host.raw_database().configuration_for_root(&other).read_objects().len(), 1);
+    }
+
+    #[test]
+    fn prepared_nested_subsystems_keep_scope_and_adopted_overlay_origins() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().join("base");
+        let extension = directory.path().join("extension");
+        let base_uuid = "00000000-0000-0000-0000-000000000001";
+        let write = |root: &Path,
+                     parent: &str,
+                     uuid: &str,
+                     ownership: &str,
+                     reference: &str,
+                     picture: &str| {
+            let path = root.join("Subsystems").join(parent).join("Subsystems/Rules.xml");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path,format!("<MetaDataObject><Subsystem uuid=\"{uuid}\"><Properties><Name>Rules</Name>{ownership}<Content><Item>{reference}</Item></Content><Picture>{picture}</Picture></Properties></Subsystem></MetaDataObject>")).unwrap();
+        };
+        write(&base, "Operations", base_uuid, "", "Catalog.Base", "CommonPicture.Base");
+        write(
+            &base,
+            "Other",
+            "00000000-0000-0000-0000-000000000003",
+            "",
+            "Catalog.Other",
+            "CommonPicture.Other",
+        );
+        write(&extension,"Operations","00000000-0000-0000-0000-000000000002",&format!("<ObjectBelonging>Adopted</ObjectBelonging><ExtendedConfigurationObject>{base_uuid}</ExtendedConfigurationObject>"),"CommonCommand.Extension","CommonPicture.Extension");
+        let mut host = AnalysisHost::default();
+        host.raw_database_mut().set_all_config_paths(
+            vec![(None, base.clone()), (Some("Extension".into()), extension.clone())],
+            None,
+        );
+        host.raw_database_mut().use_prepared_metadata_inputs();
+        let vfs = TestVfs(RefCell::new(Vfs::default()));
+        host.bootstrap_metadata_substrate(&vfs);
+        let value = host
+            .raw_database()
+            .resolve_subsystem_across_roots("Operations.Subsystem.Rules")
+            .unwrap();
+        assert_eq!(value.parent.as_deref(), Some("Operations"));
+        assert_eq!(value.picture.as_deref(), Some("CommonPicture.Extension"));
+        assert_eq!(
+            value.content_refs,
+            Some(vec!["Catalog.Base".into(), "CommonCommand.Extension".into()])
+        );
+        assert_eq!(
+            value.source_roots,
+            [base.to_string_lossy().to_string(), extension.to_string_lossy().to_string()]
+        );
+        let other =
+            host.raw_database().resolve_subsystem_across_roots("Other.Subsystem.Rules").unwrap();
+        assert_eq!(other.picture.as_deref(), Some("CommonPicture.Other"));
+        assert!(host.raw_database().resolve_subsystem_across_roots("Rules").is_none());
+        assert!(host
+            .raw_database()
+            .resolve_subsystem_across_roots("Operations.Subsystem.Missing")
+            .is_none());
     }
 
     #[test]

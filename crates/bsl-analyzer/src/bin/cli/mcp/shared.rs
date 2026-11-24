@@ -1,5 +1,7 @@
 //! Upper adapter dispatch for the existing local broker.
 
+mod startup;
+
 use std::{collections::BTreeMap, fs, path::Path, sync::Arc, time::UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -301,7 +303,11 @@ struct NamedConnection {
     user: String,
     password: String,
     allow_execute: bool,
+    #[serde(default = "super::default_execute_timeout_ms")]
+    execute_timeout_ms: u64,
     check_executor: Option<super::CheckExecutorConfig>,
+    #[serde(default)]
+    epf_module_check: bool,
 }
 
 impl NativeContext {
@@ -317,6 +323,8 @@ impl NativeContext {
 
     fn add_named(&mut self, config: super::OnecConnectionsFile) -> Result<()> {
         for (name, entry) in config.connections {
+            onec_client::validate_execute_timeout_ms(entry.execute_timeout_ms)?;
+            super::validate_epf_http(entry.epf_module_check, entry.url.as_deref())?;
             anyhow::ensure!(
                 !name.trim().is_empty()
                     && entry.url.as_deref().is_none_or(|url| !url.trim().is_empty())
@@ -346,7 +354,9 @@ impl NativeContext {
                     user,
                     password,
                     allow_execute: entry.allow_execute,
+                    execute_timeout_ms: entry.execute_timeout_ms,
                     check_executor: entry.check_executor,
+                    epf_module_check: entry.epf_module_check,
                 },
             );
         }
@@ -358,10 +368,16 @@ impl NativeContext {
             config.set_onec_client(onec_client::Client::new(url, &self.user, &self.password));
         }
         for (name, native) in &self.named {
+            onec_client::validate_execute_timeout_ms(native.execute_timeout_ms)?;
+            super::validate_epf_http(native.epf_module_check, native.url.as_deref())?;
             let client = native
                 .url
                 .as_ref()
-                .map(|url| onec_client::Client::new(url, &native.user, &native.password));
+                .map(|url| {
+                    onec_client::Client::new(url, &native.user, &native.password)
+                        .with_execute_timeout_ms(native.execute_timeout_ms)
+                })
+                .transpose()?;
             let executor = native
                 .check_executor
                 .clone()
@@ -373,7 +389,8 @@ impl NativeContext {
                     client,
                     native.allow_execute,
                     executor,
-                ),
+                )
+                .with_epf_module_check(native.epf_module_check),
             );
         }
         Ok(())
@@ -434,6 +451,7 @@ pub(super) async fn run_daemon(inputs: ServerInputs) -> Result<()> {
     let executor_slots = Arc::new(ExecutorSlots::default());
     let owner: Arc<tokio::sync::OnceCell<mcp_server::McpServer>> =
         Arc::new(tokio::sync::OnceCell::new());
+    let mcp_readiness = Arc::new(startup::OwnerStartup::default());
     let markers_enabled = std::env::var_os("BSL_SHARED_BACKEND_MARKERS").is_some();
     let retiring = CancellationToken::new();
     let retired = retiring.clone();
@@ -445,6 +463,7 @@ pub(super) async fn run_daemon(inputs: ServerInputs) -> Result<()> {
                            stop: CancellationToken,
                            _retired: CancellationToken| {
         let owner = owner.clone();
+        let mcp_readiness = mcp_readiness.clone();
         let source = source.clone();
         let cache = cache.clone();
         let expected = expected.clone();
@@ -538,7 +557,19 @@ pub(super) async fn run_daemon(inputs: ServerInputs) -> Result<()> {
             };
             match session {
                 SharedSession::Mcp(stream) => {
-                    let server = initialized.await?;
+                    let server = match startup::wait_for_mcp_owner(
+                        &mcp_readiness,
+                        initialized,
+                        stop.clone(),
+                    )
+                    .await
+                    {
+                        Ok(Some(server)) => server,
+                        Ok(None) => return Ok(()),
+                        Err(failure) => {
+                            return mcp_server::refuse_initialization(stream, stop, failure).await;
+                        }
+                    };
                     let context: McpContext = serde_json::from_slice(&bytes)?;
                     mcp_server::contract::validate_enabled_tools(
                         mcp_server::McpProfile::Workspace,
@@ -812,6 +843,51 @@ pub(crate) fn encode_lsp_message(message: &lsp_server::Message) -> Result<Vec<u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn epf_module_check_defaults_off_and_survives_session_round_trip() {
+        for (extra, enabled) in [("", false), (",\"epf_module_check\":true", true)] {
+            let config = serde_json::from_str(&format!(
+                r#"{{"connections":{{"test":{{"url":"http://localhost/test"{extra}}}}}}}"#
+            ))
+            .unwrap();
+            let mut native = NativeContext::default();
+            native.add_named(config).unwrap();
+            let native: NativeContext =
+                serde_json::from_slice(&serde_json::to_vec(&native).unwrap()).unwrap();
+            assert_eq!(native.named["test"].epf_module_check, enabled);
+            let mut settings = mcp_server::SessionConfig::default();
+            native.install(&mut settings, &ExecutorSlots::default()).unwrap();
+        }
+        let legacy: NativeContext = serde_json::from_str(r#"{"url":null,"user":"","password":"","named":{"test":{"url":"http://localhost/test","user":"","password":"","allow_execute":false,"check_executor":null}}}"#).unwrap();
+        assert!(!legacy.named["test"].epf_module_check);
+        let invalid = serde_json::from_str(r#"{"connections":{"test":{"epf_module_check":true,"check_executor":{"program":"/test/executor","handles_snippet":false}}}}"#).unwrap();
+        assert!(NativeContext::default().add_named(invalid).is_err());
+    }
+
+    #[test]
+    fn execute_timeout_survives_shared_context_and_validates_legacy_defaults() {
+        for (field, expected) in [("", 30_000), (",\"execute_timeout_ms\":90000", 90_000)] {
+            let config = serde_json::from_str(&format!(
+                r#"{{"connections":{{"test":{{"url":"http://localhost/test"{field}}}}}}}"#
+            ))
+            .unwrap();
+            let mut native = NativeContext::default();
+            native.add_named(config).unwrap();
+            let native: NativeContext =
+                serde_json::from_slice(&serde_json::to_vec(&native).unwrap()).unwrap();
+            assert_eq!(native.named["test"].execute_timeout_ms, expected);
+            let mut settings = mcp_server::SessionConfig::default();
+            native.install(&mut settings, &ExecutorSlots::default()).unwrap();
+        }
+        let invalid = serde_json::from_str(
+            r#"{"connections":{"test":{"url":"http://localhost/test","execute_timeout_ms":0}}}"#,
+        )
+        .unwrap();
+        assert!(NativeContext::default().add_named(invalid).is_err());
+        let old: NativeContext = serde_json::from_str(r#"{"url":null,"user":"","password":"","named":{"test":{"url":"http://localhost/test","user":"","password":"","allow_execute":false,"check_executor":null}}}"#).unwrap();
+        assert_eq!(old.named["test"].execute_timeout_ms, 30_000);
+    }
 
     #[test]
     fn executor_only_connection_survives_the_session_context_round_trip() {

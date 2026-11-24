@@ -1,0 +1,14 @@
+{
+  "schema": 3,
+  "source": {"file": "Form.bin", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  "producer": {"name": "v8unpack", "version": "1.2.6", "formSchema": "0-27"},
+  "form": {"name": "Dialog", "pages": ["Main", "Details"]},
+  "attributes": [{"name": "Document"}],
+  "controls": [
+    {"kind": "panel", "name": "DialogPanel", "id": 2, "page": "Main", "sourceIdentity": "Main/DialogPanel", "children": [
+      {"kind": "input", "name": "Partner", "id": 3, "page": "Details", "sourceIdentity": "Main/DialogPanel/Details/Partner", "dataPath": "Document", "dataPathCoverage": "reader_property"},
+      {"kind": "button", "name": "Accept", "id": 4, "page": "Details", "sourceIdentity": "Main/DialogPanel/Details/Accept"}
+    ]}
+  ],
+  "inspectionLimitations": ["event_bindings_unread", "attribute_types_unread", "nested_data_paths_unread"]
+}

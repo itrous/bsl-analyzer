@@ -1,0 +1,198 @@
+{
+  "_fixture": {
+    "producer_contract": "read-properties-current-locale-v1",
+    "source": "generic transport fixtures; native API support is captured separately, not producer E2E"
+  },
+  "catalog": {
+    "name": "Products",
+    "full_name": "Справочник.Products",
+    "synonym": "Пример",
+    "read_properties": {
+      "synonym": {
+        "ru": "Пример"
+      },
+      "synonym_complete": false,
+      "members": [
+        {
+          "path": [
+            "Attribute",
+            "Article"
+          ],
+          "synonym": {
+            "ru": ""
+          },
+          "synonym_complete": false,
+          "use_mode": "ForFolderAndItem",
+          "fill_value": {
+            "type_name": "{http://www.w3.org/2001/XMLSchema}string",
+            "value": "",
+            "nil": false,
+            "fields": []
+          }
+        },
+        {
+          "path": [
+            "TabularSection",
+            "Rows"
+          ],
+          "synonym": {
+            "ru": "Строки"
+          },
+          "synonym_complete": false,
+          "use_mode": "ForItem"
+        },
+        {
+          "path": [
+            "TabularSection",
+            "Rows",
+            "Attribute",
+            "Quantity"
+          ],
+          "synonym": {
+            "ru": "Количество"
+          },
+          "synonym_complete": false,
+          "fill_value": {
+            "type_name": "{http://www.w3.org/2001/XMLSchema}decimal",
+            "value": "0",
+            "nil": false,
+            "fields": []
+          }
+        }
+      ],
+      "hierarchical": true,
+      "hierarchy_type": "HierarchyFoldersAndItems",
+      "code_type": "String",
+      "code_length": 9,
+      "code_allowed_length": "Fixed"
+    },
+    "Реквизиты": [
+      {
+        "name": "Article",
+        "synonym": "",
+        "type": "Строка",
+        "typeVariants": [
+          {
+            "technicalName": "Строка",
+            "presentation": "Строка"
+          }
+        ]
+      }
+    ],
+    "ТабличныеЧасти": [
+      {
+        "name": "Rows",
+        "synonym": "Строки",
+        "attributes": [
+          {
+            "name": "Quantity",
+            "synonym": "Количество",
+            "type": "Число",
+            "typeVariants": [
+              {
+                "technicalName": "Число",
+                "presentation": "Число"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "independent_register": {
+    "name": "Settings",
+    "full_name": "РегистрСведений.Settings",
+    "synonym": "Пример",
+    "read_properties": {
+      "synonym": {
+        "ru": "Пример"
+      },
+      "synonym_complete": false,
+      "members": [
+        {
+          "path": [
+            "Resource",
+            "Enabled"
+          ],
+          "synonym": {
+            "ru": "Включено"
+          },
+          "synonym_complete": false,
+          "fill_value": {
+            "type_name": "{http://www.w3.org/2001/XMLSchema}boolean",
+            "value": "true",
+            "nil": false,
+            "fields": []
+          }
+        },
+        {
+          "path": [
+            "Resource",
+            "Timestamp"
+          ],
+          "synonym": {
+            "ru": "Время"
+          },
+          "synonym_complete": false,
+          "fill_value": {
+            "type_name": null,
+            "value": "",
+            "nil": true,
+            "fields": []
+          }
+        }
+      ],
+      "periodicity": "Nonperiodical",
+      "write_mode": "Independent"
+    },
+    "СтандартныеРеквизиты": []
+  },
+  "enum": {
+    "name": "State",
+    "full_name": "Перечисление.State",
+    "synonym": "Пример",
+    "read_properties": {
+      "synonym": {
+        "ru": "Пример"
+      },
+      "synonym_complete": false,
+      "members": [
+        {
+          "path": [
+            "EnumValue",
+            "Active"
+          ],
+          "synonym": {
+            "ru": "Активный"
+          },
+          "synonym_complete": false
+        },
+        {
+          "path": [
+            "EnumValue",
+            "Inactive"
+          ],
+          "synonym": {
+            "ru": ""
+          },
+          "synonym_complete": false
+        }
+      ]
+    },
+    "enum_values": [
+      {
+        "name": "Active",
+        "synonym": "Активный"
+      },
+      {
+        "name": "Inactive",
+        "synonym": ""
+      }
+    ]
+  },
+  "legacy": {
+    "name": "Legacy",
+    "full_name": "Справочник.Legacy",
+    "synonym": "Прежний"
+  }
+}
