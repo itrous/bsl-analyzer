@@ -68,7 +68,7 @@ impl StandardKind {
             Self::Posted => "Проведен",
             Self::Started => "Стартован",
             Self::Completed => "Завершен",
-            Self::HeadTask => "ГлавнаяЗадача",
+            Self::HeadTask => "ВедущаяЗадача",
             Self::Executed => "Выполнена",
             Self::TaskBusinessProcess => "БизнесПроцесс",
             Self::RoutePoint => "ТочкаМаршрута",
