@@ -628,9 +628,8 @@ fn reported(names: &[&str]) -> Vec<String> {
     names.iter().map(|name| name.to_string()).collect()
 }
 
-const ALL_LIST_READS: [&str; 11] = [
+const ALL_LIST_READS: [&str; 10] = [
     "СовсемНеизвестноеИмя",
-    "РеквизитФормы",
     "Отбор",
     "Порядок",
     "Колонки",
@@ -663,14 +662,18 @@ fn a_list_form_with_an_english_list_type_resolves_the_same_surface() {
 }
 
 /// The control of the list tests: the same module over the sidecar that differs only
-/// in the missing `type` and `main` keys. Every name is reported as before.
+/// in the missing `type` and `main` keys. The form's own attribute is resolved from its
+/// sidecar whatever the main attribute is, so it is no longer reported; every other name is
+/// reported as before.
 #[test]
 fn a_list_form_without_a_main_attribute_is_judged_as_before() {
     let (db, file_id) = setup_at(&form_module("ФормаСпискаБезТипа"), LIST_FORM_READS);
     assert_eq!(absent_names(&db, file_id), reported(&ALL_LIST_READS));
 }
 
-/// A plain value as the main attribute names no list: the surface stays unreadable.
+/// A plain value as the main attribute names no list: the surface stays unreadable. The
+/// form's own attribute is resolved from its sidecar whatever the main attribute is, so it
+/// is no longer reported.
 #[test]
 fn a_list_form_whose_main_attribute_is_a_plain_string_is_judged_as_before() {
     let (db, file_id) = setup_at(&form_module("ФормаСпискаСтрока"), LIST_FORM_READS);
@@ -756,7 +759,8 @@ fn a_record_set_form_read_resolves_the_registers_fields_in_both_notations() {
 }
 
 /// The control of the register tests: the same module over the sidecar without `type`
-/// and `main`. Every name is reported as before.
+/// and `main`. The form's own attribute is resolved from its sidecar whatever the main
+/// attribute is, so it is no longer reported; every other name is reported as before.
 #[test]
 fn a_register_form_without_a_main_attribute_is_judged_as_before() {
     let (db, file_id) = setup_at(&form_module("ФормаСпискаБезТипа"), REGISTER_FORM_READS);
@@ -764,7 +768,6 @@ fn a_register_form_without_a_main_attribute_is_judged_as_before() {
         absent_names(&db, file_id),
         reported(&[
             "СовсемНеизвестноеИмя",
-            "РеквизитФормы",
             "Справочник1",
             "Период",
             "Отбор",
