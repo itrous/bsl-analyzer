@@ -212,7 +212,7 @@ pub fn handle_find_references(
         let known = result.hits.len();
         let count = reasons.len();
         let sample = reasons.iter().take(8).map(|reason| &reason.kind).collect::<Vec<_>>();
-        anyhow::bail!(
+        tracing::warn!(
             "Metadata references are incomplete: {known} known occurrences; {count} issues; {sample:?}"
         );
     }
@@ -2828,6 +2828,76 @@ mod tests {
 
         let result = handle_find_references(&ctx, params);
         assert!(result.is_err() || result.unwrap().is_none());
+    }
+
+    #[test]
+    fn find_references_returns_known_hits_when_metadata_coverage_is_partial() {
+        use base_db::{SourceDatabase as _, SourceRoot, METADATA_SOURCE_ROOT};
+
+        let temp = tempfile::tempdir().expect("temp directory");
+        let xml_path = temp.path().join("Catalogs/Справочник1.xml");
+        std::fs::create_dir_all(xml_path.parent().unwrap()).expect("metadata directory");
+        let xml_text = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../bsl-metadata/fixtures/designer/Catalogs/Справочник1.xml"
+        ));
+        std::fs::write(&xml_path, xml_text).expect("metadata fixture");
+
+        let source =
+            "Процедура Тест()\n    Справочники.Справочник1.НайтиПоКоду(\"x\");\nКонецПроцедуры\n";
+        let source_path = temp.path().join("CommonModules/Тест/Ext/Module.bsl");
+        let uri = lsp_types::Url::from_file_path(&source_path).expect("source URI");
+        let mut state = create_test_state();
+        state.init_empty_source_root();
+        open_source(&mut state, &uri, source);
+
+        let xml_id = state.vfs.write().alloc_file_id(VfsPath::new(xml_path.clone()));
+        {
+            let db = state.analysis_host.raw_database_mut();
+            let mut metadata_files = vfs::file_set::FileSet::new();
+            metadata_files.insert(xml_id, VfsPath::new(xml_path));
+            db.set_source_root(METADATA_SOURCE_ROOT, SourceRoot::new_metadata(metadata_files));
+            db.set_file_source_root(xml_id, METADATA_SOURCE_ROOT);
+            db.set_file_text(xml_id, xml_text);
+            db.set_all_config_paths(vec![(None, temp.path().to_path_buf())], None);
+            db.set_metadata_listing(
+                &temp.path().to_string_lossy(),
+                ide_db::metadata::MetadataListingData {
+                    entries: vec![ide_db::metadata::MdoEntry {
+                        kind: bsl_metadata::MdoType::Catalog,
+                        name: "Справочник1".to_string(),
+                        main: xml_id,
+                        predefined: None,
+                    }],
+                    ..Default::default()
+                },
+            );
+        }
+
+        let line = source.lines().nth(1).expect("reference line");
+        let byte_offset = line.find("Справочник1").expect("metadata reference");
+        let character = line[..byte_offset].encode_utf16().count() as u32;
+        let mut ctx = latency_ctx(&state);
+        ctx.file_paths = FrozenFilePaths::freeze_database(ctx.analysis.database());
+        let locations = handle_find_references(
+            &ctx,
+            ReferenceParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: Position { line: 1, character },
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: lsp_types::ReferenceContext { include_declaration: true },
+            },
+        )
+        .expect("partial references are still a successful LSP response")
+        .expect("known occurrences are returned");
+
+        assert!(
+            locations.iter().any(|location| location.uri == uri),
+            "the known BSL occurrence must survive the incomplete metadata coverage: {locations:?}",
+        );
     }
 
     fn open_source(state: &mut GlobalState, uri: &lsp_types::Url, source: &str) {
