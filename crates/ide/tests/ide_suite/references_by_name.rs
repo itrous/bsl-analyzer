@@ -6,6 +6,7 @@
 //! assertions, so each one is paired with an input where the hit is required.
 
 use hir::{DefDatabase, ModuleId};
+use ide::metadata_rename::MetadataPreviewIssueKind;
 use ide::{
     anchor_references, find_references_by_name, finish_references, lookup_names,
     resolve_declarations, symbol_info, walk_reference_file, Anchored, NameQuery, ReferenceAnchor,
@@ -52,6 +53,13 @@ fn request(anchor: ReferenceAnchor) -> ReferencesRequest {
 
 fn by_name(db: &RootDatabaseImpl, name: &str) -> ide::ReferencesResult {
     find_references_by_name(db, &request(ReferenceAnchor::Name(name.to_string())), &[])
+}
+
+fn assert_incomplete_metadata(result: &ide::ReferencesResult, expected: MetadataPreviewIssueKind) {
+    let ReferencesOutcome::Partial { reasons } = &result.outcome else {
+        panic!("expected an incomplete metadata walk, got {:?}", result.outcome);
+    };
+    assert!(reasons.iter().any(|issue| issue.kind == expected), "{reasons:?}");
 }
 
 fn dictionary_candidates(db: &RootDatabaseImpl, name: &str) -> usize {
@@ -737,11 +745,9 @@ fn the_type_of_an_implicit_local_follows_the_occurrence() {
     assert_eq!(target_of(reads[1]), document_xml, "the read after the second write");
 }
 
-/// Gate Q1 (metadata half) and gate O (first input) — a metadata object is
-/// found and is not referenceable. Control: `symbol_info` answers for the same
-/// string, so the name is genuinely resolvable and `not_found` would be a lie.
+/// A semantic-only fixture can resolve the object without proving XML coverage.
 #[test]
-fn a_metadata_object_is_unsupported_not_missing() {
+fn a_metadata_object_without_xml_coverage_is_partial_not_missing() {
     let db = db_with_catalog();
 
     let card = symbol_info(
@@ -757,19 +763,12 @@ fn a_metadata_object_is_unsupported_not_missing() {
     assert!(card.is_some(), "control: the same string resolves as a card");
 
     let result = by_name(&db, "Справочник.Справочник1");
-    assert!(
-        matches!(result.outcome, ReferencesOutcome::UnsupportedSymbol { .. }),
-        "got {:?}",
-        result.outcome,
-    );
+    assert_incomplete_metadata(&result, MetadataPreviewIssueKind::XmlCoverageRequired);
 }
 
-/// An attribute of a metadata object is `unsupported_symbol` too, and this input is what
-/// pins the label: the classifier accepts the kinds `symbol_info` publishes, so a renamed
-/// label would quietly turn this answer into `not_found` — a claim that the name does not
-/// exist. Control: `symbol_info` resolves the same string.
+/// Missing XML coverage does not turn a resolvable attribute into an unknown name.
 #[test]
-fn a_metadata_attribute_is_unsupported_not_missing() {
+fn a_metadata_attribute_without_xml_coverage_is_partial_not_missing() {
     let db = db_with_catalog();
 
     let card = symbol_info(
@@ -785,11 +784,7 @@ fn a_metadata_attribute_is_unsupported_not_missing() {
     assert!(card.is_some(), "control: the same string resolves as a card");
 
     let result = by_name(&db, "Справочник.Справочник1.Реквизит1");
-    assert!(
-        matches!(result.outcome, ReferencesOutcome::UnsupportedSymbol { .. }),
-        "got {:?}",
-        result.outcome,
-    );
+    assert_incomplete_metadata(&result, MetadataPreviewIssueKind::XmlCoverageRequired);
 }
 
 /// Gate Q1 (platform half) — a platform type member is found and is not
@@ -980,6 +975,8 @@ fn references_follow_the_declared_dependency_matrix() {
     let canonical_paths =
         paths.iter().map(|(_, p)| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone())).collect();
     db.set_workspace_configs_snapshot(ide_db::metadata::WorkspaceConfigsSnapshot {
+        external_owners: Vec::new(),
+        compilation_overrides: Default::default(),
         extension_scopes: paths
             .iter()
             .map(|(label, _)| label.as_ref().map(|_| bsl_metadata::ExtensionScope::InfoBase))
@@ -1082,6 +1079,8 @@ fn manager_module_references_follow_the_declared_dependency_matrix() {
     let canonical_paths =
         paths.iter().map(|(_, p)| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone())).collect();
     db.set_workspace_configs_snapshot(ide_db::metadata::WorkspaceConfigsSnapshot {
+        external_owners: Vec::new(),
+        compilation_overrides: Default::default(),
         extension_scopes: paths
             .iter()
             .map(|(label, _)| label.as_ref().map(|_| bsl_metadata::ExtensionScope::InfoBase))
@@ -1175,6 +1174,8 @@ fn object_module_references_follow_the_declared_dependency_matrix() {
     let canonical_paths =
         paths.iter().map(|(_, p)| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone())).collect();
     db.set_workspace_configs_snapshot(ide_db::metadata::WorkspaceConfigsSnapshot {
+        external_owners: Vec::new(),
+        compilation_overrides: Default::default(),
         extension_scopes: paths
             .iter()
             .map(|(label, _)| label.as_ref().map(|_| bsl_metadata::ExtensionScope::InfoBase))
@@ -1282,6 +1283,8 @@ fn record_set_module_references_follow_the_declared_dependency_matrix() {
     let canonical_paths =
         paths.iter().map(|(_, p)| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone())).collect();
     db.set_workspace_configs_snapshot(ide_db::metadata::WorkspaceConfigsSnapshot {
+        external_owners: Vec::new(),
+        compilation_overrides: Default::default(),
         extension_scopes: paths
             .iter()
             .map(|(label, _)| label.as_ref().map(|_| bsl_metadata::ExtensionScope::InfoBase))
@@ -1374,6 +1377,8 @@ fn adopter_first_input() -> (RootDatabaseImpl, FileId, FileId, FileId) {
     let canonical_paths =
         paths.iter().map(|(_, p)| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone())).collect();
     db.set_workspace_configs_snapshot(ide_db::metadata::WorkspaceConfigsSnapshot {
+        external_owners: Vec::new(),
+        compilation_overrides: Default::default(),
         extension_scopes: paths
             .iter()
             .map(|(label, _)| label.as_ref().map(|_| bsl_metadata::ExtensionScope::InfoBase))
@@ -1571,11 +1576,7 @@ fn an_attribute_outranks_a_module_method_of_the_same_name() {
     assert_eq!(card.expect("a card").kind, "attribute", "the card reads it as an attribute");
 
     let collided = by_name(&db, "Справочник.Справочник1.Реквизит1");
-    assert!(
-        matches!(collided.outcome, ReferencesOutcome::UnsupportedSymbol { .. }),
-        "the reference surface must read the string the same way, got {:?}",
-        collided.outcome,
-    );
+    assert_incomplete_metadata(&collided, MetadataPreviewIssueKind::XmlCoverageRequired);
 
     // The control: a method name that collides with no member still resolves, so the rule
     // above did not simply disable module methods on triples.
@@ -1644,10 +1645,11 @@ fn a_form_attribute_outranks_a_form_module_method_of_the_same_name() {
     );
 
     let collided = by_name(&db, symbol);
-    assert!(
-        matches!(collided.outcome, ReferencesOutcome::UnsupportedSymbol { .. }),
-        "the reference surface must read the string the same way, got {:?}",
-        collided.outcome,
+    assert_incomplete_metadata(
+        &collided,
+        MetadataPreviewIssueKind::UnresolvedReference(
+            hir::metadata_symbol::MetadataIdentityError::MissingDeclaration,
+        ),
     );
 
     let handler = by_name(&db, "Документ.Документ1.Форма.ФормаДокумента.ПриЗаписиНаСервере");

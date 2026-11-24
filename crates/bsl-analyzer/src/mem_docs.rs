@@ -50,6 +50,10 @@ pub struct FrozenMemDocs {
 }
 
 impl FrozenMemDocs {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&Url, &FrozenDocument)> {
+        self.docs.iter()
+    }
+
     pub fn get(&self, uri: &Url) -> Option<&FrozenDocument> {
         self.docs.get(uri)
     }

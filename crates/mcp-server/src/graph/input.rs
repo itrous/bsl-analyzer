@@ -54,6 +54,16 @@ pub(crate) struct ProjectSnapshot {
 }
 
 impl ProjectSnapshot {
+    /// Owner dependencies are observed separately from diagnostic and graph subject files.
+    pub(crate) fn semantic_dependency_roots(&self) -> Vec<PathBuf> {
+        self.configs
+            .prepared_roots()
+            .into_iter()
+            .skip(self.configs.paths.len())
+            .map(|(_, root, _)| root)
+            .collect()
+    }
+
     /// Graph passes run only after the daemon bootstrap validated the project;
     /// a config broken by a mid-session edit restricts the scan to the
     /// workspace root (loud in logs) instead of walking a wrong universe.
@@ -154,6 +164,13 @@ fn portable_topology(
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"bsl-analyzer-portable-topology-v1\0");
     hasher.update(topology.as_bytes());
+    if project
+        .external_configuration_owners()
+        .iter()
+        .any(|(_, owner)| owner.proven_root().is_some())
+    {
+        hasher.update(&project.compilation_context_fingerprint());
+    }
     for exclusion in exclusions {
         hasher.update(&(exclusion.len() as u64).to_le_bytes());
         hasher.update(&exclusion);
@@ -566,5 +583,123 @@ mod tests {
             before.portable_topology, after.portable_topology,
             "cache aliases identify one owned hole whether or not its directory exists",
         );
+    }
+}
+
+#[cfg(test)]
+mod external_owner_inputs_tests {
+    use super::ProjectSnapshot;
+    use crate::graph::{scan, test_support, GraphState};
+    use std::{fs, path::Path, sync::atomic::Ordering};
+
+    fn fixture(root: &Path) {
+        for (path, compatibility) in [("modern", "Version8_3_27"), ("legacy", "Version8_2_16")] {
+            test_support::write(root, &format!("{path}/Configuration.xml"), &format!("<MetaDataObject><Configuration uuid=\"00000000-0000-0000-0000-000000000001\"><Properties><Name>{path}</Name><CompatibilityMode>{compatibility}</CompatibilityMode><DefaultRunMode>ManagedApplication</DefaultRunMode></Properties></Configuration></MetaDataObject>"));
+        }
+        test_support::write_common_module(
+            &root.join("legacy"),
+            "OwnerLibrary",
+            true,
+            "Функция Значение() Экспорт\nВозврат 1;\nКонецФункции",
+        );
+        test_support::write(root, "processor/External.xml", "<MetaDataObject><ExternalDataProcessor uuid=\"00000000-0000-0000-0000-000000000002\"><Properties><Name>External</Name></Properties></ExternalDataProcessor></MetaDataObject>");
+        test_support::write(
+            root,
+            "processor/External/Ext/ObjectModule.bsl",
+            "Процедура Проверить() Экспорт\nЗначение = OwnerLibrary.Значение();\nКонецПроцедуры",
+        );
+        test_support::write(root, "bsl-analyzer.toml", "[source]\nroot=\"modern\"\nextensions=[]\nexternals=[{name=\"External\",path=\"processor\",configuration_root=\"legacy\"}]\n");
+    }
+
+    #[test]
+    fn external_owner_dependency_freshness_survives_reopen_and_unchanged_probes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fixture(root);
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        let excluded = cache.exclusions(root);
+        let project = ProjectSnapshot::load_excluding(root, &excluded);
+        let universe = crate::graph::universe::ScannedUniverse::scan_project(&project);
+        assert_eq!(universe.files.len(), 1, "owner dependencies have no graph subject FileIds");
+        assert!(!project.scan_roots.contains(&root.join("legacy")));
+        let original = scan::fingerprint_of_project(&universe.stats, &project).unwrap();
+        test_support::seed_cache(root, original);
+        {
+            let cached = crate::graph_query::GraphDb::open(&cache.graph_db_path()).unwrap();
+            assert_eq!(cached.freshness_token().unwrap().1, original);
+            assert!(scan::graph_matches_live_project_strict(&cached, &project));
+        }
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        graph.ensure_loading();
+        test_support::wait_ready(&graph);
+        let identity = ProjectSnapshot::load_excluding(root, &excluded).configs.fingerprint;
+        for _ in 0..3 {
+            assert_eq!(
+                ProjectSnapshot::load_excluding(root, &excluded).configs.fingerprint,
+                identity
+            );
+            cache.verify_project(&crate::project::at(root).unwrap()).unwrap();
+            graph.forget_the_disk_look();
+            let snapshot = graph.snapshot().unwrap();
+            assert!(!graph.freshness(&snapshot).stale, "unchanged owner inputs stay fresh");
+            assert_eq!(snapshot.generation, 7);
+        }
+        assert_eq!(
+            graph.full_builds_started.load(Ordering::SeqCst),
+            0,
+            "unchanged probes do not rebuild or retire a cached graph"
+        );
+        let library = root.join("legacy/CommonModules/OwnerLibrary/Ext/Module.bsl");
+        fs::write(&library, "Функция Значение() Экспорт\nВозврат 2;\nКонецФункции").unwrap();
+        let changed_project = ProjectSnapshot::load_excluding(root, &excluded);
+        let changed = scan::fingerprint_of_project(&universe.stats, &changed_project).unwrap();
+        assert_eq!(
+            changed.topology, original.topology,
+            "dependency bytes are not topology choices"
+        );
+        assert_ne!(changed.files, original.files);
+        graph.forget_the_disk_look();
+        assert!(graph.freshness(&graph.snapshot().unwrap()).stale);
+        test_support::wait_until(&graph, "owner body content published", || {
+            graph
+                .snapshot()
+                .is_some_and(|snapshot| snapshot.fingerprint == changed && !snapshot.force_stale)
+        });
+        assert!(graph.full_builds_started.load(Ordering::SeqCst) > 0);
+        drop(graph);
+
+        let reopened = GraphState::for_workspace(root.to_path_buf());
+        reopened.ensure_loading();
+        test_support::wait_ready(&reopened);
+        assert_eq!(reopened.snapshot().unwrap().fingerprint, changed);
+        assert_eq!(
+            reopened.full_builds_started.load(Ordering::SeqCst),
+            0,
+            "persisted graph reopens under the dependency inputs it actually used"
+        );
+        drop(reopened);
+        let header = root.join("legacy/Configuration.xml");
+        let xml = fs::read_to_string(&header).unwrap().replace("Version8_2_16", "Version8_3_10");
+        fs::write(header, xml).unwrap();
+        let changed_xml = scan::fingerprint_of_project(
+            &universe.stats,
+            &ProjectSnapshot::load_excluding(root, &excluded),
+        )
+        .unwrap();
+        assert_eq!(changed_xml.topology, original.topology);
+        assert_ne!(changed_xml.files, changed.files);
+        assert_eq!(
+            ProjectSnapshot::load_excluding(root, &excluded).configs.fingerprint,
+            identity,
+            "cheap project choice probes do not compare byte digests"
+        );
+        let after_xml = GraphState::for_workspace(root.to_path_buf());
+        after_xml.ensure_loading();
+        test_support::wait_until(&after_xml, "owner XML content published after reopening", || {
+            after_xml.snapshot().is_some_and(|snapshot| {
+                snapshot.fingerprint == changed_xml && !snapshot.force_stale
+            })
+        });
+        assert!(after_xml.full_builds_started.load(Ordering::SeqCst) > 0);
     }
 }

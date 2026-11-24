@@ -32,13 +32,26 @@ pub(crate) struct RequestCancel {
 struct RequestCancelInner {
     cancel_requested: bool,
     tokens: Vec<salsa::CancellationToken>,
+    disk_read: Option<ide_host_core::WorkspaceDiskRead>,
 }
 
 impl RequestCancel {
+    pub(crate) fn with_disk_read(disk_read: ide_host_core::WorkspaceDiskRead) -> Self {
+        Self {
+            inner: Mutex::new(RequestCancelInner {
+                disk_read: Some(disk_read),
+                ..RequestCancelInner::default()
+            }),
+        }
+    }
+
     /// Register a database handle's token; cancels it immediately when cancellation
     /// was already requested.
     pub(crate) fn register(&self, token: salsa::CancellationToken) {
         let mut inner = lock_recover(&self.inner);
+        if let Some(disk_read) = &inner.disk_read {
+            disk_read.register_cancel(token.clone());
+        }
         if inner.cancel_requested {
             token.cancel();
         }
@@ -58,6 +71,10 @@ impl RequestCancel {
     /// Cheap check for loops between queries (nothing to unwind from).
     pub(crate) fn is_cancelled(&self) -> bool {
         lock_recover(&self.inner).cancel_requested
+    }
+
+    pub(crate) fn disk_superseded(&self) -> bool {
+        lock_recover(&self.inner).disk_read.as_ref().is_some_and(|read| !read.is_current())
     }
 }
 

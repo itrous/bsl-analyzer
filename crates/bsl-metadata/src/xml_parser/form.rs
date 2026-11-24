@@ -385,16 +385,17 @@ pub fn parse_form_from_bsl_path(bsl_path: &std::path::Path) -> Result<Form> {
         matches!(&metadata_xml, Err(error) if error.kind() == std::io::ErrorKind::NotFound);
     let metadata = metadata_xml.ok().and_then(|xml| parse_form_metadata_xml(&xml).ok());
 
+    let descriptor_ordinary = metadata.as_ref().is_some_and(|m| m.form_type == FormType::Ordinary);
     let mut form = match std::fs::read_to_string(&ext_form_xml_path) {
-        Ok(ext_form_xml) => parse_form_xml(&ext_form_xml)?,
-        // No `Ext/Form.xml`: an ORDINARY form keeps its dialog in the binary
+        Ok(ext_form_xml) if !descriptor_ordinary => parse_form_xml(&ext_form_xml)?,
+        // An ORDINARY descriptor wins over a leftover managed `Ext/Form.xml`:
+        // the ordinary form keeps its dialog in the binary
         // `Ext/Form.bin`. A tool that reads it may describe the dialog in
         // `Ext/Form/Form.json` next to the module; without a usable one the form's
         // own descriptor still says `<FormType>Ordinary`, which is enough to stop
         // analyzing the module as a managed one.
-        Err(read_error) => {
-            let may_be_ordinary = descriptor_absent
-                || metadata.as_ref().is_some_and(|m| m.form_type == FormType::Ordinary);
+        xml_read => {
+            let may_be_ordinary = descriptor_absent || descriptor_ordinary;
             let mut rejection_reason: Option<OrdinaryDialogRejection> = None;
             let sidecar_path = bsl_path.parent().filter(|_| may_be_ordinary).and_then(|dir| {
                 bsl_conventions::find_child_ci(
@@ -418,6 +419,9 @@ pub fn parse_form_from_bsl_path(bsl_path: &std::path::Path) -> Result<Form> {
                                 OrdinaryDialogRejection::InvalidSchema
                             }
                             SidecarRejection::Stale => OrdinaryDialogRejection::Stale,
+                            SidecarRejection::Fingerprint(_) => {
+                                OrdinaryDialogRejection::Fingerprint
+                            }
                         });
                         None
                     }
@@ -425,7 +429,7 @@ pub fn parse_form_from_bsl_path(bsl_path: &std::path::Path) -> Result<Form> {
             });
             match sidecar {
                 Some(form) => form,
-                None if metadata.as_ref().is_some_and(|m| m.form_type == FormType::Ordinary) => {
+                None if descriptor_ordinary => {
                     let mut form = Form::ordinary_without_dialog(form_name);
                     form.ordinary_dialog_rejection = rejection_reason;
                     form
@@ -434,7 +438,10 @@ pub fn parse_form_from_bsl_path(bsl_path: &std::path::Path) -> Result<Form> {
                     return Err(crate::error::MetadataError::InvalidFormat(format!(
                         "Cannot read form XML at {}: {}",
                         ext_form_xml_path.display(),
-                        read_error
+                        xml_read.err().map_or_else(
+                            || "ordinary dialog unavailable".to_string(),
+                            |error| error.to_string(),
+                        )
                     )));
                 }
             }
@@ -1017,8 +1024,9 @@ mod tests {
 
         assert_eq!(form.name(), "ТестоваяФорма");
         assert_eq!(form.form_type(), FormType::Ordinary);
-        assert!(form.is_handler("ПриСозданииНаСервере"));
-        assert!(form.is_handler("КомандаОК"));
+        assert!(is_descriptor_only(&form));
+        assert!(!form.is_handler("ПриСозданииНаСервере"));
+        assert!(!form.is_handler("КомандаОК"));
     }
 
     #[test]
@@ -1129,6 +1137,20 @@ mod tests {
             && form.attributes().is_empty()
             && form.is_handler("ПередОткрытием")
             && !form.is_handler("Поле1ПриИзменении")
+    }
+
+    #[test]
+    fn ordinary_descriptor_ignores_a_managed_form_xml() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = ordinary_form_on_disk(dir.path());
+        let ext = module.parent().unwrap().parent().unwrap();
+        std::fs::write(ext.join("Form.xml"), r#"<Form><Attributes><Attribute name="ManagedOnly" id="1"><Type/></Attribute></Attributes></Form>"#).unwrap();
+        let form = parse_form_from_bsl_path(&module).unwrap();
+        assert!(is_descriptor_only(&form), "{form:?}");
+        std::fs::write(module.with_file_name("Form.json"), sidecar_json(2)).unwrap();
+        let form = parse_form_from_bsl_path(&module).unwrap();
+        assert!(reads_dialog(&form), "{form:?}");
+        assert!(form.find_attribute("ManagedOnly").is_none());
     }
 
     #[test]

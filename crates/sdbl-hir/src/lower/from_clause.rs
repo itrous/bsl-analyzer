@@ -202,6 +202,39 @@ impl LoweringContext<'_> {
             })
             .collect();
 
+        if let Some(
+            ResolvedTable::Metadata { mdo_type, name, .. }
+            | ResolvedTable::Register { mdo_type, name, .. },
+        ) = &resolved
+        {
+            if let Some(range) = ident_ranges.get(1) {
+                self.source_map.record_metadata_reference(
+                    crate::metadata_reference::MetadataReference {
+                        range: *range,
+                        owner_kind: *mdo_type,
+                        owner_name: name.clone(),
+                        members: Vec::new(),
+                    },
+                );
+            }
+            if parts.len() == 3
+                && !matches!(resolved.as_ref(), Some(ResolvedTable::Register { .. }))
+            {
+                if let Some(range) = ident_ranges.get(2) {
+                    self.source_map.record_metadata_reference(
+                        crate::metadata_reference::MetadataReference {
+                            range: *range,
+                            owner_kind: *mdo_type,
+                            owner_name: name.clone(),
+                            members: vec![bsl_metadata::declaration_identity::DeclarationSegment {
+                                kind: "TabularSection".into(),
+                                name: parts[2].to_string(),
+                            }],
+                        },
+                    );
+                }
+            }
+        }
         for (idx, (part, range)) in parts.iter().zip(ident_ranges.iter()).enumerate() {
             let category = if resolved.is_some() {
                 if idx == 0 && parts.len() > 1 {
@@ -706,7 +739,9 @@ impl LoweringContext<'_> {
         let reader_has_period = attributes.iter().any(|field| field.matches_name("Период"));
         let (query_only_fields, standard_complete) =
             Self::register_query_only_fields(mdo_type, reader_has_period);
-        let field_model_complete = standard_complete && !register.common_attributes_open();
+        let field_model_complete = standard_complete
+            && register.recorder_subordination().is_some()
+            && !register.common_attributes_open();
         fields.extend(query_only_fields);
 
         tracing::debug!(

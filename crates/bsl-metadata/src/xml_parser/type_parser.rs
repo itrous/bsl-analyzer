@@ -116,19 +116,27 @@ impl TypeQualifiers {
     }
 }
 
+pub(crate) fn parse_xml_type_token(node: roxmltree::Node<'_, '_>) -> Result<AttributeType> {
+    let raw = node
+        .text()
+        .ok_or_else(|| crate::MetadataError::InvalidFormat("Type token is empty".into()))?;
+    let parent = node.parent_element().unwrap_or(node);
+    parse_single_type(&canonical_type_name(node, raw), &TypeQualifiers::from_node(parent))
+}
+
 pub(crate) fn parse_type_xml(type_node: roxmltree::Node<'_, '_>) -> Result<AttributeType> {
     let qualifiers = TypeQualifiers::from_node(type_node);
 
-    let type_strs: Vec<&str> = type_node
+    let type_strs: Vec<String> = type_node
         .children()
         .filter(|n| n.is_element() && n.tag_name().name() == "Type")
-        .filter_map(|n| n.text())
+        .filter_map(|n| n.text().map(|raw| canonical_type_name(n, raw)))
         .collect();
 
-    let type_set_strs: Vec<&str> = type_node
+    let type_set_strs: Vec<String> = type_node
         .children()
         .filter(|n| n.is_element() && n.tag_name().name() == "TypeSet")
-        .filter_map(|n| n.text())
+        .filter_map(|n| n.text().map(|raw| canonical_type_name(n, raw)))
         .collect();
 
     let mut all_types = Vec::new();
@@ -146,7 +154,7 @@ pub(crate) fn parse_type_xml(type_node: roxmltree::Node<'_, '_>) -> Result<Attri
         );
 
         let parsed = parse_type_set(type_set)
-            .unwrap_or_else(|| AttributeType::UnknownNamed((*type_set).to_string()));
+            .unwrap_or_else(|| AttributeType::UnknownNamed(type_set.to_string()));
         tracing::debug!(type_set = %type_set, "adding TypeSet to types list");
         all_types.push(parsed);
     }
@@ -170,6 +178,19 @@ pub(crate) fn parse_type_xml(type_node: roxmltree::Node<'_, '_>) -> Result<Attri
             tracing::debug!(types_count = all_types.len(), "parse_type_xml: composite type");
             Ok(AttributeType::Composite { types: all_types })
         }
+    }
+}
+
+fn canonical_type_name(node: roxmltree::Node<'_, '_>, raw: &str) -> String {
+    let raw = raw.trim();
+    let Some((prefix, local)) = raw.split_once(':') else {
+        return raw.to_string();
+    };
+    match node.lookup_namespace_uri(Some(prefix)) {
+        Some("http://www.w3.org/2001/XMLSchema") => format!("xs:{local}"),
+        Some("http://v8.1c.ru/8.1/data/enterprise/current-config") => format!("cfg:{local}"),
+        Some(namespace) if prefix == "cfg" || prefix == "xs" => format!("{{{namespace}}}{local}"),
+        _ => raw.to_string(),
     }
 }
 

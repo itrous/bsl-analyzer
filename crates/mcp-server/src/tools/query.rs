@@ -22,6 +22,10 @@ pub fn schema() -> CallToolResult {
             "parameters": "object of name → value bindings for execute (optional)",
             "max_output_tokens": "output budget in tokens (~4 chars each) for execute, on top of `limit` — the rendered table is cut at a row boundary with a note (default 6000)"
         },
+        "execute_error": {
+            "phase": ["admission", "transport", "response", "decode"],
+            "meaning": "MCP error.data.phase identifies the local boundary that failed. response means an HTTP error response, not proof that platform execution started. The error code and server exception text are preserved; transport failure does not prove remote rollback and must not trigger an automatic retry."
+        },
         "prerequisites": "validate needs nothing to run; it reports `parser` instead of `workspace_semantics` while the metadata substrate is not ready. execute (and the platform block) need --onec-url / --onec-user / --onec-password"
     }))
 }
@@ -557,17 +561,23 @@ pub async fn execute_query(
     // and two actions must not disagree about what an unset value means.
     let selected = state
         .onec_connection(connection.filter(|name| !name.is_empty()))
-        .map_err(|e| McpError::invalid_params(e, None))?;
-    let client = selected
-        .http_client()
-        .ok_or_else(|| McpError::invalid_params("This 1C connection has no HTTP backend", None))?;
+        .map_err(|e| McpError::invalid_params(e, Some(json!({"phase": "admission"}))))?;
+    let client = selected.http_client().ok_or_else(|| {
+        McpError::invalid_params(
+            "This 1C connection has no HTTP backend",
+            Some(json!({"phase": "admission"})),
+        )
+    })?;
 
     if query.trim().is_empty() {
-        return Err(McpError::invalid_params("Пустой запрос", None));
+        return Err(McpError::invalid_params("Пустой запрос", Some(json!({"phase": "admission"}))));
     }
 
     if !first_member_is_select(query) {
-        return Err(McpError::invalid_params("Только SELECT/ВЫБРАТЬ запросы разрешены", None));
+        return Err(McpError::invalid_params(
+            "Только SELECT/ВЫБРАТЬ запросы разрешены",
+            Some(json!({"phase": "admission"})),
+        ));
     }
 
     let limit = limit.unwrap_or(DEFAULT_QUERY_LIMIT).min(MAX_QUERY_LIMIT);
@@ -578,9 +588,24 @@ pub async fn execute_query(
         parameters: parameters.unwrap_or_default(),
     };
 
-    let result = client.execute_query(&request).await.map_err(|e| {
-        McpError::internal_error(format!("Ошибка выполнения запроса в 1С: {e}"), None)
-    })?;
+    let result =
+        client.execute_query(&request).await.map_err(|error| {
+            let phase =
+                match &error {
+                    onec_client::Error::Request(_)
+                    | onec_client::Error::UnknownExecutionState(_) => "transport",
+                    onec_client::Error::Status { .. }
+                    | onec_client::Error::EndpointUnavailable { .. } => "response",
+                    onec_client::Error::Decode(_)
+                    | onec_client::Error::ModuleCheckProtocol { .. } => "decode",
+                    onec_client::Error::Validation(_)
+                    | onec_client::Error::ModuleCheckBeforeRequest { .. } => "admission",
+                };
+            McpError::internal_error(
+                format!("Ошибка выполнения запроса в 1С: {error}"),
+                Some(json!({"phase": phase})),
+            )
+        })?;
 
     Ok(render_query_result(&result, max_output_tokens))
 }
@@ -647,6 +672,9 @@ fn format_query_result(result: &onec_client::QueryResult) -> String {
 
     out
 }
+
+#[cfg(test)]
+mod execution_tests;
 
 #[cfg(test)]
 mod tests {

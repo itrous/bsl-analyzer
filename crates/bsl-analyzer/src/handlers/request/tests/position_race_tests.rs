@@ -127,7 +127,7 @@ fn position_requests_past_the_buffer_answer_nothing_instead_of_an_error() {
     let r = handle_prepare_call_hierarchy(&ctx, call_hierarchy_params(&uri, position));
     check("prepare_call_hierarchy", matches!(r, Ok(None)), format!("{r:?}"));
 
-    let r = handle_on_type_formatting(state.snapshot(), on_type_params(&uri, position));
+    let r = handle_on_type_formatting(state.snapshot().unwrap(), on_type_params(&uri, position));
     check("on_type_formatting", matches!(r, Ok(None)), format!("{r:?}"));
 
     assert!(wrong.is_empty(), "handlers that did not answer Ok(None):\n{}", wrong.join("\n"));
@@ -164,6 +164,6 @@ fn position_requests_inside_the_buffer_still_answer() {
     // These two may legitimately have nothing to say here; what matters is that a valid
     // position is not an error.
     handle_type_definition(&ctx, goto_params(&uri, VALID)).expect("type_definition");
-    handle_on_type_formatting(state.snapshot(), on_type_params(&uri, VALID))
+    handle_on_type_formatting(state.snapshot().unwrap(), on_type_params(&uri, VALID))
         .expect("on_type_formatting");
 }

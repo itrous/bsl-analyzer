@@ -1,0 +1,18 @@
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <Catalog uuid="00000000-0000-0000-0000-000000000002">
+    <Properties>
+      <Name>SharedCatalog</Name>
+      <ObjectBelonging>Adopted</ObjectBelonging>
+      <ExtendedConfigurationObject>00000000-0000-0000-0000-000000000001</ExtendedConfigurationObject>
+    </Properties>
+    <ChildObjects>
+      <Attribute uuid="00000000-0000-0000-0000-000000000003">
+        <Properties>
+          <Name>Field</Name>
+          <Type><v8:Type>xs:string</v8:Type></Type>
+          <FillChecking>ShowError</FillChecking>
+        </Properties>
+      </Attribute>
+    </ChildObjects>
+  </Catalog>
+</MetaDataObject>

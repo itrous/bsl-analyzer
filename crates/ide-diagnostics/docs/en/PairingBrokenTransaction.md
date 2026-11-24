@@ -19,6 +19,14 @@ same condition (e.g. `If LocalTransaction Then …`), infeasible paths where the
 flag would be both true and false are dropped, so no false positive is raised.
 Correlation applies only to stable variables that are assigned at most once.
 
+When a path already holds an unfinished local transaction, a direct
+`TransactionActive()` check uses that state. A guarded rollback in the catch
+therefore does not invent a path that skips rollback. An early `Continue`
+before the transaction and a `Return` after rollback do not break pairing.
+An arbitrary flag, a qualified same-named method, or a check without a proven
+local begin does not prove a valid pair. A reachable exit with an unfinished
+transaction remains a diagnostic. The active-state proof requires a confirmed platform call and a complete global callable index; a same-named application function does not satisfy it.
+
 ## Examples
 
 Correct:

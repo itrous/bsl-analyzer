@@ -1,0 +1,7 @@
+<Rights xmlns="http://v8.1c.ru/8.2/roles">
+  <setForNewObjects>false</setForNewObjects>
+  <independentRightsOfChildObjects>true</independentRightsOfChildObjects>
+  <object><name>Catalog.Partners.Attribute.Secret</name><right><name>Read</name><value>false</value></right><right><name>View</name><value>true</value><restrictionByCondition><condition>Partner = &amp;AllowedPartner</condition><use>true</use></restrictionByCondition></right></object>
+  <object><name>Configuration.Demo</name><right><name>Administration</name></right></object>
+  <restrictionTemplate><name>AllowedPartner</name><condition>Ref IN (&amp;Allowed)</condition></restrictionTemplate>
+</Rights>
