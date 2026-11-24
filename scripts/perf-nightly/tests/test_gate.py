@@ -1181,5 +1181,316 @@ class CommandLine(unittest.TestCase):
         self.assertEqual(calls, [("gate", ("a", clock)), ("calibrate", ("b", clock))])
 
 
+def _at(phase, cores=3.0, attempt=None, series=None):
+    def rate(run, name):
+        if name != phase:
+            return 0.0
+        if attempt is not None and run.attempt != attempt:
+            return 0.0
+        if series is not None and run.series != series:
+            return 0.0
+        return cores
+    return rate
+
+
+class LoadWindows(GateCase):
+    """Full-run load windows (plan perf-gate-0-4-7, И1–И5, И7, И8). Counters are
+    scripted; nothing here waits on the machine."""
+
+    def record_of(self, launch):
+        return read_json(os.path.join(launch["dir"], "r.json"))
+
+    def run_until_busy(self, series="A", role="base", ready_only=False):
+        binary = perf_nightly.load_binary(self.base_path if role == "base" else self.cand_path)
+        runner = self.runner(0)
+        self._load_n = getattr(self, "_load_n", 0) + 1
+        tag = "b" if role == "base" else "c"
+        self.run_dir = os.path.join(self.tmp, "load", f"{series}-{tag}{self._load_n}")
+        with self.assertRaises(gate.MachineBusy):
+            runner.run(self.run_dir, binary, role, series, 1, ready_only, {})
+        self.assertEqual(runner.launches[0]["reason"], "foreign_load")
+        return runner.launches[0], self.record_of(runner.launches[0])
+
+    def test_a_clean_run_keeps_its_metrics_and_is_not_contaminated(self):
+        record = self.one_run("A")
+        self.assertTrue(record["held"], record["errors"])
+        metrics = record["metrics"]
+        self.assertEqual({k: metrics[k] for k in ("graph_ready_s", "graph_ready_cpu_s", "foreign_cores",
+                                                   "graph_resolve_s", "diagnostics_workspace_s", "hwm_kb")},
+                         {"graph_ready_s": 100.0, "graph_ready_cpu_s": 40.0, "foreign_cores": 0.0,
+                          "graph_resolve_s": 17.8, "diagnostics_workspace_s": 22.1, "hwm_kb": 4 << 20})
+        self.assertFalse(record["load_contaminated"])
+        ready = record["load_windows"][0]
+        self.assertEqual(ready["name"], "graph_ready")
+        self.assertEqual(ready["start_s"], 0.0)
+        self.assertGreater(ready["samples"], 0)
+        self.assertEqual(ready["foreign_cores_mean"], 0.0)
+        self.assertFalse(ready["contaminated"])
+        # A call the virtual clock does not advance has no rate, and that is not a measured zero.
+        quiet = next(w for w in record["load_windows"] if w["name"] == "symbol_info_1")
+        self.assertIsNone(quiet["foreign_cores_mean"])
+        self.assertNotEqual(quiet["foreign_cores_mean"], 0.0)
+
+    def test_ready_only_checks_readiness_and_finish_and_invents_no_calls(self):
+        record = self.one_run("A", ready_only=True)
+        self.assertTrue(record["held"], record["errors"])
+        self.assertEqual([w["name"] for w in record["load_windows"]], ["graph_ready", "finish"])
+        self.assertFalse(record["load_contaminated"])
+        self.assertNotIn("graph_resolve_s", record["metrics"])
+
+    def test_two_cores_pass_and_a_bit_more_discards_the_attempt(self):
+        self.script.values["foreign"] = 2.0
+        record = self.one_run("A", ready_only=True)
+        self.assertTrue(record["held"], record["errors"])
+        self.assertEqual(record["metrics"]["foreign_cores"], 2.0)
+        self.assertFalse(record["load_contaminated"])
+        self.assertEqual(record["load_windows"][0]["foreign_cores_mean"], 2.0)
+        self.script.values["foreign"] = 2.01
+        launch, rejected = self.run_until_busy(ready_only=True)
+        self.assertEqual(rejected["metrics"]["foreign_cores"], 2.01)
+        self.assertTrue(rejected["load_windows"][0]["contaminated"])
+        self.assertEqual(launch["load_contaminated"], True)
+
+    def test_load_in_any_measured_stretch_discards_the_whole_attempt(self):
+        clean_a = self.one_run("A")
+        clean_b = self.one_run("B", "candidate")
+        self.assertTrue(clean_a["held"] and clean_b["held"])
+        real_stop = scenarios.stop_mcp
+
+        def stop_and_advance(ctx, runs, sampler):
+            self.clock.advance(1.0)
+            return real_stop(ctx, runs, sampler)
+
+        self.enterContext(patch.object(scenarios, "stop_mcp", stop_and_advance))
+        segments = (("graph_ready", "A", "base"), ("graph_resolve", "A", "base"),
+                    ("diagnostics_workspace", "A", "base"), ("symbol_info_1", "A", "base"),
+                    ("between_calls", "A", "base"), ("finish", "A", "base"),
+                    ("references_1", "B", "candidate"), ("references_2_same", "B", "candidate"),
+                    ("references_3_other", "B", "candidate"))
+        for phase, series, role in segments:
+            with self.subTest(phase=phase):
+                self.script.values.pop("window_foreign", None)
+                if phase == "graph_ready":
+                    self.script.values["foreign"] = 3.0
+                else:
+                    self.script.values["foreign"] = 0.0
+                    self.script.values["window_foreign"] = _at(phase)
+                _, record = self.run_until_busy(series, role, ready_only=phase == "finish")
+                self.assertTrue(record["load_contaminated"], record["load_windows"])
+                hit = next(w for w in record["load_windows"] if w["name"] == phase and w["contaminated"])
+                self.assertGreater(hit["foreign_cores_max"] or hit["foreign_cores_mean"], verdict.GATE_FOREIGN_CORES)
+
+    def test_a_short_call_between_ticks_still_has_boundary_probes(self):
+        self.script.values["call_wall"] = lambda run, call: 0.001 if call is None else None
+        self.script.values["window_foreign"] = _at("symbol_info_1")
+        _, record = self.run_until_busy()
+        window = next(w for w in record["load_windows"] if w["name"] == "symbol_info_1")
+        self.assertGreaterEqual(window["samples"], 1)
+        self.assertGreater(window["end_s"], window["start_s"])
+        self.assertTrue(window["contaminated"])
+        self.assertLess(window["end_s"] - window["start_s"], procs.SAMPLE_INTERVAL_S)
+
+    def test_one_late_spike_is_redone_and_its_numbers_do_not_decide(self):
+        self.script.values["elapsed"] = lambda run, name: 80.0 if name == "references_3_other" and run.attempt == 1 \
+            else None
+        self.script.values["window_foreign"] = _at("references_3_other", attempt=1)
+        code, summary, _ = self.gate()
+        self.assertEqual((code, summary["verdict"]), (0, "pass"))
+        discarded = next(r for r in summary["runs"] if r["run"] == "B-c1")
+        redone = next(r for r in summary["runs"] if r["run"] == "B-c1.2")
+        self.assertEqual((discarded["held"], discarded["reason"], discarded["k"]), (False, "foreign_load", 1))
+        self.assertEqual((redone["held"], redone["k"]), (True, 1))
+        self.assertGreater(summary["busy_spent_s"], 0)
+        self.assertEqual(self.row(summary, "references_3_other_s")["outcome"], "ok")
+        self.assertEqual(self.row(summary, "references_3_other_s")["candidate"]["value"], 50.3)
+        self.assertEqual(summary["answers"]["outcome"], "ok")
+        stale = self.record_of(discarded)
+        self.assertEqual(stale["metrics"]["references_3_other_s"], 80.0)
+        self.assertTrue(stale["load_contaminated"])
+        self.assertNotEqual(stale["metrics"]["references_3_other_s"],
+                            self.record_of(redone)["metrics"]["references_3_other_s"])
+        with open(self.data.path("gates", "g1", "report.md"), encoding="utf-8") as fh:
+            report = fh.read()
+        self.assertIn("| прогон | окно | начало–конец, с | интервалы | среднее, ядра | максимум, ядра | загрязнено |",
+                      report)
+        self.assertIn("| B-c1 | references_3_other |", report)
+        self.assertIn("| B-c1.2 |", report)
+        self.assertIn("| B-c1 | candidate | B | false | foreign_load |", report)
+
+    def test_a_budget_spent_on_late_load_stays_incomplete_and_does_not_block(self):
+        self.script.values["elapsed"] = lambda run, name: 80.0 if name == "references_3_other" else None
+        self.script.values["window_foreign"] = _at("symbol_info_1")
+        code, summary, _ = self.gate("--busy-budget-min", "0", label="all")
+        self.assertEqual((code, summary["verdict"]), (2, "incomplete"))
+        self.assertEqual(summary["reasons"][0], "machine_busy")
+        self.assertFalse(any(r.startswith("block") for r in summary["reasons"]))
+        self.assertEqual(summary["record_proposals"], [])
+        self.assertTrue(all(r["outcome"] != "block" for r in summary["ceilings"]))
+        # Series B after a clean A: the late references never become a ceiling block.
+        self.script.values["window_foreign"] = _at("references_3_other", series="B")
+        code, summary, _ = self.gate("--busy-budget-min", "0", label="b-only")
+        self.assertEqual((code, summary["verdict"]), (2, "incomplete"))
+        self.assertTrue(any(r["held"] and r["series"] == "A" for r in summary["runs"]))
+        self.assertFalse(any(r["outcome"] == "block" and r["metric"].startswith("references")
+                             for r in summary["ceilings"]))
+        self.assertEqual(summary["record_proposals"], [])
+        # The same high references without contamination are a real block.
+        self.script.values.pop("window_foreign")
+        code, summary, _ = self.gate(label="clean-block")
+        self.assertEqual((code, summary["verdict"]), (1, "block"))
+        self.assertEqual(self.row(summary, "references_3_other_s")["outcome"], "block")
+        # A real block found before the machine gets busy keeps its priority.
+        self.script.values["wall"] = candidate_slower(1.5)
+        self.script.values["window_foreign"] = _at("references_1", series="B")
+        code, summary, _ = self.gate("--busy-budget-min", "0", label="block-stands")
+        self.assertEqual((code, summary["verdict"]), (1, "block"))
+        self.assertIn("block: graph_ready_s", summary["reasons"])
+
+    def test_a_failure_is_not_hidden_by_load(self):
+        set_mode("sweep_answers", "refs_tool")
+        plain = self.one_run("A")
+        self.script.values["window_foreign"] = _at("graph_resolve")
+        dirty = self.one_run("A")
+        self.assertEqual(plain["reason"], dirty["reason"])
+        self.assertEqual(dirty["reason"], "call_failed")
+        self.assertFalse(plain["load_contaminated"])
+        self.assertTrue(dirty["load_contaminated"])
+        self.assertTrue(any(e.startswith("foreign_load:") for e in dirty["errors"]))
+
+        current = scenarios.McpRun.tool
+
+        def boom(mcp_run, name, arguments, timeout=scenarios.CALL_TIMEOUT_S):
+            if name == "symbol_info" and arguments.get("symbol") == S1 and not mcp_run.__dict__.get("_boom"):
+                mcp_run._boom = True
+                mcp_run.ctx.clock.advance(1.0)
+                raise scenarios.NotHeld("server_failed", "connection closed during tools/call")
+            return current(mcp_run, name, arguments, timeout)
+
+        self.enterContext(patch.object(scenarios.McpRun, "tool", boom))
+        self.script.values.pop("window_foreign", None)
+        set_mode(*self.modes.split(","))
+        quiet = self.one_run("A")
+        self.script.values["window_foreign"] = _at("symbol_info_1")
+        loaded = self.one_run("A")
+        self.assertEqual((quiet["reason"], loaded["reason"]), ("server_failed", "server_failed"))
+        self.assertFalse(quiet["load_contaminated"])
+        self.assertTrue(loaded["load_contaminated"])
+        self.assertTrue(any(e.startswith("foreign_load:") for e in loaded["errors"]))
+
+    def test_stop_incomplete_keeps_its_reason_when_the_finish_is_dirty(self):
+        real_stop = procs.stop
+        real_mcp = scenarios.stop_mcp
+
+        def left_behind(*args, **kwargs):
+            report = real_stop(*args, **kwargs)
+            report["left"] = [1]
+            return report
+
+        def advance(ctx, runs, sampler):
+            self.clock.advance(1.0)
+            return real_mcp(ctx, runs, sampler)
+
+        self.enterContext(patch.object(procs, "stop", left_behind))
+        self.enterContext(patch.object(scenarios, "stop_mcp", advance))
+        quiet = self.one_run("A", ready_only=True)
+        self.script.values["window_foreign"] = _at("finish")
+        loaded = self.one_run("A", ready_only=True)
+        self.assertEqual((quiet["reason"], loaded["reason"]), ("stop_incomplete", "stop_incomplete"))
+        self.assertFalse(quiet["load_contaminated"])
+        self.assertTrue(loaded["load_contaminated"])
+        self.assertTrue(any(e.startswith("foreign_load:") for e in loaded["errors"]))
+
+    def test_artifacts_show_the_windows_and_an_old_summary_is_not_declared_clean(self):
+        clean = self.one_run("A")
+        self.script.values["window_foreign"] = _at("symbol_info_1", attempt=1)
+        runner = self.runner()
+        binary = perf_nightly.load_binary(self.base_path)
+        self.run_dir = os.path.join(self.tmp, "art", "A-b1")
+        held = runner.run(self.run_dir, binary, "base", "A", 1, False, {})
+        self.assertTrue(held["held"])
+        self.assertEqual([os.path.basename(launch["dir"]) for launch in runner.launches], ["A-b1", "A-b1.2"])
+        rejected = self.record_of(runner.launches[0])
+        self.assertTrue(rejected["load_contaminated"])
+        self.assertFalse(held["load_contaminated"])
+        pauses = [w for w in clean["load_windows"] if w["name"] == "between_calls"]
+        self.assertGreaterEqual(len(pauses), 2)
+        self.assertNotEqual(pauses[0]["start_s"], pauses[1]["start_s"])
+        ready = self.one_run("A", ready_only=True)
+        self.assertEqual([w["name"] for w in ready["load_windows"]], ["graph_ready", "finish"])
+
+        machine = self.machine
+        real_busy = type(machine).busy_s
+
+        def fail_the_call():
+            if getattr(machine, "phase", None) == "diagnostics_file":
+                raise OSError("stat unreadable")
+            return real_busy(machine)
+
+        machine.busy_s = fail_the_call
+        broken = self.one_run("A")
+        self.assertEqual(broken["reason"], "server_failed")
+        opened = next(w for w in broken["load_windows"] if w["name"] == "diagnostics_file")
+        self.assertIsNone(opened["foreign_cores_mean"])
+        self.assertIsNone(opened["foreign_cores_max"])
+        self.assertNotEqual(opened["foreign_cores_mean"], 0)
+
+        source = gate.check_source(self.data)
+        traced = gate.Runner(self.clock, self.machine, source, self.fingerprint(), 60.0, trace=True)
+        self.run_dir = os.path.join(self.tmp, "art", "A-b2")
+        # The broken busy reader would fail this run too; put the machine back.
+        machine.busy_s = real_busy.__get__(machine, type(machine))
+        on = traced.run(self.run_dir, binary, "base", "A", 1, True, {})
+        off = self.one_run("A", ready_only=True)
+        self.assertIn("load_windows", on)
+        self.assertIn("load_windows", off)
+        self.assertIn("resource_trace", on)
+        self.assertNotIn("resource_trace", off)
+
+        summary = {"verdict": "pass", "reasons": [], "base": {"label": "v", "sha": "s"},
+                   "candidate": {"label": "c", "sha": "t"}, "controls": None, "noise": {"status": "current"},
+                   "rows": [], "runs": [{"run": "A-b1", "role": "base", "series": "A", "held": True,
+                                          "reason": None, "foreign_cores": 1.2}]}
+        with tempfile.TemporaryDirectory(prefix="perf-nightly-test-") as tmp:
+            gate.write_report(tmp, summary)
+            with open(os.path.join(tmp, "report.md"), encoding="utf-8") as fh:
+                report = fh.read()
+        self.assertIn("контроль только до готовности", report)
+        self.assertIn("| A-b1 | - | - | - | контроль только до готовности | - | - |", report)
+        self.assertNotIn("| A-b1 | graph_ready | 0.000", report)
+
+
+class LoadConfirmation(GateCase):
+    """И5: a contaminated confirming round uses the same retry and the same budget."""
+
+    wall_noise = 0.18
+
+    def wall(self, first, second):
+        return lambda run: 100.0 if run.role == "b" else (first if run.n <= 3 else second) if run.series == "A" \
+            else 100.0
+
+    def test_a_dirty_confirmation_is_retried_and_an_unfinished_one_proposes_nothing(self):
+        self.script.values["wall"] = self.wall(120.0, 119.0)
+        # Only the first attempt of the confirming round's first base run is dirty: n is 4 there.
+        self.script.values["window_foreign"] = lambda run, phase: 3.0 if phase == "symbol_info_1" and \
+            run.n == 4 and run.attempt == 1 and run.role == "b" else 0.0
+        _, summary, _ = self.gate(label="retried")
+        self.assertEqual(summary["record_confirmation"], {"requested": True, "triggers": ["wall"],
+                                                         "complete": True})
+        self.assertEqual(summary["record_proposals"], [])
+        self.assertEqual([r["run"] for r in summary["runs"] if r["held"] and r["series"] == "A"
+                          and r["role"] == "base" and r["run"].startswith("A-b")],
+                         ["A-b1", "A-b2", "A-b3", "A-b4.2", "A-b5", "A-b6"])
+        self.assertEqual(gate.RUNS, 3)
+        self.assertEqual(next(r["k"] for r in summary["runs"] if r["run"] == "A-b4.2"), 1)
+
+        self.script.values["window_foreign"] = lambda run, phase: 3.0 if phase == "symbol_info_1" and run.n >= 4 \
+            else 0.0
+        code, summary, _ = self.gate("--busy-budget-min", "0", label="spent")
+        self.assertEqual((code, summary["verdict"]), (2, "incomplete"))
+        self.assertEqual(summary["record_confirmation"]["complete"], False)
+        self.assertEqual(summary["record_proposals"], [])
+        self.assertEqual(summary["reasons"][0], "machine_busy")
+
+
 if __name__ == "__main__":
     unittest.main()

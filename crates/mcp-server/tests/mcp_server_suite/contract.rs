@@ -73,7 +73,7 @@ async fn contract_is_discoverable_and_readable_over_a_session() {
         .iter()
         .map(|a| a["name"].as_str().unwrap())
         .collect();
-    assert_eq!(actions, ["catalog", "schema", "status", "file", "workspace"]);
+    assert_eq!(actions, ["catalog", "schema", "status", "file", "snippet", "workspace"]);
 
     let file_action =
         diagnostics["actions"].as_array().unwrap().iter().find(|a| a["name"] == "file").unwrap();
@@ -145,11 +145,11 @@ fn dummy_for(ty: &str) -> Value {
 }
 
 /// `require()` runs before the readiness gate for most tools, so a missing parameter comes
-/// back as a parameter error even against an empty workspace. These two resolve their
+/// back as a parameter error even against an empty workspace. Graph resolves its
 /// arguments inside the gate instead, where an unbuilt project answers "still loading"
 /// before it ever looks at them — probing them would assert on the gate, not the contract.
-fn resolves_arguments_behind_the_readiness_gate(tool: &str, action: &str) -> bool {
-    tool == "graph" || (tool == "metadata" && action == "object")
+fn resolves_arguments_behind_the_readiness_gate(tool: &str) -> bool {
+    tool == "graph"
 }
 
 fn probes(profile: &Value) -> Vec<Probe> {
@@ -164,7 +164,7 @@ fn probes(profile: &Value) -> Vec<Probe> {
             .collect();
         for action in tool["actions"].as_array().unwrap() {
             let action_name = action["name"].as_str().unwrap();
-            if resolves_arguments_behind_the_readiness_gate(name, action_name) {
+            if resolves_arguments_behind_the_readiness_gate(name) {
                 continue;
             }
             let required: Vec<&str> = action["required"]
@@ -275,7 +275,7 @@ fn complete_calls(profile: &Value) -> Vec<Probe> {
             .collect();
         for action in tool["actions"].as_array().unwrap() {
             let action_name = action["name"].as_str().unwrap();
-            if resolves_arguments_behind_the_readiness_gate(name, action_name)
+            if resolves_arguments_behind_the_readiness_gate(name)
                 || reaches_out_of_process(name, action_name)
             {
                 continue;

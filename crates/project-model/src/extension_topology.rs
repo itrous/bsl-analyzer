@@ -173,6 +173,10 @@ impl TopologyFingerprint {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TopologyError {
+    InvalidExternalConfigurationOwner {
+        name: String,
+        reason: String,
+    },
     EmptyName,
     DuplicateName {
         name: String,
@@ -269,6 +273,9 @@ pub enum TopologyError {
 impl fmt::Display for TopologyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            TopologyError::InvalidExternalConfigurationOwner { name, reason } => {
+                write!(f, "invalid configuration owner for external {name}: {reason}")
+            }
             TopologyError::EmptyName => {
                 write!(f, "extension entry has an empty name")
             }

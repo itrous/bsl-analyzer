@@ -2,6 +2,8 @@
 //! last touched by an ignored git author must not reach the report, while
 //! the user's own, uncommitted and untracked code always does.
 
+mod common;
+
 use std::{fs, path::Path, process::Command};
 
 use tempfile::TempDir;
@@ -79,7 +81,7 @@ fn run_analyze_verbose(
     let output_dir = root.join("reports");
     fs::create_dir_all(&output_dir).expect("output dir");
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"));
+    let mut command = Command::new(common::qualified_app());
     command.args(["analyze", "-s"]).arg(root).args(["-r", "sarif", "-o"]).arg(&output_dir);
     if quiet {
         command.arg("-q");
@@ -258,7 +260,7 @@ fn baseline_classification_precedes_author_presentation_filter() {
     .unwrap();
 
     let run = |extra: &[&str]| {
-        let output = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
+        let output = Command::new(common::qualified_app())
             .args(["analyze", "-s"])
             .arg(temp.path())
             .args(["--format", "jsonl"])
@@ -333,7 +335,7 @@ fn author_filter_summary_states_the_counts_it_actually_dropped() {
 fn code_quality_findings(root: &Path, extra_args: &[&str]) -> Vec<((String, u64), String)> {
     let output_dir = root.join("reports");
     fs::create_dir_all(&output_dir).expect("output dir");
-    let output = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
+    let output = Command::new(common::qualified_app())
         .args(["analyze", "-s"])
         .arg(root)
         .args(["-r", "codequality", "-o"])

@@ -29,6 +29,9 @@ pub(super) fn reconcile(
     .entered();
 
     loop {
+        if !frozen.disk_read.is_current() {
+            return superseded(&lifecycle, source_root, generation, "workspace_disk_epoch_changed");
+        }
         let Some(edited_files) = lifecycle.drain_journal(source_root, generation) else {
             return superseded(
                 &lifecycle,
@@ -49,12 +52,12 @@ pub(super) fn reconcile(
             let pair_count = index.len();
             let estimated_heap_bytes = index.estimated_heap_bytes();
             let candidate = Arc::new(index);
-            if lifecycle.publish(source_root, generation, Arc::clone(&candidate)) {
+            if lifecycle.is_building(source_root, generation) && frozen.disk_read.is_current() {
                 tracing::info!(
                     phase = "publish",
                     pair_count,
                     estimated_heap_bytes,
-                    "call hierarchy compact index published"
+                    "call hierarchy compact index ready for publication"
                 );
                 return Task::CallHierarchyIndexBuilt { source_root, generation, index: candidate };
             }

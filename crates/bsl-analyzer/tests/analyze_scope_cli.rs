@@ -2,6 +2,8 @@
 //! `--changed-files` and `[analysis].diff_base` must restrict the SARIF
 //! report to files changed relative to the vendor state.
 
+mod common;
+
 use std::{fs, path::Path, process::Command};
 
 use tempfile::TempDir;
@@ -63,7 +65,7 @@ fn run_analyze(root: &Path, extra_args: &[&str]) -> (bool, String) {
     let output_dir = root.join("reports");
     fs::create_dir_all(&output_dir).expect("output dir");
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"));
+    let mut command = Command::new(common::qualified_app());
     let output = hermetic(&mut command)
         .args(["analyze", "-s"])
         .arg(root)
@@ -142,7 +144,7 @@ fn relative_source_dir_matches_the_native_git_scope() {
     let temp = setup_repo();
     fs::create_dir_all(temp.path().join("reports")).expect("output dir");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
+    let output = Command::new(common::qualified_app())
         .current_dir(temp.path())
         .args(["analyze", "-s", ".", "-r", "sarif", "-o", "reports", "-q"])
         .args(["--incremental", "--git-diff", "vendor"])

@@ -13,6 +13,9 @@ pub mod proxy;
 pub(crate) mod security;
 pub mod transport;
 
+/// Internal log destination passed from a detached proxy to its daemon.
+pub const DETACHED_LOG_PATH_ENV: &str = "BSL_MCP_DETACHED_LOG_PATH";
+
 pub use name::{
     backend_name, embedding_config_fingerprint, embedding_config_fingerprint_with_prefixes,
     embedding_endpoint_identity, process_epoch, workspace_topology_fingerprint, BackendKey,

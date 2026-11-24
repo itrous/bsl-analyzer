@@ -206,7 +206,10 @@ fn a_value_that_is_no_metadata_object_is_still_rejected() {
         let expected: Vec<&str> = message.split(" | ").collect();
         assert!(
             expected.len() > 60
-                && expected.iter().all(|kind| kind.starts_with("ОбъектМетаданных: ")),
+                && expected.iter().all(|kind| {
+                    kind.starts_with("ОбъектМетаданных: ")
+                        || *kind == "ОбъектМетаданныхКонфигурация"
+                }),
             "the whole family is expected, got {expected:?}"
         );
     }

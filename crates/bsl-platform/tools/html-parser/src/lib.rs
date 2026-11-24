@@ -1419,7 +1419,16 @@ mod hbk_corpus_tests {
         let held = std::fs::File::create(live.join(".lock")).unwrap();
         held.lock().unwrap();
         let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 3600);
-        std::fs::File::open(&live).unwrap().set_modified(long_ago).unwrap();
+        let mut directory = std::fs::OpenOptions::new();
+        directory.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            directory.access_mode(FILE_WRITE_ATTRIBUTES).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        }
+        directory.open(&live).unwrap().set_modified(long_ago).unwrap();
 
         let data = extract_corpus_from_hbk(
             &platform.join("shcntx_ru.hbk"),

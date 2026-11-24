@@ -43,8 +43,10 @@ cargo run -p check-contract --example generate_schemas
 
 `handles_snippet` обязателен и явно выбирает маршрут. При `true` snippets идут
 исполнителю. При `false` snippets идут по HTTP, если задан URL, иначе получают
-`unsupported`. Module всегда идёт исполнителю. Ошибка выбранного backend не
-переключает запрос на другой маршрут.
+`unsupported`. Запрос `module` использует исполнителя, если он настроен.
+Без исполнителя запрос использует HTTP при заданном URL и включённом
+`epf_module_check`, иначе возвращает `unsupported`. Ошибка выбранного backend
+завершает проверку. [Условия проверки модуля через HTTP](../EPF_MODULE_CHECK.md).
 
 ## Лимиты и остановка
 

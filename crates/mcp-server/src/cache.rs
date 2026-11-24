@@ -227,6 +227,7 @@ impl WorkspaceCacheLayout {
     ) -> std::io::Result<Option<PathBuf>> {
         let output = canonicalize_nearest(output)?;
         let mut roots = project.source_roots();
+        roots.extend(project.semantic_dependency_roots());
         roots.push(project.root.clone());
         for root in roots {
             let root = canonicalize_nearest(&root)?;
@@ -441,7 +442,8 @@ impl WorkspaceCacheLayout {
                 workspace.display()
             )));
         }
-        let roots = project.source_roots();
+        let mut roots = project.source_roots();
+        roots.extend(project.semantic_dependency_roots());
         for root in roots {
             let root = canonicalize_nearest(&root)?;
             if family.starts_with(&root) && self.origin == CacheOrigin::Default {
@@ -579,6 +581,13 @@ fn project_scope(project: &project_model::Project) -> std::io::Result<[u8; 32]> 
     hasher.update(SCOPE_DOMAIN);
     append_field(&mut hasher, workspace.as_os_str().as_encoded_bytes());
     append_field(&mut hasher, project.extension_topology().fingerprint().as_bytes());
+    if project
+        .external_configuration_owners()
+        .iter()
+        .any(|(_, owner)| owner.proven_root().is_some())
+    {
+        append_field(&mut hasher, project.compilation_fingerprint().as_bytes());
+    }
     for exclusion in exclusions {
         append_field(&mut hasher, &exclusion);
     }
@@ -1157,6 +1166,7 @@ mod tests {
         let with_external = layout(
             first_root.path(),
             Some(vec![project_model::ExternalDecl {
+                configuration_root: None,
                 name: "Processor".to_owned(),
                 path: "src/epf/Processor".to_owned(),
                 depends_on: None,
