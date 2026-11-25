@@ -357,6 +357,9 @@ mod tests {
     #[test]
     fn every_named_refusal_in_the_adapter_has_a_reason_code() {
         let source = include_str!("external_baseline/postgres.rs");
+        // Normalised for the reason spelled out in `engine.rs`: on a CRLF checkout the cut
+        // below matches nothing and the "production" half would carry the test module too.
+        let source = &source.replace("\r\n", "\n");
         let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap_or(source);
 
         let mut checked = 0usize;

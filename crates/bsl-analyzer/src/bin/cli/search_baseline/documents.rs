@@ -757,6 +757,12 @@ mod tests {
     #[test]
     fn the_publisher_does_not_carry_its_own_tree_walk() {
         let source = include_str!("documents.rs");
+        // A CRLF checkout (core.autocrlf on Windows, no .gitattributes pinning LF) gives this
+        // file "\r\n" endings, and the cut below is anchored on "\n": unmatched, it leaves the
+        // whole file as the "production" half, so this gate reads the test code it exists to
+        // exclude and fails on the line endings rather than on the code. Normalised first, so
+        // the gate is about the source and not the checkout.
+        let source = &source.replace("\r\n", "\n");
         let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap_or(source);
         assert!(
             production.contains("fn build_workspace_code"),
@@ -776,6 +782,8 @@ mod tests {
     #[test]
     fn the_publisher_does_not_fall_back_to_a_single_root_table() {
         let source = include_str!("documents.rs");
+        // Normalised like the gate above, and for the same reason.
+        let source = &source.replace("\r\n", "\n");
         let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap_or(source);
         assert!(
             production.contains("initialize_workspace_roots("),
