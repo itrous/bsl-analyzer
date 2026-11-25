@@ -376,7 +376,14 @@ mod tests {
         let nonexistent = spawn(&missing).err().expect("missing executable must fail launch");
         let missing_source = nonexistent.downcast_ref::<io::Error>().unwrap();
         assert_eq!(missing_source.raw_os_error(), Some(ERROR_FILE_NOT_FOUND as i32));
-        assert_eq!(nonexistent.to_string(), missing_source.to_string());
+        // Only the OS error has to reach the top of the chain. On a host whose job forbids
+        // breakaway the first launch is refused with ERROR_ACCESS_DENIED before the executable
+        // is even looked up, so the retry's error arrives wrapped in context; comparing the
+        // plain Display would pin the test to the host's job configuration, not to this code.
+        assert!(
+            format!("{nonexistent:#}").contains(&missing_source.to_string()),
+            "the OS error must survive to the top: {nonexistent:#}"
+        );
     }
 
     #[test]
