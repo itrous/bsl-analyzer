@@ -170,6 +170,52 @@ fn install_refuses_a_tool_the_preset_profile_does_not_declare() {
     assert!(harness.invocations().is_empty(), "nothing must be installed on refusal");
 }
 
+/// A project whose configuration is not at the project root, with its data kept elsewhere,
+/// must be installable: the flags that say so have to survive into the config the client
+/// will read, with the relative cache dir anchored at the project (the client's own working
+/// directory is not ours).
+#[test]
+fn workspace_flags_reach_the_server_args_written_into_the_client_config() {
+    let harness = TestHarness::new();
+    harness.install_stub("codex", &failing_stub());
+
+    let output = harness
+        .command()
+        .args([
+            "mcp",
+            "install",
+            "--target",
+            "codex",
+            "--scope",
+            "project",
+            "--source-dir",
+            harness.source_dir().to_str().expect("utf-8 path"),
+            "--cache-dir",
+            "data/cache",
+            "--configuration-root",
+            "app/config",
+        ])
+        .output()
+        .expect("run binary");
+
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let config = fs::read_to_string(harness.project_dir.join(".codex/config.toml"))
+        .expect("project config")
+        .parse::<toml::Table>()
+        .expect("config is valid toml");
+    let args: Vec<&str> = config["mcp_servers"]["bsl-analyzer-workspace"]["args"]
+        .as_array()
+        .expect("args array")
+        .iter()
+        .map(|arg| arg.as_str().expect("string arg"))
+        .collect();
+
+    let cache = args.iter().position(|arg| *arg == "--cache-dir").expect("--cache-dir recorded");
+    assert!(Path::new(args[cache + 1]).is_absolute(), "cache dir not absolute: {args:?}");
+    assert!(Path::new(args[cache + 1]).ends_with("data/cache"), "args: {args:?}");
+    assert!(args.contains(&"--configuration-root=app/config"), "args: {args:?}");
+}
+
 #[test]
 fn codex_user_reference_force_uses_cli_and_passes_env() {
     let harness = TestHarness::new();
