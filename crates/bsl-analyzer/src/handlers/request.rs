@@ -1600,7 +1600,7 @@ pub fn handle_document_diagnostic(
         ctx.workspace_root.as_deref(),
         path.as_deref(),
         &text,
-        ide_diagnostics.iter().cloned().collect(),
+        ide_diagnostics.to_vec(),
         late_scope.as_deref(),
     );
     let result_id = crate::lsp::diagnostics_result_id(&ide_diagnostics);

@@ -159,7 +159,7 @@ pub fn schedule_diagnostics(state: &mut GlobalState, uri: &Url) {
                     workspace_root.as_deref(),
                     path.as_deref(),
                     &text,
-                    result.diagnostics.iter().cloned().collect(),
+                    result.diagnostics.to_vec(),
                     late_scope.as_deref(),
                 );
                 let line_index = LineIndex::new(&text);
