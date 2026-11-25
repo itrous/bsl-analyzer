@@ -1248,6 +1248,46 @@ fn render_workspace_args(
     args
 }
 
+/// Refuses workspace-shaping flags that `mcp serve` would reject for the preset being
+/// installed. A config whose argv `mcp serve` rejects is a config whose client silently
+/// fails to start, so the refusal has to happen before anything is written. Pure on
+/// purpose: the refusals are testable without touching the filesystem.
+fn validate_workspace_flags(
+    preset: InstallPresetCli,
+    cache_dir: Option<&Path>,
+    source_set: &super::source_set::SourceSetArgs,
+) -> Result<(), io::Error> {
+    if cache_dir.is_some() || !source_set.is_empty() {
+        match preset {
+            // Same refusal `mcp serve` gives this combination.
+            InstallPresetCli::Reference => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "reference profile does not accept --cache-dir/source-set flags \
+                     (--configuration-root/--extension/--extension-depends-on/--no-extensions/...); \
+                     install '--preset workspace' to shape a workspace",
+                ));
+            }
+            // Mirrors --enable-tool: the recommended set writes both servers, and these
+            // flags belong to one of them only.
+            InstallPresetCli::Recommended => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--cache-dir/source-set flags are not used with '--preset recommended'; \
+                     install '--preset workspace' to shape a workspace",
+                ));
+            }
+            InstallPresetCli::Workspace => {}
+        }
+    }
+    // An unset shell variable expands to an empty argument; `mcp serve` refuses it, so the
+    // install must not write a config that records it.
+    if cache_dir.is_some_and(|dir| dir.as_os_str().is_empty()) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "--cache-dir must not be empty"));
+    }
+    Ok(())
+}
+
 fn run_mcp_install(args: McpInstallArgs) -> Result<(), Box<dyn Error + Send + Sync>> {
     use bsl_analyzer::mcp_install::{
         self, default_server_name, InstallPreset, InstallRequest, InstallScope, InstallTarget,
@@ -1291,40 +1331,7 @@ fn run_mcp_install(args: McpInstallArgs) -> Result<(), Box<dyn Error + Send + Sy
     }
     let enable_tools = args.enable_tools;
 
-    let shapes_workspace = args.cache_dir.is_some() || !args.source_set.is_empty();
-    if shapes_workspace {
-        match args.preset {
-            // Same refusal `mcp serve` gives this combination: an installed config that the
-            // server then refuses to start from is worse than a failed install.
-            InstallPresetCli::Reference => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "reference profile does not accept --cache-dir/source-set flags \
-                     (--configuration-root/--extension/--extension-depends-on/--no-extensions/...); \
-                     install '--preset workspace' to shape a workspace",
-                )
-                .into());
-            }
-            // Mirrors --enable-tool: the recommended set writes both servers, and these
-            // flags belong to one of them only.
-            InstallPresetCli::Recommended => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "--cache-dir/source-set flags are not used with '--preset recommended'; \
-                     install '--preset workspace' to shape a workspace",
-                )
-                .into());
-            }
-            InstallPresetCli::Workspace => {}
-        }
-    }
-    // An unset shell variable expands to an empty argument; `mcp serve` refuses it, so the
-    // install must not write a config that records it.
-    if args.cache_dir.as_deref().is_some_and(|dir| dir.as_os_str().is_empty()) {
-        return Err(
-            io::Error::new(io::ErrorKind::InvalidInput, "--cache-dir must not be empty").into()
-        );
-    }
+    validate_workspace_flags(args.preset, args.cache_dir.as_deref(), &args.source_set)?;
     let workspace_args =
         render_workspace_args(args.cache_dir.as_deref(), &project_dir, &args.source_set);
 
@@ -3203,6 +3210,97 @@ mod tests {
             ]
         );
         assert_eq!(bare, ["--no-extensions", "--no-externals"]);
+    }
+
+    fn source_set_with_root() -> crate::cli::source_set::SourceSetArgs {
+        crate::cli::source_set::SourceSetArgs {
+            configuration_root: Some("src/cf".to_owned()),
+            ..Default::default()
+        }
+    }
+
+    /// The reference server has no workspace; an install that recorded source-set flags for
+    /// it would write a config `mcp serve` refuses to start from.
+    #[test]
+    fn install_refuses_source_set_flags_for_the_reference_preset() {
+        let err = super::validate_workspace_flags(
+            super::InstallPresetCli::Reference,
+            None,
+            &source_set_with_root(),
+        )
+        .expect_err("reference must refuse source-set flags");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--configuration-root"), "message: {err}");
+    }
+
+    #[test]
+    fn install_refuses_cache_dir_for_the_reference_preset() {
+        let err = super::validate_workspace_flags(
+            super::InstallPresetCli::Reference,
+            Some(Path::new("cache")),
+            &Default::default(),
+        )
+        .expect_err("reference must refuse --cache-dir");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--cache-dir"), "message: {err}");
+    }
+
+    /// The recommended preset writes both servers, so a flag meant for one of them cannot be
+    /// applied honestly; either flag kind must be refused rather than silently dropped.
+    #[test]
+    fn install_refuses_either_flag_kind_for_the_recommended_preset() {
+        let with_source_set = super::validate_workspace_flags(
+            super::InstallPresetCli::Recommended,
+            None,
+            &source_set_with_root(),
+        );
+        let with_cache_dir = super::validate_workspace_flags(
+            super::InstallPresetCli::Recommended,
+            Some(Path::new("cache")),
+            &Default::default(),
+        );
+
+        for result in [with_source_set, with_cache_dir] {
+            let err = result.expect_err("recommended must refuse workspace flags");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("'--preset recommended'"), "message: {err}");
+        }
+    }
+
+    /// An unset shell variable expands to an empty argument, which `mcp serve` refuses.
+    #[test]
+    fn install_refuses_an_empty_cache_dir() {
+        let err = super::validate_workspace_flags(
+            super::InstallPresetCli::Workspace,
+            Some(Path::new("")),
+            &Default::default(),
+        )
+        .expect_err("an empty --cache-dir must be refused");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("must not be empty"), "message: {err}");
+    }
+
+    /// Control: the guard rejects only what it is meant to. The workspace preset accepts
+    /// both flag kinds, and every preset accepts an install that asked for neither.
+    #[test]
+    fn install_accepts_what_the_guard_is_not_meant_to_refuse() {
+        use super::InstallPresetCli::{Recommended, Reference, Workspace};
+
+        assert!(super::validate_workspace_flags(
+            Workspace,
+            Some(Path::new("cache")),
+            &source_set_with_root()
+        )
+        .is_ok());
+        for preset in [Workspace, Reference, Recommended] {
+            assert!(
+                super::validate_workspace_flags(preset, None, &Default::default()).is_ok(),
+                "{preset:?} must accept an install without workspace flags"
+            );
+        }
     }
 
     fn serve_args(mode: McpServeMode, port: Option<u16>) -> McpServeArgs {

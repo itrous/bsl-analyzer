@@ -666,11 +666,19 @@ mod contract_surface {
                   profile = workspace | reference
                   source-dir (-s)
                 install
+                  cache-dir
+                  configuration-root
                   dry-run
                   enable-tool
                   env
+                  extension !no-extensions
+                  extension-depends-on
+                  external !no-externals
+                  external-depends-on
                   force
                   name
+                  no-extensions !extension
+                  no-externals !external
                   onec-password
                   onec-url
                   onec-user
