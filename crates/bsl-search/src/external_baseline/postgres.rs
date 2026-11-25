@@ -4886,8 +4886,10 @@ mod tests {
     /// in `document.rs` where it is written.
     #[test]
     fn the_serving_side_key_recipe_ignores_the_root() {
-        let source = include_str!("postgres.rs");
-        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap_or(source);
+        // The helper removes every `#[cfg(test)]` element rather than cutting at the first one,
+        // and normalises the checkout's line endings.
+        let production =
+            test_utils::production_source::production_source(include_str!("postgres.rs"));
         let recipe = production
             .split_once("fn semantic_key_for_semantic_row")
             .expect("the serving-side key recomputation moved; this gate scans what it can find")

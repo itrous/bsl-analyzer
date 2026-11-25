@@ -756,8 +756,10 @@ mod tests {
     /// see: a private `read_dir` or `WalkDir` never reaches `SourceSet::scan`.
     #[test]
     fn the_publisher_does_not_carry_its_own_tree_walk() {
-        let source = include_str!("documents.rs");
-        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap_or(source);
+        // The helper removes every `#[cfg(test)]` element rather than cutting at the first one,
+        // and normalises the checkout's line endings.
+        let production =
+            test_utils::production_source::production_source(include_str!("documents.rs"));
         assert!(
             production.contains("fn build_workspace_code"),
             "the production/test cut moved; this gate scans only what it can prove it scanned"
@@ -775,8 +777,10 @@ mod tests {
     /// its complete configuration+extensions table to the plural boot initializer.
     #[test]
     fn the_publisher_does_not_fall_back_to_a_single_root_table() {
-        let source = include_str!("documents.rs");
-        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap_or(source);
+        // The helper removes every `#[cfg(test)]` element rather than cutting at the first one,
+        // and normalises the checkout's line endings.
+        let production =
+            test_utils::production_source::production_source(include_str!("documents.rs"));
         assert!(
             production.contains("initialize_workspace_roots("),
             "the production/test cut moved, or the root table is no longer installed here; \

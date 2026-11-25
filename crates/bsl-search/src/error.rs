@@ -356,8 +356,11 @@ mod tests {
     /// gate.
     #[test]
     fn every_named_refusal_in_the_adapter_has_a_reason_code() {
-        let source = include_str!("external_baseline/postgres.rs");
-        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap_or(source);
+        // The helper removes every `#[cfg(test)]` element rather than cutting at the first one,
+        // and normalises the checkout's line endings.
+        let production = test_utils::production_source::production_source(include_str!(
+            "external_baseline/postgres.rs"
+        ));
 
         let mut checked = 0usize;
         for occurrence in production.split("ExternalBaseline(").skip(1) {
