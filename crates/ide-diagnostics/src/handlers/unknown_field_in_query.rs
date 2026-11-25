@@ -150,6 +150,35 @@ mod tests {
     }
 
     #[test]
+    fn positive_missing_field_behind_a_reference() {
+        check_with_designer(
+            "ВЫБРАТЬ Т.Справочник1.НетТакогоПоля ИЗ РегистрСведений.РегистрСведений1 КАК Т",
+            expect![[r#"
+                UnknownFieldInQuery @ 3:43..3:56
+                  message: Поле "НетТакогоПоля" не найдено в таблице "Справочник.Справочник1" запроса
+                  severity: Blocker"#]],
+        );
+    }
+
+    #[test]
+    fn negative_declared_standard_and_virtual_fields_behind_a_reference() {
+        check_with_designer(
+            "ВЫБРАТЬ Т.Справочник1.Реквизит1, Т.Справочник1.Код, Т.Справочник1.Наименование, Т.Справочник1.Родитель, Т.Справочник1.Представление, Т.Справочник1.ТабличнаяЧасть1.Количество ИЗ РегистрСведений.РегистрСведений1 КАК Т",
+            expect![[r#""#]],
+        );
+    }
+
+    #[test]
+    fn positive_missing_column_of_a_tabular_section_behind_a_reference() {
+        check_with_designer(
+            "ВЫБРАТЬ Т.Справочник1.ТабличнаяЧасть1.НетКолонки ИЗ РегистрСведений.РегистрСведений1 КАК Т",
+            expect![[r#"
+                UnknownFieldInQuery @ 3:59..3:69
+                  message: Поле "НетКолонки" не найдено в таблице "Справочник.Справочник1.ТабличнаяЧасть1" запроса
+                  severity: Blocker"#]],
+        );
+    }
+    #[test]
     fn negative_valid_dimension() {
         check_with_designer(
             "ВЫБРАТЬ Т.Справочник1 ИЗ РегистрСведений.РегистрСведений1 КАК Т",
