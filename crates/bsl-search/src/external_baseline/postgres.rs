@@ -4887,6 +4887,9 @@ mod tests {
     #[test]
     fn the_serving_side_key_recipe_ignores_the_root() {
         let source = include_str!("postgres.rs");
+        // Normalised for the reason spelled out in `engine.rs`: on a CRLF checkout the cut
+        // below matches nothing and the "production" half would carry the test module too.
+        let source = &source.replace("\r\n", "\n");
         let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap_or(source);
         let recipe = production
             .split_once("fn semantic_key_for_semantic_row")
