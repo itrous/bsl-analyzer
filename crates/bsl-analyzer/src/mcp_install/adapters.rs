@@ -98,7 +98,7 @@ fn apply_action(
         (
             InstallTarget::Claude,
             InstallScope::User | InstallScope::Project | InstallScope::Local,
-        ) => install_claude(action, runner),
+        ) => install_claude(action, runner, files),
         (InstallTarget::Cursor, InstallScope::User | InstallScope::Project) => {
             install_cursor(action, files)
         }
@@ -336,10 +336,20 @@ fn install_gemini(
 fn install_claude(
     action: &InstallAction,
     runner: &dyn CommandRunner,
+    files: &dyn FileStore,
 ) -> Result<InstallEntryResult, InstallError> {
     let location = claude_location_hint(action.scope, &action.project_dir)?;
-    let existing_name =
-        claude_existing_server_name(runner, &action.spec.name, &action.project_dir)?;
+    // `claude mcp get` ignores scope, so project scope is decided by `.mcp.json` itself.
+    let existing_name = if matches!(action.scope, InstallScope::Project) {
+        json_existing_server_name(
+            files,
+            &action.project_dir.join(".mcp.json"),
+            &action.spec.name,
+            "mcpServers",
+        )?
+    } else {
+        claude_existing_server_name(runner, &action.spec.name, &action.project_dir)?
+    };
     let decision = resolve_apply_decision(
         existing_name.is_some(),
         action.force,
@@ -549,6 +559,11 @@ fn build_claude_remove_args(name: &str, scope: InstallScope) -> Vec<String> {
     vec!["mcp".to_owned(), "remove".to_owned(), "-s".to_owned(), scope.to_string(), name.to_owned()]
 }
 
+/// Clients word "no such server" differently across versions; any other failure stays an error.
+fn stderr_reports_missing_server(stderr: &str) -> bool {
+    stderr.contains("No MCP server named") || stderr.contains("No MCP server found with name")
+}
+
 fn codex_server_exists(
     runner: &dyn CommandRunner,
     name: &str,
@@ -559,7 +574,7 @@ fn codex_server_exists(
     if output.status == 0 {
         return Ok(true);
     }
-    if output.stderr.contains("No MCP server named") {
+    if stderr_reports_missing_server(&output.stderr) {
         return Ok(false);
     }
     Err(InstallError::InspectionFailed {
@@ -597,7 +612,7 @@ fn claude_server_exists(
     if output.status == 0 {
         return Ok(true);
     }
-    if output.stderr.contains("No MCP server found with name") {
+    if stderr_reports_missing_server(&output.stderr) {
         return Ok(false);
     }
     Err(InstallError::InspectionFailed {
@@ -917,7 +932,10 @@ mod tests {
         InstallError,
     };
 
-    use super::{apply_action, build_codex_add_args, upsert_codex_project_server};
+    use super::{
+        apply_action, build_codex_add_args, stderr_reports_missing_server,
+        upsert_codex_project_server,
+    };
 
     struct FakeRunner {
         outputs: RefCell<Vec<CommandOutput>>,
@@ -1049,11 +1067,8 @@ mod tests {
 
     #[test]
     fn dry_run_command_preview_redacts_onec_password() {
-        let runner = FakeRunner::new(vec![CommandOutput {
-            status: 1,
-            stdout: String::new(),
-            stderr: "No MCP server found with name bsl-analyzer".to_owned(),
-        }]);
+        // Project scope never consults the client registry: an empty runner would panic on any call.
+        let runner = FakeRunner::new(Vec::new());
         let files = MemoryFiles::default();
         let mut install_action =
             action_with_spec(InstallTarget::Claude, InstallScope::Project, spec_with_password());
@@ -1200,7 +1215,7 @@ args = ["mcp", "--source-dir", "."]
     }
 
     #[test]
-    fn claude_force_reinstalls_existing_server() {
+    fn claude_user_force_reinstalls_existing_server() {
         let runner = FakeRunner::new(vec![
             CommandOutput { status: 0, stdout: String::new(), stderr: String::new() },
             CommandOutput { status: 0, stdout: String::new(), stderr: String::new() },
@@ -1209,13 +1224,146 @@ args = ["mcp", "--source-dir", "."]
         let files = MemoryFiles::default();
 
         let result =
-            apply_action(&action(InstallTarget::Claude, InstallScope::Project), &runner, &files)
+            apply_action(&action(InstallTarget::Claude, InstallScope::User), &runner, &files)
                 .expect("claude install succeeds");
 
         assert_eq!(result.status, InstallStatus::Updated);
         let invocations = runner.invocations.borrow();
         assert_eq!(invocations.len(), 3);
+        assert_eq!(invocations[0].1[1], "get");
         assert_eq!(invocations[1].1[1], "remove");
         assert_eq!(invocations[2].1[1], "add");
+    }
+
+    fn ok() -> CommandOutput {
+        CommandOutput { status: 0, stdout: String::new(), stderr: String::new() }
+    }
+
+    fn failed(stderr: &str) -> CommandOutput {
+        CommandOutput { status: 1, stdout: String::new(), stderr: stderr.to_owned() }
+    }
+
+    const REAL_MISSING: &str = "No MCP server named \"bsl-analyzer\". Configured servers: codex, gemini (and 3 more - run `claude mcp list` to see all)";
+    const LEGACY_MISSING: &str = "No MCP server found with name: bsl-analyzer";
+
+    fn project_mcp_json() -> PathBuf {
+        PathBuf::from("/workspace").join(".mcp.json")
+    }
+
+    fn subcommands(runner: &FakeRunner) -> Vec<String> {
+        runner.invocations.borrow().iter().map(|call| call.1[1].clone()).collect()
+    }
+
+    #[test]
+    fn claude_project_without_mcp_json_installs_without_consulting_client() {
+        let runner = FakeRunner::new(vec![ok()]);
+        let files = MemoryFiles::default();
+
+        let result =
+            apply_action(&action(InstallTarget::Claude, InstallScope::Project), &runner, &files)
+                .expect("project install succeeds");
+
+        assert_eq!(result.status, InstallStatus::Installed);
+        assert_eq!(subcommands(&runner), vec!["add"]);
+    }
+
+    #[test]
+    fn claude_project_entry_in_mcp_json_with_force_removes_then_adds() {
+        let runner = FakeRunner::new(vec![ok(), ok()]);
+        let files = MemoryFiles::with(
+            project_mcp_json(),
+            r#"{"mcpServers":{"bsl-analyzer":{"command":"x"}}}"#,
+        );
+
+        let result =
+            apply_action(&action(InstallTarget::Claude, InstallScope::Project), &runner, &files)
+                .expect("project update succeeds");
+
+        assert_eq!(result.status, InstallStatus::Updated);
+        assert_eq!(subcommands(&runner), vec!["remove", "add"]);
+    }
+
+    #[test]
+    fn claude_project_entry_in_mcp_json_without_force_is_already_exists() {
+        let runner = FakeRunner::new(Vec::new());
+        let files = MemoryFiles::with(
+            project_mcp_json(),
+            r#"{"mcpServers":{"bsl-analyzer":{"command":"x"}}}"#,
+        );
+        let mut install_action = action(InstallTarget::Claude, InstallScope::Project);
+        install_action.force = false;
+
+        let err = apply_action(&install_action, &runner, &files).expect_err("must refuse");
+
+        assert!(matches!(err, InstallError::AlreadyExists { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn claude_project_legacy_name_in_mcp_json_is_removed() {
+        let runner = FakeRunner::new(vec![ok(), ok()]);
+        let files = MemoryFiles::with(
+            project_mcp_json(),
+            r#"{"mcpServers":{"bsl-analyzer":{"command":"x"}}}"#,
+        );
+        let install_action = action_with_spec(
+            InstallTarget::Claude,
+            InstallScope::Project,
+            spec_named("bsl-analyzer-workspace"),
+        );
+
+        apply_action(&install_action, &runner, &files).expect("migration succeeds");
+
+        let invocations = runner.invocations.borrow();
+        assert_eq!(invocations[0].1[1], "remove");
+        assert_eq!(invocations[0].1.last().map(String::as_str), Some("bsl-analyzer"));
+        assert_eq!(invocations[1].1[1], "add");
+    }
+
+    #[test]
+    fn claude_user_scope_tolerates_real_missing_server_wording() {
+        let runner = FakeRunner::new(vec![failed(REAL_MISSING), ok()]);
+        let files = MemoryFiles::default();
+
+        let result =
+            apply_action(&action(InstallTarget::Claude, InstallScope::User), &runner, &files)
+                .expect("install proceeds");
+
+        assert_eq!(result.status, InstallStatus::Installed);
+    }
+
+    #[test]
+    fn claude_user_scope_tolerates_legacy_missing_server_wording() {
+        let runner = FakeRunner::new(vec![failed(LEGACY_MISSING), ok()]);
+        let files = MemoryFiles::default();
+
+        let result =
+            apply_action(&action(InstallTarget::Claude, InstallScope::User), &runner, &files)
+                .expect("install proceeds");
+
+        assert_eq!(result.status, InstallStatus::Installed);
+    }
+
+    #[test]
+    fn claude_user_scope_unrelated_failure_is_inspection_failed() {
+        let message = "claude: EACCES: permission denied, open '/root/.claude.json'";
+        let runner = FakeRunner::new(vec![failed(message)]);
+        let files = MemoryFiles::default();
+
+        let err = apply_action(&action(InstallTarget::Claude, InstallScope::User), &runner, &files)
+            .expect_err("must not be treated as absent");
+
+        match err {
+            InstallError::InspectionFailed { message: got, .. } => assert_eq!(got, message),
+            other => panic!("expected InspectionFailed, got {other:?}"),
+        }
+        assert_eq!(subcommands(&runner), vec!["get"]);
+    }
+
+    #[test]
+    fn missing_server_predicate_accepts_both_wordings_only() {
+        assert!(stderr_reports_missing_server(REAL_MISSING));
+        assert!(stderr_reports_missing_server(LEGACY_MISSING));
+        assert!(!stderr_reports_missing_server("claude: EACCES: permission denied"));
+        assert!(!stderr_reports_missing_server(""));
     }
 }

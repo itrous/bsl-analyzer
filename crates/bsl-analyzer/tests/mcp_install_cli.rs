@@ -1,8 +1,5 @@
-#![cfg(unix)]
-
 use std::{
     env, fs,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -46,19 +43,21 @@ impl TestHarness {
     }
 
     fn install_stub(&self, name: &str, script: &str) {
-        let path = self.bin_dir.join(name);
+        // Windows resolves a bare program name through PATHEXT, so the stub needs an extension.
+        let file_name = if cfg!(windows) { format!("{name}.cmd") } else { name.to_owned() };
+        let path = self.bin_dir.join(file_name);
         fs::write(&path, script).expect("write stub");
-        let mut perms = fs::metadata(&path).expect("metadata").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms).expect("chmod");
+        make_executable(&path);
     }
 
     fn command(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"));
-        let path_env =
-            format!("{}:{}", self.bin_dir.display(), env::var("PATH").unwrap_or_default());
+        let mut dirs = vec![self.bin_dir.clone()];
+        dirs.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
+        let path_env = env::join_paths(dirs).expect("join PATH");
         cmd.current_dir(&self.project_dir)
             .env("HOME", &self.home_dir)
+            .env("USERPROFILE", &self.home_dir)
             .env("PATH", path_env)
             .env("TEST_LOG", &self.log_path);
         cmd
@@ -387,27 +386,64 @@ fn gemini_project_force_migrates_legacy_name() {
     );
 }
 
+const CLAUDE_PROJECT_ENTRY: &str = r#"{"mcpServers":{"NAME":{"command":"x"}}}"#;
+
+fn claude_install_args(harness: &TestHarness, scope: &str, extra: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = ["mcp", "install", "--target", "claude", "--scope", scope]
+        .iter()
+        .map(|arg| (*arg).to_owned())
+        .collect();
+    args.extend(extra.iter().map(|arg| (*arg).to_owned()));
+    args.push("--source-dir".to_owned());
+    args.push(harness.source_dir().to_str().expect("utf-8 path").to_owned());
+    args
+}
+
 #[test]
-fn claude_project_force_runs_get_remove_add() {
+fn claude_project_without_mcp_json_creates_it_without_get() {
     let harness = TestHarness::new();
     harness.install_stub("claude", &claude_stub());
 
     let output = harness
         .command()
-        .env("CLAUDE_GET_EXISTS", "1")
-        .args([
-            "mcp",
-            "install",
-            "--target",
-            "claude",
-            "--scope",
+        .args(claude_install_args(&harness, "project", &[]))
+        .output()
+        .expect("run binary");
+
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("[claude:project] installed"), "stdout: {stdout}");
+
+    let config = fs::read_to_string(harness.project_dir.join(".mcp.json")).expect(".mcp.json");
+    assert!(config.contains("mcpServers"));
+    assert!(config.contains("bsl-analyzer-workspace"));
+
+    let invocations = harness.invocations();
+    assert_eq!(invocations.len(), 1);
+    assert!(invocations.iter().all(|call| call.args[1] != "get"));
+    assert_eq!(
+        invocations[0].args[0..5],
+        ["mcp", "add", "-s", "project", "bsl-analyzer-workspace"]
+    );
+}
+
+#[test]
+fn claude_project_force_with_entry_in_mcp_json_runs_remove_add() {
+    let harness = TestHarness::new();
+    harness.install_stub("claude", &claude_stub());
+    fs::write(
+        harness.project_dir.join(".mcp.json"),
+        CLAUDE_PROJECT_ENTRY.replace("NAME", "bsl-analyzer-workspace"),
+    )
+    .expect("seed .mcp.json");
+
+    let output = harness
+        .command()
+        .args(claude_install_args(
+            &harness,
             "project",
-            "--force",
-            "--env",
-            "NAPARNIK_TOKEN=test",
-            "--source-dir",
-            harness.source_dir().to_str().expect("utf-8 path"),
-        ])
+            &["--force", "--env", "NAPARNIK_TOKEN=test"],
+        ))
         .output()
         .expect("run binary");
 
@@ -416,55 +452,120 @@ fn claude_project_force_runs_get_remove_add() {
     assert!(stdout.contains("[claude:project] updated"));
 
     let invocations = harness.invocations();
-    assert_eq!(invocations.len(), 3);
-    assert_eq!(invocations[0].args, vec!["mcp", "get", "bsl-analyzer-workspace"]);
+    assert_eq!(invocations.len(), 2);
     assert_eq!(
-        invocations[1].args,
+        invocations[0].args,
         vec!["mcp", "remove", "-s", "project", "bsl-analyzer-workspace"]
     );
     assert_eq!(
-        invocations[2].args[0..5],
+        invocations[1].args[0..5],
         ["mcp", "add", "-s", "project", "bsl-analyzer-workspace"]
     );
-    assert!(invocations[2].args.contains(&"-e".to_owned()));
-    assert!(invocations[2].args.contains(&"NAPARNIK_TOKEN=test".to_owned()));
+    assert!(invocations[1].args.contains(&"-e".to_owned()));
+    assert!(invocations[1].args.contains(&"NAPARNIK_TOKEN=test".to_owned()));
+}
+
+#[test]
+fn claude_project_entry_in_mcp_json_without_force_is_already_exists() {
+    let harness = TestHarness::new();
+    harness.install_stub("claude", &claude_stub());
+    fs::write(
+        harness.project_dir.join(".mcp.json"),
+        CLAUDE_PROJECT_ENTRY.replace("NAME", "bsl-analyzer-workspace"),
+    )
+    .expect("seed .mcp.json");
+
+    let output = harness
+        .command()
+        .args(claude_install_args(&harness, "project", &[]))
+        .output()
+        .expect("run binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("failed to inspect"), "stderr: {stderr}");
+    assert!(stderr.contains("already"), "stderr: {stderr}");
+    assert!(harness.invocations().is_empty());
 }
 
 #[test]
 fn claude_project_force_migrates_legacy_name() {
     let harness = TestHarness::new();
     harness.install_stub("claude", &claude_stub());
+    fs::write(
+        harness.project_dir.join(".mcp.json"),
+        CLAUDE_PROJECT_ENTRY.replace("NAME", "bsl-analyzer"),
+    )
+    .expect("seed .mcp.json");
 
     let output = harness
         .command()
-        .env("CLAUDE_GET_EXISTS_NAMES", "bsl-analyzer")
-        .args([
-            "mcp",
-            "install",
-            "--target",
-            "claude",
-            "--scope",
-            "project",
-            "--preset",
-            "workspace",
-            "--force",
-            "--source-dir",
-            harness.source_dir().to_str().expect("utf-8 path"),
-        ])
+        .args(claude_install_args(&harness, "project", &["--preset", "workspace", "--force"]))
         .output()
         .expect("run binary");
 
     assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
 
     let invocations = harness.invocations();
-    assert_eq!(invocations.len(), 4);
-    assert_eq!(invocations[0].args, vec!["mcp", "get", "bsl-analyzer-workspace"]);
-    assert_eq!(invocations[1].args, vec!["mcp", "get", "bsl-analyzer"]);
-    assert_eq!(invocations[2].args, vec!["mcp", "remove", "-s", "project", "bsl-analyzer"]);
+    assert_eq!(invocations.len(), 2);
+    assert_eq!(invocations[0].args, vec!["mcp", "remove", "-s", "project", "bsl-analyzer"]);
     assert_eq!(
-        invocations[3].args[0..5],
+        invocations[1].args[0..5],
         ["mcp", "add", "-s", "project", "bsl-analyzer-workspace"]
     );
+}
+
+#[test]
+fn claude_user_scope_proceeds_when_client_reports_missing_server_in_current_wording() {
+    let harness = TestHarness::new();
+    harness.install_stub("claude", &claude_stub());
+
+    let output = harness
+        .command()
+        .args(claude_install_args(&harness, "user", &["--preset", "reference"]))
+        .output()
+        .expect("run binary");
+
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let invocations = harness.invocations();
+    assert_eq!(invocations.last().expect("add call").args[1], "add");
+}
+
+#[test]
+fn claude_user_scope_proceeds_when_client_reports_missing_server_in_legacy_wording() {
+    let harness = TestHarness::new();
+    harness.install_stub("claude", &claude_stub());
+
+    let output = harness
+        .command()
+        .env("CLAUDE_GET_WORDING", "legacy")
+        .args(claude_install_args(&harness, "user", &["--preset", "reference"]))
+        .output()
+        .expect("run binary");
+
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let invocations = harness.invocations();
+    assert_eq!(invocations.last().expect("add call").args[1], "add");
+}
+
+/// Control: the widened absence check must not turn a real failure into "absent".
+#[test]
+fn claude_user_scope_unrelated_get_failure_is_reported_not_swallowed() {
+    let harness = TestHarness::new();
+    harness.install_stub("claude", &claude_stub());
+
+    let output = harness
+        .command()
+        .env("CLAUDE_GET_FAIL", "claude: EACCES: permission denied, open '/root/.claude.json'")
+        .args(claude_install_args(&harness, "user", &["--preset", "reference"]))
+        .output()
+        .expect("run binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to inspect existing MCP server"), "stderr: {stderr}");
+    assert!(stderr.contains("EACCES"), "stderr: {stderr}");
+    assert!(harness.invocations().iter().all(|call| call.args[1] != "add"));
 }
 
 #[test]
@@ -607,7 +708,47 @@ fn assert_same_path(actual: &str, expected: &Path) {
 }
 
 fn codex_stub() -> String {
-    common_stub_prelude(
+    #[cfg(unix)]
+    return codex_stub_sh();
+    #[cfg(windows)]
+    return codex_stub_cmd();
+}
+
+fn gemini_stub() -> String {
+    #[cfg(unix)]
+    return gemini_stub_sh();
+    #[cfg(windows)]
+    return gemini_stub_cmd();
+}
+
+fn claude_stub() -> String {
+    #[cfg(unix)]
+    return claude_stub_sh();
+    #[cfg(windows)]
+    return claude_stub_cmd();
+}
+
+fn failing_stub() -> String {
+    #[cfg(unix)]
+    return failing_stub_sh();
+    #[cfg(windows)]
+    return failing_stub_cmd();
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(path).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).expect("chmod");
+}
+
+#[cfg(windows)]
+fn make_executable(_path: &Path) {}
+
+#[cfg(unix)]
+fn codex_stub_sh() -> String {
+    common_stub_prelude_sh(
         r#"
 if [ "$1" = "mcp" ] && [ "$2" = "get" ]; then
   if [ "$CODEX_GET_EXISTS" = "1" ]; then
@@ -628,12 +769,14 @@ exit 0
     )
 }
 
-fn gemini_stub() -> String {
-    common_stub_prelude("exit 0\n")
+#[cfg(unix)]
+fn gemini_stub_sh() -> String {
+    common_stub_prelude_sh("exit 0\n")
 }
 
-fn claude_stub() -> String {
-    common_stub_prelude(
+#[cfg(unix)]
+fn claude_stub_sh() -> String {
+    common_stub_prelude_sh(
         r#"
 if [ "$1" = "mcp" ] && [ "$2" = "get" ]; then
   if [ "$CLAUDE_GET_EXISTS" = "1" ]; then
@@ -646,19 +789,33 @@ if [ "$1" = "mcp" ] && [ "$2" = "get" ]; then
       exit 0
       ;;
   esac
-  echo "No MCP server found with name: $3" >&2
+  if [ -n "$CLAUDE_GET_FAIL" ]; then
+    echo "$CLAUDE_GET_FAIL" >&2
+    exit 1
+  fi
+  if [ "$CLAUDE_GET_WORDING" = "legacy" ]; then
+    echo "No MCP server found with name: $3" >&2
+  else
+    printf 'No MCP server named "%s". Configured servers: codex, gemini (and 3 more - run `claude mcp list` to see all)\n' "$3" >&2
+  fi
   exit 1
+fi
+# The real CLI creates .mcp.json from nothing on a project-scope add.
+if [ "$1" = "mcp" ] && [ "$2" = "add" ] && [ "$4" = "project" ] && [ ! -e .mcp.json ]; then
+  printf '{"mcpServers":{"%s":{"command":"stub"}}}\n' "$5" > .mcp.json
 fi
 exit 0
 "#,
     )
 }
 
-fn failing_stub() -> String {
-    common_stub_prelude("echo 'unexpected invocation' >&2\nexit 99\n")
+#[cfg(unix)]
+fn failing_stub_sh() -> String {
+    common_stub_prelude_sh("echo 'unexpected invocation' >&2\nexit 99\n")
 }
 
-fn common_stub_prelude(body: &str) -> String {
+#[cfg(unix)]
+fn common_stub_prelude_sh(body: &str) -> String {
     format!(
         "#!/bin/sh\n\
 echo \"PROGRAM=$(basename \"$0\")\" >> \"$TEST_LOG\"\n\
@@ -669,4 +826,96 @@ done\n\
 echo \"---\" >> \"$TEST_LOG\"\n\
 {body}"
     )
+}
+
+// Batch stubs. Every echo sits outside a parenthesised block (the client wordings contain
+// parentheses and quotes), the log writes put the redirect first so values get no trailing
+// space, and the arguments needed for branching are saved before the `shift` loop renumbers
+// them.
+#[cfg(windows)]
+fn cmd_script(body: &str) -> String {
+    let text = format!(
+        "@echo off\n\
+setlocal\n\
+set \"A1=%~1\"\n\
+set \"A2=%~2\"\n\
+set \"A3=%~3\"\n\
+set \"A4=%~4\"\n\
+set \"A5=%~5\"\n\
+>>\"%TEST_LOG%\" echo PROGRAM=%~n0\n\
+>>\"%TEST_LOG%\" echo CWD=%CD%\n\
+:logloop\n\
+if \"%~1\"==\"\" goto logdone\n\
+>>\"%TEST_LOG%\" echo ARG=%~1\n\
+shift\n\
+goto logloop\n\
+:logdone\n\
+>>\"%TEST_LOG%\" echo ---\n\
+{body}"
+    );
+    text.replace('\n', "\r\n")
+}
+
+#[cfg(windows)]
+fn codex_stub_cmd() -> String {
+    cmd_script(
+        r#"if not "%A1%"=="mcp" goto done
+if not "%A2%"=="get" goto done
+if "%CODEX_GET_EXISTS%"=="1" goto present
+if not defined CODEX_GET_EXISTS_NAMES goto missing
+for %%n in (%CODEX_GET_EXISTS_NAMES%) do if "%%n"=="%A3%" goto present
+:missing
+>&2 echo Error: No MCP server named '%A3%' found.
+exit /b 1
+:present
+echo {}
+exit /b 0
+:done
+exit /b 0
+"#,
+    )
+}
+
+#[cfg(windows)]
+fn gemini_stub_cmd() -> String {
+    cmd_script("exit /b 0\n")
+}
+
+#[cfg(windows)]
+fn claude_stub_cmd() -> String {
+    cmd_script(
+        r#"if not "%A1%"=="mcp" goto done
+if "%A2%"=="add" goto add
+if not "%A2%"=="get" goto done
+if "%CLAUDE_GET_EXISTS%"=="1" goto present
+if not defined CLAUDE_GET_EXISTS_NAMES goto missing
+for %%n in (%CLAUDE_GET_EXISTS_NAMES%) do if "%%n"=="%A3%" goto present
+:missing
+if defined CLAUDE_GET_FAIL goto fail
+if "%CLAUDE_GET_WORDING%"=="legacy" goto legacy
+>&2 echo No MCP server named "%A3%". Configured servers: codex, gemini (and 3 more - run `claude mcp list` to see all)
+exit /b 1
+:legacy
+>&2 echo No MCP server found with name: %A3%
+exit /b 1
+:fail
+>&2 echo %CLAUDE_GET_FAIL%
+exit /b 1
+:present
+echo present
+exit /b 0
+:add
+if not "%A4%"=="project" goto done
+if exist .mcp.json goto done
+>.mcp.json echo {"mcpServers":{"%A5%":{"command":"stub"}}}
+exit /b 0
+:done
+exit /b 0
+"#,
+    )
+}
+
+#[cfg(windows)]
+fn failing_stub_cmd() -> String {
+    cmd_script(">&2 echo unexpected invocation\nexit /b 99\n")
 }
