@@ -6926,17 +6926,11 @@ mod walk_ownership {
     /// the same divergence wearing different letters.
     #[test]
     fn the_engine_does_not_carry_its_own_tree_walk() {
-        let source = include_str!("engine.rs");
-        // A CRLF checkout (core.autocrlf on Windows, no .gitattributes pinning LF) gives this
-        // file "\r\n" endings, and a needle anchored on "\n" would then match nothing — the
-        // gate would fail on the line endings rather than on the code, in the very CI step that
-        // runs it by name. Normalised first, so the gate is about the source and not the
-        // checkout.
-        let source = &source.replace("\r\n", "\n");
         // Test code walks legitimately (a stand has to build and probe trees), so the ban
-        // covers production only. The cut is asserted below: a marker that stopped matching
-        // would shrink the scanned region to nothing and quietly pass everything.
-        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap_or(source);
+        // covers production only. The helper removes every `#[cfg(test)]` element rather than
+        // cutting at the first one, and normalises the checkout's line endings.
+        let production =
+            test_utils::production_source::production_source(include_str!("engine.rs"));
         assert!(
             production.contains("fn ingest_scanned_fts"),
             "the production/test cut moved; this gate scans only what it can prove it scanned"
