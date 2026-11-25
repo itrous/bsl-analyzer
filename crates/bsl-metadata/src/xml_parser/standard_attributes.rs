@@ -74,7 +74,7 @@ impl MdoProperties {
         let owners_explicitly_supplied = owners_node.is_some();
         let owners_explicitly_empty = owners_node.is_some_and(|node| {
             node.children().all(|child| {
-                !child.is_element() && child.text().map_or(true, |text| text.trim().is_empty())
+                !child.is_element() && child.text().is_none_or(|text| text.trim().is_empty())
             })
         });
         let owners = owners_node
