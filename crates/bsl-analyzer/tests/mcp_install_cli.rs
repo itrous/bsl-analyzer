@@ -1,8 +1,5 @@
-#![cfg(unix)]
-
 use std::{
     env, fs,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -46,19 +43,21 @@ impl TestHarness {
     }
 
     fn install_stub(&self, name: &str, script: &str) {
-        let path = self.bin_dir.join(name);
+        // Windows resolves a bare program name through PATHEXT, so the stub needs an extension.
+        let file_name = if cfg!(windows) { format!("{name}.cmd") } else { name.to_owned() };
+        let path = self.bin_dir.join(file_name);
         fs::write(&path, script).expect("write stub");
-        let mut perms = fs::metadata(&path).expect("metadata").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms).expect("chmod");
+        make_executable(&path);
     }
 
     fn command(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"));
-        let path_env =
-            format!("{}:{}", self.bin_dir.display(), env::var("PATH").unwrap_or_default());
+        let mut dirs = vec![self.bin_dir.clone()];
+        dirs.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
+        let path_env = env::join_paths(dirs).expect("join PATH");
         cmd.current_dir(&self.project_dir)
             .env("HOME", &self.home_dir)
+            .env("USERPROFILE", &self.home_dir)
             .env("PATH", path_env)
             .env("TEST_LOG", &self.log_path);
         cmd
@@ -607,7 +606,47 @@ fn assert_same_path(actual: &str, expected: &Path) {
 }
 
 fn codex_stub() -> String {
-    common_stub_prelude(
+    #[cfg(unix)]
+    return codex_stub_sh();
+    #[cfg(windows)]
+    return codex_stub_cmd();
+}
+
+fn gemini_stub() -> String {
+    #[cfg(unix)]
+    return gemini_stub_sh();
+    #[cfg(windows)]
+    return gemini_stub_cmd();
+}
+
+fn claude_stub() -> String {
+    #[cfg(unix)]
+    return claude_stub_sh();
+    #[cfg(windows)]
+    return claude_stub_cmd();
+}
+
+fn failing_stub() -> String {
+    #[cfg(unix)]
+    return failing_stub_sh();
+    #[cfg(windows)]
+    return failing_stub_cmd();
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(path).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).expect("chmod");
+}
+
+#[cfg(windows)]
+fn make_executable(_path: &Path) {}
+
+#[cfg(unix)]
+fn codex_stub_sh() -> String {
+    common_stub_prelude_sh(
         r#"
 if [ "$1" = "mcp" ] && [ "$2" = "get" ]; then
   if [ "$CODEX_GET_EXISTS" = "1" ]; then
@@ -628,12 +667,14 @@ exit 0
     )
 }
 
-fn gemini_stub() -> String {
-    common_stub_prelude("exit 0\n")
+#[cfg(unix)]
+fn gemini_stub_sh() -> String {
+    common_stub_prelude_sh("exit 0\n")
 }
 
-fn claude_stub() -> String {
-    common_stub_prelude(
+#[cfg(unix)]
+fn claude_stub_sh() -> String {
+    common_stub_prelude_sh(
         r#"
 if [ "$1" = "mcp" ] && [ "$2" = "get" ]; then
   if [ "$CLAUDE_GET_EXISTS" = "1" ]; then
@@ -654,11 +695,13 @@ exit 0
     )
 }
 
-fn failing_stub() -> String {
-    common_stub_prelude("echo 'unexpected invocation' >&2\nexit 99\n")
+#[cfg(unix)]
+fn failing_stub_sh() -> String {
+    common_stub_prelude_sh("echo 'unexpected invocation' >&2\nexit 99\n")
 }
 
-fn common_stub_prelude(body: &str) -> String {
+#[cfg(unix)]
+fn common_stub_prelude_sh(body: &str) -> String {
     format!(
         "#!/bin/sh\n\
 echo \"PROGRAM=$(basename \"$0\")\" >> \"$TEST_LOG\"\n\
@@ -669,4 +712,80 @@ done\n\
 echo \"---\" >> \"$TEST_LOG\"\n\
 {body}"
     )
+}
+
+// Batch stubs. Every echo sits outside a parenthesised block (the client wordings contain
+// parentheses and quotes), the log writes put the redirect first so values get no trailing
+// space, and the arguments needed for branching are saved before the `shift` loop renumbers
+// them.
+#[cfg(windows)]
+fn cmd_script(body: &str) -> String {
+    let text = format!(
+        "@echo off\n\
+setlocal\n\
+set \"A1=%~1\"\n\
+set \"A2=%~2\"\n\
+set \"A3=%~3\"\n\
+>>\"%TEST_LOG%\" echo PROGRAM=%~n0\n\
+>>\"%TEST_LOG%\" echo CWD=%CD%\n\
+:logloop\n\
+if \"%~1\"==\"\" goto logdone\n\
+>>\"%TEST_LOG%\" echo ARG=%~1\n\
+shift\n\
+goto logloop\n\
+:logdone\n\
+>>\"%TEST_LOG%\" echo ---\n\
+{body}"
+    );
+    text.replace('\n', "\r\n")
+}
+
+#[cfg(windows)]
+fn codex_stub_cmd() -> String {
+    cmd_script(
+        r#"if not "%A1%"=="mcp" goto done
+if not "%A2%"=="get" goto done
+if "%CODEX_GET_EXISTS%"=="1" goto present
+if not defined CODEX_GET_EXISTS_NAMES goto missing
+for %%n in (%CODEX_GET_EXISTS_NAMES%) do if "%%n"=="%A3%" goto present
+:missing
+>&2 echo Error: No MCP server named '%A3%' found.
+exit /b 1
+:present
+echo {}
+exit /b 0
+:done
+exit /b 0
+"#,
+    )
+}
+
+#[cfg(windows)]
+fn gemini_stub_cmd() -> String {
+    cmd_script("exit /b 0\n")
+}
+
+#[cfg(windows)]
+fn claude_stub_cmd() -> String {
+    cmd_script(
+        r#"if not "%A1%"=="mcp" goto done
+if not "%A2%"=="get" goto done
+if "%CLAUDE_GET_EXISTS%"=="1" goto present
+if not defined CLAUDE_GET_EXISTS_NAMES goto missing
+for %%n in (%CLAUDE_GET_EXISTS_NAMES%) do if "%%n"=="%A3%" goto present
+:missing
+>&2 echo No MCP server found with name: %A3%
+exit /b 1
+:present
+echo present
+exit /b 0
+:done
+exit /b 0
+"#,
+    )
+}
+
+#[cfg(windows)]
+fn failing_stub_cmd() -> String {
+    cmd_script(">&2 echo unexpected invocation\nexit /b 99\n")
 }
