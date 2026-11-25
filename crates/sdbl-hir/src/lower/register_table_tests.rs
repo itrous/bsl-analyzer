@@ -868,7 +868,7 @@ mod nested_field_existence {
 
     const QUEUE: &str = r#"
     <InformationRegister uuid="00000000-0000-0000-0000-000000000030">
-        <Properties><Name>Очередь</Name><InformationRegisterPeriodicity>Nonperiodical</InformationRegisterPeriodicity></Properties>
+        <Properties><Name>Очередь</Name><WriteMode>RecorderSubordinate</WriteMode><InformationRegisterPeriodicity>Nonperiodical</InformationRegisterPeriodicity></Properties>
         <ChildObjects>
             <Dimension uuid="00000000-0000-0000-0000-000000000031">
                 <Properties><Name>Заказ</Name><Type><v8:Type>cfg:DocumentRef.Заказ</v8:Type></Type></Properties>
