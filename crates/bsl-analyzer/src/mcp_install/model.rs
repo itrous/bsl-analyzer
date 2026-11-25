@@ -92,6 +92,10 @@ pub struct InstallRequest {
     /// Opt-in tools the installed server is told to serve. Empty unless the caller asked:
     /// enabling one is a decision of whoever installs, never of a preset.
     pub enable_tools: Vec<String>,
+    /// Rendered argv fragments (`["--cache-dir", "<abs>", "--configuration-root", "src/cf"]`)
+    /// that shape the workspace the installed server serves. Empty unless asked for; the
+    /// reference preset refuses them, because a reference server has no workspace.
+    pub workspace_args: Vec<String>,
     pub force: bool,
     pub dry_run: bool,
 }

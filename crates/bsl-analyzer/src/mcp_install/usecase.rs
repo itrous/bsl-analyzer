@@ -99,6 +99,7 @@ mod tests {
             onec_password: String::new(),
             env: BTreeMap::new(),
             enable_tools: Vec::new(),
+            workspace_args: Vec::new(),
             force: false,
             dry_run: false,
         }

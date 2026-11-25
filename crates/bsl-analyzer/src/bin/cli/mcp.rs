@@ -403,6 +403,18 @@ pub struct McpInstallArgs {
     #[arg(short = 's', long = "source-dir")]
     source_dir: Option<PathBuf>,
 
+    /// Written verbatim into the installed `mcp serve` argv (made absolute against the
+    /// project directory), so the installed server keeps its derived data where the
+    /// install asked instead of in the OS cache directory.
+    #[arg(long = "cache-dir", value_name = "PATH")]
+    cache_dir: Option<PathBuf>,
+
+    /// Written verbatim into the installed `mcp serve` argv, so the installed server
+    /// shapes its workspace the way the install asked — a project whose configuration is
+    /// not at the project root cannot be served by a config that omits these.
+    #[command(flatten)]
+    source_set: super::source_set::SourceSetArgs,
+
     #[arg(long)]
     onec_url: Option<String>,
 
@@ -1212,6 +1224,70 @@ fn broker_idle_ttl() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// The `mcp serve` flags an install records to shape the workspace its server will serve.
+///
+/// `--cache-dir` is made absolute against the project directory: the installed config is
+/// read by a client whose working directory is not ours, and `mcp serve` resolves a
+/// relative cache dir against the process cwd, so a relative value would scatter
+/// multi-gigabyte databases wherever the client happened to start. The same reason keeps
+/// the recorded binary path absolute. `--configuration-root` stays as typed: its own
+/// contract is "relative to the project root". The source-set flags are rendered by
+/// [`SourceSetArgs::to_args`], the one place that knows their spelling and the
+/// `--option=value` form that survives a hyphen-leading value.
+fn render_workspace_args(
+    cache_dir: Option<&Path>,
+    project_dir: &Path,
+    source_set: &super::source_set::SourceSetArgs,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(dir) = cache_dir {
+        args.push("--cache-dir".to_owned());
+        args.push(project_dir.join(dir).to_string_lossy().into_owned());
+    }
+    args.extend(source_set.to_args());
+    args
+}
+
+/// Refuses workspace-shaping flags that `mcp serve` would reject for the preset being
+/// installed. A config whose argv `mcp serve` rejects is a config whose client silently
+/// fails to start, so the refusal has to happen before anything is written. Pure on
+/// purpose: the refusals are testable without touching the filesystem.
+fn validate_workspace_flags(
+    preset: InstallPresetCli,
+    cache_dir: Option<&Path>,
+    source_set: &super::source_set::SourceSetArgs,
+) -> Result<(), io::Error> {
+    if cache_dir.is_some() || !source_set.is_empty() {
+        match preset {
+            // Same refusal `mcp serve` gives this combination.
+            InstallPresetCli::Reference => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "reference profile does not accept --cache-dir/source-set flags \
+                     (--configuration-root/--extension/--extension-depends-on/--no-extensions/...); \
+                     install '--preset workspace' to shape a workspace",
+                ));
+            }
+            // Mirrors --enable-tool: the recommended set writes both servers, and these
+            // flags belong to one of them only.
+            InstallPresetCli::Recommended => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--cache-dir/source-set flags are not used with '--preset recommended'; \
+                     install '--preset workspace' to shape a workspace",
+                ));
+            }
+            InstallPresetCli::Workspace => {}
+        }
+    }
+    // An unset shell variable expands to an empty argument; `mcp serve` refuses it, so the
+    // install must not write a config that records it.
+    if cache_dir.is_some_and(|dir| dir.as_os_str().is_empty()) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "--cache-dir must not be empty"));
+    }
+    Ok(())
+}
+
 fn run_mcp_install(args: McpInstallArgs) -> Result<(), Box<dyn Error + Send + Sync>> {
     use bsl_analyzer::mcp_install::{
         self, default_server_name, InstallPreset, InstallRequest, InstallScope, InstallTarget,
@@ -1255,6 +1331,10 @@ fn run_mcp_install(args: McpInstallArgs) -> Result<(), Box<dyn Error + Send + Sy
     }
     let enable_tools = args.enable_tools;
 
+    validate_workspace_flags(args.preset, args.cache_dir.as_deref(), &args.source_set)?;
+    let workspace_args =
+        render_workspace_args(args.cache_dir.as_deref(), &project_dir, &args.source_set);
+
     let requests = match args.preset {
         InstallPresetCli::Workspace => vec![InstallRequest {
             target,
@@ -1268,6 +1348,7 @@ fn run_mcp_install(args: McpInstallArgs) -> Result<(), Box<dyn Error + Send + Sy
             onec_password: password,
             env,
             enable_tools,
+            workspace_args,
             force: args.force,
             dry_run: args.dry_run,
         }],
@@ -1283,6 +1364,8 @@ fn run_mcp_install(args: McpInstallArgs) -> Result<(), Box<dyn Error + Send + Sy
             onec_password: password,
             env,
             enable_tools,
+            // Refused above when any were given, so this is always empty.
+            workspace_args: Vec::new(),
             force: args.force,
             dry_run: args.dry_run,
         }],
@@ -1310,6 +1393,7 @@ fn run_mcp_install(args: McpInstallArgs) -> Result<(), Box<dyn Error + Send + Sy
                     onec_password: password.clone(),
                     env: env.clone(),
                     enable_tools: Vec::new(),
+                    workspace_args: Vec::new(),
                     force: args.force,
                     dry_run: args.dry_run,
                 },
@@ -1325,6 +1409,7 @@ fn run_mcp_install(args: McpInstallArgs) -> Result<(), Box<dyn Error + Send + Sy
                     onec_password: password,
                     env,
                     enable_tools: Vec::new(),
+                    workspace_args: Vec::new(),
                     force: args.force,
                     dry_run: args.dry_run,
                 },
@@ -3037,6 +3122,185 @@ mod tests {
         assert!(validate_serve_args(&args)
             .expect("reference without 1C options remains valid")
             .is_none());
+    }
+
+    /// Control: an install that asked for no workspace flags must render the argv it
+    /// rendered before the feature existed. A suite that only proves the new flags appear
+    /// cannot show that an untouched install is unchanged.
+    #[test]
+    fn render_workspace_args_is_empty_when_nothing_was_asked_for() {
+        let project = std::env::temp_dir();
+
+        let args = super::render_workspace_args(None, &project, &Default::default());
+
+        assert!(args.is_empty(), "args: {args:?}");
+    }
+
+    /// A relative cache dir recorded as typed would be resolved by `mcp serve` against the
+    /// client's working directory and scatter databases there; an absolute one must stay
+    /// untouched, or an explicit location would be rewritten.
+    #[test]
+    fn render_workspace_args_anchors_a_relative_cache_dir_at_the_project() {
+        let project = std::env::temp_dir().join("render-project");
+        let absolute = std::env::temp_dir().join("render-absolute-cache");
+
+        let relative = super::render_workspace_args(
+            Some(Path::new("cache/bsl")),
+            &project,
+            &Default::default(),
+        );
+        let kept =
+            super::render_workspace_args(Some(absolute.as_path()), &project, &Default::default());
+
+        assert_eq!(
+            relative,
+            vec![
+                "--cache-dir".to_owned(),
+                project.join("cache/bsl").to_string_lossy().into_owned()
+            ]
+        );
+        assert_eq!(kept, vec!["--cache-dir".to_owned(), absolute.to_string_lossy().into_owned()]);
+    }
+
+    /// `--configuration-root` is documented as relative to the project root; joining it onto
+    /// the install directory would record a path the server cannot resolve from its root.
+    #[test]
+    fn render_workspace_args_passes_the_configuration_root_through_unchanged() {
+        let source_set = crate::cli::source_set::SourceSetArgs {
+            configuration_root: Some("src/cf".to_owned()),
+            ..Default::default()
+        };
+
+        let args = super::render_workspace_args(None, &std::env::temp_dir(), &source_set);
+
+        assert_eq!(args, vec!["--configuration-root=src/cf".to_owned()]);
+    }
+
+    /// Repeatable flags carry one occurrence per value in the order given (a later
+    /// `--extension-depends-on` may refer to an earlier `--extension`), and the switches are
+    /// bare.
+    #[test]
+    fn render_workspace_args_renders_repeatable_and_bare_flags_in_order() {
+        let source_set = crate::cli::source_set::SourceSetArgs {
+            extensions: vec!["a=ext/a".to_owned(), "b=ext/b".to_owned()],
+            extension_depends_on: vec!["b=a".to_owned()],
+            externals: vec!["x=epf/x".to_owned(), "y=epf/y".to_owned()],
+            external_depends_on: vec!["x=a".to_owned()],
+            no_externals: false,
+            ..Default::default()
+        };
+        let none = crate::cli::source_set::SourceSetArgs {
+            no_extensions: true,
+            no_externals: true,
+            ..Default::default()
+        };
+
+        let args = super::render_workspace_args(None, &std::env::temp_dir(), &source_set);
+        let bare = super::render_workspace_args(None, &std::env::temp_dir(), &none);
+
+        assert_eq!(
+            args,
+            [
+                "--extension=a=ext/a",
+                "--extension=b=ext/b",
+                "--extension-depends-on=b=a",
+                "--external=x=epf/x",
+                "--external=y=epf/y",
+                "--external-depends-on=x=a",
+            ]
+        );
+        assert_eq!(bare, ["--no-extensions", "--no-externals"]);
+    }
+
+    fn source_set_with_root() -> crate::cli::source_set::SourceSetArgs {
+        crate::cli::source_set::SourceSetArgs {
+            configuration_root: Some("src/cf".to_owned()),
+            ..Default::default()
+        }
+    }
+
+    /// The reference server has no workspace; an install that recorded source-set flags for
+    /// it would write a config `mcp serve` refuses to start from.
+    #[test]
+    fn install_refuses_source_set_flags_for_the_reference_preset() {
+        let err = super::validate_workspace_flags(
+            super::InstallPresetCli::Reference,
+            None,
+            &source_set_with_root(),
+        )
+        .expect_err("reference must refuse source-set flags");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--configuration-root"), "message: {err}");
+    }
+
+    #[test]
+    fn install_refuses_cache_dir_for_the_reference_preset() {
+        let err = super::validate_workspace_flags(
+            super::InstallPresetCli::Reference,
+            Some(Path::new("cache")),
+            &Default::default(),
+        )
+        .expect_err("reference must refuse --cache-dir");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--cache-dir"), "message: {err}");
+    }
+
+    /// The recommended preset writes both servers, so a flag meant for one of them cannot be
+    /// applied honestly; either flag kind must be refused rather than silently dropped.
+    #[test]
+    fn install_refuses_either_flag_kind_for_the_recommended_preset() {
+        let with_source_set = super::validate_workspace_flags(
+            super::InstallPresetCli::Recommended,
+            None,
+            &source_set_with_root(),
+        );
+        let with_cache_dir = super::validate_workspace_flags(
+            super::InstallPresetCli::Recommended,
+            Some(Path::new("cache")),
+            &Default::default(),
+        );
+
+        for result in [with_source_set, with_cache_dir] {
+            let err = result.expect_err("recommended must refuse workspace flags");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("'--preset recommended'"), "message: {err}");
+        }
+    }
+
+    /// An unset shell variable expands to an empty argument, which `mcp serve` refuses.
+    #[test]
+    fn install_refuses_an_empty_cache_dir() {
+        let err = super::validate_workspace_flags(
+            super::InstallPresetCli::Workspace,
+            Some(Path::new("")),
+            &Default::default(),
+        )
+        .expect_err("an empty --cache-dir must be refused");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("must not be empty"), "message: {err}");
+    }
+
+    /// Control: the guard rejects only what it is meant to. The workspace preset accepts
+    /// both flag kinds, and every preset accepts an install that asked for neither.
+    #[test]
+    fn install_accepts_what_the_guard_is_not_meant_to_refuse() {
+        use super::InstallPresetCli::{Recommended, Reference, Workspace};
+
+        assert!(super::validate_workspace_flags(
+            Workspace,
+            Some(Path::new("cache")),
+            &source_set_with_root()
+        )
+        .is_ok());
+        for preset in [Workspace, Reference, Recommended] {
+            assert!(
+                super::validate_workspace_flags(preset, None, &Default::default()).is_ok(),
+                "{preset:?} must accept an install without workspace flags"
+            );
+        }
     }
 
     fn serve_args(mode: McpServeMode, port: Option<u16>) -> McpServeArgs {

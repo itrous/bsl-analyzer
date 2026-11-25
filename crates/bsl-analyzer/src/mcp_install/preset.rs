@@ -53,6 +53,10 @@ fn build_workspace_spec(request: &InstallRequest, binary: &str) -> ServerSpec {
         normalize_source_dir_for_scope(request.scope, &request.project_dir, &request.source_dir),
     ];
 
+    // Right after the source dir: these decide where the workspace's data goes and what
+    // its source set is, so they are read together with the dir they qualify.
+    args.extend(request.workspace_args.iter().cloned());
+
     if let Some(url) = &request.onec_url {
         args.push("--onec-url".to_owned());
         args.push(url.clone());
@@ -124,6 +128,7 @@ mod tests {
             onec_password: "secret".to_owned(),
             env: BTreeMap::from([("NAPARNIK_TOKEN".to_owned(), "test".to_owned())]),
             enable_tools: Vec::new(),
+            workspace_args: Vec::new(),
             force: false,
             dry_run: false,
         }
@@ -158,6 +163,37 @@ mod tests {
         let spec = build_server_spec(&request(), "bsl-analyzer");
 
         assert!(spec.args.iter().all(|arg| arg != "--enable-tool"), "argv: {:?}", spec.args);
+    }
+
+    /// The fragments must sit right after the `--source-dir` pair and before the 1C flags:
+    /// a config that scattered them would still start, but reading it would no longer show
+    /// which workspace the server was shaped for.
+    #[test]
+    fn workspace_args_follow_the_source_dir_pair_and_precede_the_onec_flags() {
+        let mut request = request();
+        request.workspace_args = ["--cache-dir", "/abs/cache", "--configuration-root", "src/cf"]
+            .map(str::to_owned)
+            .to_vec();
+
+        let spec = build_server_spec(&request, "bsl-analyzer");
+
+        let source_dir = spec.args.iter().position(|arg| arg == "--source-dir").unwrap();
+        assert_eq!(spec.args[source_dir + 2..source_dir + 6], request.workspace_args[..]);
+        assert_eq!(spec.args[source_dir + 6], "--onec-url", "argv: {:?}", spec.args);
+    }
+
+    /// A reference server has no workspace: carrying the fragments would write a config
+    /// that `mcp serve` refuses to start from.
+    #[test]
+    fn reference_preset_ignores_workspace_args() {
+        let mut request = request();
+        request.preset = InstallPreset::Reference;
+        let without = build_server_spec(&request, "bsl-analyzer").args;
+        request.workspace_args = vec!["--cache-dir".to_owned(), "/abs/cache".to_owned()];
+
+        let with = build_server_spec(&request, "bsl-analyzer").args;
+
+        assert_eq!(with, without);
     }
 
     #[test]
