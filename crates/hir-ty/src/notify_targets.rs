@@ -121,6 +121,10 @@ pub struct SemanticNotifyFacts {
 /// marker so diagnostics stay conservative instead of reporting the partial data as
 /// complete.
 const NOTIFY_TARGET_WORK_BUDGET: usize = 131_072;
+const NOTIFY_TARGET_WORK_PER_BODY_ITEM: usize = 128;
+const NOTIFY_TARGET_BUDGET_SATURATION_SIZE: usize = 3_072;
+const NOTIFY_TARGET_MAX_WORK_BUDGET: usize = NOTIFY_TARGET_WORK_BUDGET
+    + NOTIFY_TARGET_WORK_PER_BODY_ITEM * NOTIFY_TARGET_BUDGET_SATURATION_SIZE;
 const NOTIFY_TARGET_CANCEL_INTERVAL: usize = 128;
 
 pub(crate) struct NotifyWorkBudget<'a> {
@@ -131,8 +135,34 @@ pub(crate) struct NotifyWorkBudget<'a> {
 }
 
 impl<'a> NotifyWorkBudget<'a> {
-    fn new(cancel: &'a mut dyn FnMut()) -> Self {
-        Self::with_limit(cancel, NOTIFY_TARGET_WORK_BUDGET)
+    fn for_module(cancel: &'a mut dyn FnMut(), bodies: &hir_def::ModuleBodies) -> Self {
+        let mut body_items = 0usize;
+        let mut since_cancel = 0usize;
+        for (_, body) in bodies.iter_bodies() {
+            body_items = body_items
+                .saturating_add(body_item_count(body))
+                .min(NOTIFY_TARGET_BUDGET_SATURATION_SIZE);
+            since_cancel += 1;
+            if since_cancel == NOTIFY_TARGET_CANCEL_INTERVAL {
+                since_cancel = 0;
+                cancel();
+            }
+            if body_items == NOTIFY_TARGET_BUDGET_SATURATION_SIZE {
+                break;
+            }
+        }
+        if body_items < NOTIFY_TARGET_BUDGET_SATURATION_SIZE {
+            if let Some(body) = bodies.module_code() {
+                body_items = body_items
+                    .saturating_add(body_item_count(body))
+                    .min(NOTIFY_TARGET_BUDGET_SATURATION_SIZE);
+                since_cancel += 1;
+            }
+        }
+        if since_cancel != 0 {
+            cancel();
+        }
+        Self::with_limit(cancel, notify_target_work_budget(body_items))
     }
 
     pub(crate) fn with_limit(cancel: &'a mut dyn FnMut(), limit: usize) -> Self {
@@ -161,6 +191,24 @@ impl<'a> NotifyWorkBudget<'a> {
     pub(crate) fn exhausted(&self) -> bool {
         self.exhausted
     }
+}
+
+/// Every body contributes at least one item, even when it has no expressions, statements,
+/// or bindings; the caller saturates the aggregate before it becomes an unbounded sizing pass.
+fn body_item_count(body: &Body) -> usize {
+    body.expr_count().saturating_add(body.stmt_count()).saturating_add(body.binding_count()).max(1)
+}
+
+/// Give larger modules a proportionally larger allowance while keeping the total
+/// semantic projection bounded, including for adversarially large bodies.
+fn notify_target_work_budget(body_items: usize) -> usize {
+    NOTIFY_TARGET_WORK_BUDGET
+        .saturating_add(
+            body_items
+                .min(NOTIFY_TARGET_BUDGET_SATURATION_SIZE)
+                .saturating_mul(NOTIFY_TARGET_WORK_PER_BODY_ITEM),
+        )
+        .min(NOTIFY_TARGET_MAX_WORK_BUDGET)
 }
 
 /// Budget cost of one comparison sort over `len` items: one unit per element per
@@ -325,9 +373,14 @@ pub fn semantic_notify_facts_query<'db>(
     db: &'db dyn HirDatabase,
     file_id_input: FileIdInput<'db>,
 ) -> Arc<SemanticNotifyFacts> {
+    let raw = hir_def::queries::module_call_summary_query(db, file_id_input);
+    if raw.notify_candidates.is_empty() {
+        return empty_notify_facts(&raw);
+    }
     let mut cancel = || db.unwind_if_revision_cancelled();
-    let mut budget = NotifyWorkBudget::new(&mut cancel);
-    semantic_notify_facts_with_budget(db, file_id_input, &mut budget)
+    let module_id = ModuleId::new(file_id_input.file_id(db));
+    let mut budget = NotifyWorkBudget::for_module(&mut cancel, db.module_bodies_ref(module_id));
+    semantic_notify_facts_with_budget(db, file_id_input, &raw, &mut budget)
 }
 
 /// Test hook: the same projection with an explicit work limit, so callers can
@@ -338,31 +391,35 @@ pub fn semantic_notify_facts_with_work_limit<'db>(
     file_id_input: FileIdInput<'db>,
     work_limit: usize,
 ) -> Arc<SemanticNotifyFacts> {
+    let raw = hir_def::queries::module_call_summary_query(db, file_id_input);
+    if raw.notify_candidates.is_empty() {
+        return empty_notify_facts(&raw);
+    }
     let mut cancel = || db.unwind_if_revision_cancelled();
     let mut budget = NotifyWorkBudget::with_limit(&mut cancel, work_limit);
-    semantic_notify_facts_with_budget(db, file_id_input, &mut budget)
+    semantic_notify_facts_with_budget(db, file_id_input, &raw, &mut budget)
+}
+
+fn empty_notify_facts(raw: &ModuleCallSummary) -> Arc<SemanticNotifyFacts> {
+    let mut summary = raw.clone();
+    summary.name_literal_ref_sites.clear();
+    // Without a constructor identity, syntax-only callback sites and gaps cannot be
+    // associated; unrelated module data must not create notify uncertainty.
+    Arc::new(SemanticNotifyFacts {
+        summary: Arc::new(summary),
+        notify_candidates: Arc::new(Vec::new()),
+    })
 }
 
 fn semantic_notify_facts_with_budget<'db>(
     db: &'db dyn HirDatabase,
     file_id_input: FileIdInput<'db>,
+    raw: &ModuleCallSummary,
     budget: &mut NotifyWorkBudget<'_>,
 ) -> Arc<SemanticNotifyFacts> {
     let file_id = file_id_input.file_id(db);
-    let raw = hir_def::queries::module_call_summary_query(db, file_id_input);
-    if raw.notify_candidates.is_empty() {
-        let mut summary = (*raw).clone();
-        summary.name_literal_ref_sites.clear();
-        // There is no constructor identity to associate with syntax-only callback sites or
-        // gaps. Do not turn exhausting a pass over unrelated module data into notify uncertainty.
-        return Arc::new(SemanticNotifyFacts {
-            summary: Arc::new(summary),
-            notify_candidates: Arc::new(Vec::new()),
-        });
-    }
-
     let module_id = ModuleId::new(file_id);
-    let mut summary = (*raw).clone();
+    let mut summary = raw.clone();
     let mut candidates = Vec::new();
     let mut notify_candidates = Vec::new();
     let mut reachable_dynamic_constructors: FxHashSet<(CallerId, ExprId)> = FxHashSet::default();
@@ -1658,6 +1715,40 @@ mod tests {
     }
 
     #[test]
+    fn production_work_budget_scales_with_body_size_and_has_a_hard_cap() {
+        let small = notify_target_work_budget(1);
+        let larger = notify_target_work_budget(2);
+        assert_eq!(small, NOTIFY_TARGET_WORK_BUDGET + NOTIFY_TARGET_WORK_PER_BODY_ITEM);
+        assert!(larger > small);
+        assert_eq!(notify_target_work_budget(usize::MAX), NOTIFY_TARGET_MAX_WORK_BUDGET);
+        assert_eq!(NOTIFY_TARGET_MAX_WORK_BUDGET, 524_288);
+    }
+
+    #[test]
+    fn empty_bodies_saturate_budget_sizing_early_with_cancellation_checks() {
+        let empty_bodies = NOTIFY_TARGET_BUDGET_SATURATION_SIZE + 1;
+        let source = (0..empty_bodies)
+            .map(|index| format!("Процедура Пустая{index}()\nКонецПроцедуры\n"))
+            .collect::<String>();
+        let parse = parser::parse(&source);
+        let bodies = hir_def::ModuleBodies::from_parse(&parse);
+        assert_eq!(bodies.len(), empty_bodies);
+        assert!(bodies
+            .iter_bodies()
+            .take(NOTIFY_TARGET_BUDGET_SATURATION_SIZE)
+            .all(|(_, body)| body_item_count(body) == 1));
+
+        let mut cancel_checks = 0;
+        let mut cancel = || cancel_checks += 1;
+        let budget = NotifyWorkBudget::for_module(&mut cancel, &bodies);
+        assert_eq!(budget.remaining, NOTIFY_TARGET_MAX_WORK_BUDGET);
+        assert_eq!(
+            cancel_checks,
+            NOTIFY_TARGET_BUDGET_SATURATION_SIZE / NOTIFY_TARGET_CANCEL_INTERVAL
+        );
+    }
+
+    #[test]
     fn work_budget_is_sticky_and_checks_cancellation_periodically() {
         let mut cancellations = 0;
         {
@@ -1691,7 +1782,7 @@ mod tests {
         let bodies = hir_def::ModuleBodies::from_parse(&parse);
         let body = bodies.iter_bodies().next().expect("fixture declares a method").1;
         let mut cancel = || {};
-        let mut budget = NotifyWorkBudget::new(&mut cancel);
+        let mut budget = NotifyWorkBudget::with_limit(&mut cancel, NOTIFY_TARGET_WORK_BUDGET);
         let index = enclosing_stmt_index(body, &mut budget).expect("the fixture fits the budget");
         for (expr_id, _) in body.exprs_iter() {
             assert_eq!(

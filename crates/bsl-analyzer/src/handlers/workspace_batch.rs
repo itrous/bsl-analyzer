@@ -465,13 +465,21 @@ fn compute_chunk(
         .filter(|_| crate::diagnostics_baseline::defers_scope_line_gate(baseline.0, true));
     let config = config.clone().with_defer_scope_line_gate(late_scope.is_some());
     let computed = match pool {
-        Some(pool) => analysis.workspace_diagnostics_parallel(chunk, config, pool),
-        None => analysis.workspace_diagnostics(chunk, config),
+        Some(pool) => analysis.workspace_diagnostics_result_parallel(chunk, config, pool),
+        None => analysis.workspace_diagnostics_result(chunk, config),
     };
     computed
         .into_iter()
-        .filter_map(|(file_id, diagnostics)| {
+        .filter_map(|(file_id, result)| {
             let uri = file_paths.url_for_file_id(file_id).ok()?;
+            if let Some(reason) = result.completeness.incomplete_reason() {
+                return Some(WorkspaceBatchItem {
+                    uri,
+                    result_id: String::new(),
+                    diagnostics: Vec::new(),
+                    incomplete_reason: Some(reason),
+                });
+            }
             let converted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let text = analysis.file_text(file_id);
                 let diagnostics = crate::diagnostics_baseline::active_for_publication(
@@ -479,7 +487,7 @@ fn compute_chunk(
                     baseline.1,
                     file_paths.path_for_file_id(file_id),
                     &text,
-                    diagnostics.to_vec(),
+                    result.diagnostics.clone(),
                     late_scope,
                 );
                 let result_id = crate::lsp::diagnostics_result_id(&diagnostics);
@@ -507,7 +515,7 @@ fn compute_chunk(
                     return None;
                 }
             };
-            Some(WorkspaceBatchItem { uri, result_id, diagnostics: lsp })
+            Some(WorkspaceBatchItem { uri, result_id, diagnostics: lsp, incomplete_reason: None })
         })
         .collect()
 }

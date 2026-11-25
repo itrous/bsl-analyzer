@@ -18,7 +18,8 @@ use hir_def::hir::{Expr, ExprIdx, Literal, Stmt, StmtIdx};
 use hir_def::Name;
 use intern::NormName;
 use rustc_hash::{FxHashMap, FxHashSet};
-use stdx::case::eq_ignore_case;
+use smol_str::SmolStr;
+use stdx::case::{eq_ignore_case, CaseExt};
 
 use crate::call_resolution::{
     CallParamMode, CallRejection, CallSelection, CandidateApplicability, CandidateDisposition,
@@ -113,12 +114,13 @@ pub(crate) fn collect_notify_array_registrations(
 
 /// Budgeted collection entry point.
 ///
-/// Every index entry, statement visit, statement × tracked-variable pair, constructor visit and
-/// handler visit spends from `budget`, so the shared cancellation callback runs periodically while
-/// the pass works. Exhaustion is a hard stop: the returned vector holds only the registrations
-/// proven before it and can therefore be partial. It is a final answer solely while
-/// `NotifyWorkBudget::exhausted` is false; a caller that observes exhaustion must treat the
-/// owner's notification facts as incomplete instead of publishing these registrations as complete.
+/// Every index entry, statement visit, write scan (one pass over the write events the statement
+/// makes), constructor visit and handler visit spends from `budget`, so the shared cancellation
+/// callback runs periodically while the pass works. Exhaustion is a hard stop: the returned
+/// vector holds only the registrations proven before it and can therefore be partial. It is a
+/// final answer solely while `NotifyWorkBudget::exhausted` is false; a caller that observes
+/// exhaustion must treat the owner's notification facts as incomplete instead of publishing
+/// these registrations as complete.
 pub(crate) fn collect_notify_array_registrations_with_budget(
     db: &dyn TypeKernelDb,
     body: &Body,
@@ -135,8 +137,10 @@ pub(crate) fn collect_notify_array_registrations_with_budget(
         return Vec::new();
     };
 
-    let Some(name_spellings) = local_name_spellings(body, budget) else { return Vec::new() };
     let Some(local_declarations) = unique_local_declarations(body, budget) else {
+        return Vec::new();
+    };
+    let Some(folded_tracked) = folded_tracked_names(body, &local_declarations, budget) else {
         return Vec::new();
     };
     let mut states: FxHashMap<NormName, ArrayState> = FxHashMap::default();
@@ -201,7 +205,7 @@ pub(crate) fn collect_notify_array_registrations_with_budget(
                         states.insert(key, state);
                         if !invalidate_possible_writes(
                             &mut states,
-                            &name_spellings,
+                            &folded_tracked,
                             reaching_defs,
                             stmt_id,
                             budget,
@@ -264,7 +268,7 @@ pub(crate) fn collect_notify_array_registrations_with_budget(
                 }
                 if !invalidate_possible_writes(
                     &mut states,
-                    &name_spellings,
+                    &folded_tracked,
                     reaching_defs,
                     stmt_id,
                     budget,
@@ -316,7 +320,7 @@ pub(crate) fn collect_notify_array_registrations_with_budget(
                 }
                 if !invalidate_possible_writes(
                     &mut states,
-                    &name_spellings,
+                    &folded_tracked,
                     reaching_defs,
                     stmt_id,
                     budget,
@@ -383,7 +387,7 @@ pub(crate) fn collect_notify_array_registrations_with_budget(
                 }
                 if !invalidate_possible_writes(
                     &mut states,
-                    &name_spellings,
+                    &folded_tracked,
                     reaching_defs,
                     stmt_id,
                     budget,
@@ -405,7 +409,7 @@ pub(crate) fn collect_notify_array_registrations_with_budget(
         ) {
             return registrations;
         }
-        if !invalidate_possible_writes(&mut states, &name_spellings, reaching_defs, stmt_id, budget)
+        if !invalidate_possible_writes(&mut states, &folded_tracked, reaching_defs, stmt_id, budget)
         {
             return registrations;
         }
@@ -414,45 +418,49 @@ pub(crate) fn collect_notify_array_registrations_with_budget(
     registrations
 }
 
+/// Opens every tracked array that a write event of this statement may rebind.
+///
+/// One pass over the writes the point makes replaces the old query-per-tracked-name scan: the
+/// cost follows the statement's write events, not the tracked-local count. Written names match
+/// by their folded key ([`Definition::var_name`]) against the folded spellings of the tracked
+/// locals.
 fn invalidate_possible_writes(
     states: &mut FxHashMap<NormName, ArrayState>,
-    name_spellings: &FxHashMap<NormName, Vec<Name>>,
+    folded_tracked: &FxHashMap<SmolStr, Vec<NormName>>,
     reaching_defs: &dataflow::reaching_defs::ReachingDefsResult,
     stmt: cfg_types::StmtId,
     budget: &mut NotifyWorkBudget<'_>,
 ) -> bool {
-    for (name, state) in states {
+    for def in reaching_defs.writes_at_point(EvalPoint::Stmt(stmt)) {
         if !budget.spend() {
             return false;
         }
-        if !matches!(state, ArrayState::Known(_)) {
-            continue;
-        }
-        if let Some(spellings) = name_spellings.get(name) {
-            for spelling in spellings {
-                if !budget.spend() {
-                    return false;
-                }
-                if !reaching_defs
-                    .possible_writes_at(EvalPoint::Stmt(stmt), spelling.as_str())
-                    .is_empty()
-                {
-                    *state = ArrayState::Unknown;
-                    break;
-                }
+        let Some(names) = folded_tracked.get(&def.var_name) else { continue };
+        for name in names {
+            if !budget.spend() {
+                return false;
+            }
+            if matches!(states.get(name), Some(ArrayState::Known(_))) {
+                states.insert(*name, ArrayState::Unknown);
             }
         }
     }
     true
 }
 
-fn local_name_spellings(
+/// Folded spellings of the tracked locals: the keys that written names match against.
+///
+/// Each spelling contributes its own folded key because `fold_lower` applies contextual
+/// mappings (final sigma): `eq_ignore_case`-equal spellings can fold differently, and the
+/// written side folds each written spelling the same way.
+fn folded_tracked_names(
     body: &Body,
+    tracked: &FxHashMap<NormName, (usize, Name)>,
     budget: &mut NotifyWorkBudget<'_>,
-) -> Option<FxHashMap<NormName, Vec<Name>>> {
-    let mut spellings: FxHashMap<NormName, Vec<Name>> = FxHashMap::default();
+) -> Option<FxHashMap<SmolStr, Vec<NormName>>> {
+    let mut folded: FxHashMap<SmolStr, Vec<NormName>> = FxHashMap::default();
     for (_, binding) in body.bindings_iter() {
-        if !budget.spend() || !add_local_spelling(&mut spellings, &binding.name, budget) {
+        if !budget.spend() || !add_folded_spelling(&mut folded, tracked, &binding.name) {
             return None;
         }
     }
@@ -461,29 +469,28 @@ fn local_name_spellings(
             return None;
         }
         if let Expr::Path(name) = expr {
-            if !add_local_spelling(&mut spellings, name, budget) {
+            if !add_folded_spelling(&mut folded, tracked, name) {
                 return None;
             }
         }
     }
-    Some(spellings)
+    Some(folded)
 }
 
-fn add_local_spelling(
-    spellings: &mut FxHashMap<NormName, Vec<Name>>,
+fn add_folded_spelling(
+    folded: &mut FxHashMap<SmolStr, Vec<NormName>>,
+    tracked: &FxHashMap<NormName, (usize, Name)>,
     name: &Name,
-    budget: &mut NotifyWorkBudget<'_>,
 ) -> bool {
-    let names = spellings.entry(NormName::intern(name.as_str())).or_default();
-    for existing in names.iter() {
-        if !budget.spend() {
-            return false;
-        }
-        if existing == name {
-            return true;
-        }
+    let normalized = NormName::intern(name.as_str());
+    if !tracked.contains_key(&normalized) {
+        return true;
     }
-    names.push(name.clone());
+    let key = SmolStr::new(name.as_str().fold_lower());
+    let names = folded.entry(key).or_default();
+    if !names.contains(&normalized) {
+        names.push(normalized);
+    }
     true
 }
 
@@ -1232,27 +1239,34 @@ mod tests {
     }
 
     #[test]
-    fn tracked_arrays_times_statements_spend_the_shared_budget() {
-        let source = tracked_array_body(32, 32);
+    fn wide_tracked_variable_sets_do_not_multiply_the_statement_scan() {
+        let wide = tracked_array_body(16, 64);
 
         assert!(
-            budgeted_collection_exhausts(&source, 2_000),
-            "the body-by-tracked-array scan must stop at its shared budget"
+            !budgeted_collection_exhausts(&wide, 2_000),
+            "the write scan must follow a statement's write events, not the tracked-variable count"
         );
     }
 
     #[test]
-    fn tracked_array_scan_charges_each_statement_times_variable_pair() {
-        let narrow = tracked_array_body(16, 2);
-        let wide = tracked_array_body(16, 64);
+    fn statement_writes_charge_the_scan_per_written_name() {
+        // Each `Выполнить` makes a possible write for every name of the body, so the
+        // scan charges per written name even though no array is ever read here.
+        let mut source = String::from("Процедура Test()\n");
+        for index in 0..64 {
+            source.push_str(&format!("    Перем A{index};\n"));
+        }
+        for index in 0..64 {
+            source.push_str(&format!("    A{index} = Новый Массив;\n"));
+        }
+        for _ in 0..32 {
+            source.push_str("    Выполнить(\"А = 1\");\n");
+        }
+        source.push_str("КонецПроцедуры\n");
 
         assert!(
-            !budgeted_collection_exhausts(&narrow, 2_000),
-            "two tracked arrays must stay within the budget"
-        );
-        assert!(
-            budgeted_collection_exhausts(&wide, 2_000),
-            "the same statements over sixty-four tracked arrays must exhaust it"
+            budgeted_collection_exhausts(&source, 2_000),
+            "implicit writes must still spend from the shared budget"
         );
     }
 
@@ -1268,15 +1282,15 @@ mod tests {
     Оповещение = Новый("CallbackDescription", Параметры);
 "#,
         );
-        for index in 0..64 {
+        for index in 0..128 {
             source.push_str(&format!("    Перем A{index};\n"));
         }
-        for index in 0..64 {
+        for index in 0..128 {
             source.push_str(&format!("    A{index} = Новый Массив;\n"));
         }
         source.push_str("КонецПроцедуры\n");
 
-        let (registrations, exhausted) = collection_under_budget(&source, 1_200, &mut || {});
+        let (registrations, exhausted) = collection_under_budget(&source, 1_500, &mut || {});
         assert!(exhausted, "the tail must exhaust the budget");
         assert_eq!(registrations.len(), 1, "the head proof must survive the later stop");
         assert_eq!(registrations[0].handlers.len(), 1);
@@ -1523,6 +1537,49 @@ EndProcedure
     ΟΣ.Добавить(ЭтотОбъект);
     Выполнить("ОС = Новый Массив");
     О = Новый("CallbackDescription", ΟΣ);
+КонецПроцедуры
+"#;
+
+        assert!(registrations(source).is_empty());
+    }
+
+    #[test]
+    fn one_execute_opens_every_array_it_may_write() {
+        // The literal names no array syntactically, yet the write events of one `Выполнить`
+        // cover both tracked arrays: the point scan must open each of them.
+        let source = r#"
+Процедура Test()
+    Перем П1;
+    Перем П2;
+    П1 = Новый Массив;
+    П1.Добавить("Первый");
+    П1.Добавить(ЭтотОбъект);
+    П2 = Новый Массив;
+    П2.Добавить("Второй");
+    П2.Добавить(ЭтотОбъект);
+    Выполнить("П1 = Неопределено");
+    О1 = Новый("CallbackDescription", П1);
+    О2 = Новый("CallbackDescription", П2);
+КонецПроцедуры
+"#;
+
+        assert!(registrations(source).is_empty());
+    }
+
+    #[test]
+    fn an_argument_write_hidden_in_an_add_argument_opens_that_array() {
+        // `П1.Добавить(Изменить(П2))`: П2 is part of the Add argument, hidden from the
+        // syntactic use scan, so only its write event at this point can open it.
+        let source = r#"
+Процедура Test()
+    Перем П1;
+    Перем П2;
+    П1 = Новый Массив;
+    П2 = Новый Массив;
+    П2.Добавить("Второй");
+    П2.Добавить(ЭтотОбъект);
+    П1.Добавить(Изменить(П2));
+    О2 = Новый("CallbackDescription", П2);
 КонецПроцедуры
 "#;
 

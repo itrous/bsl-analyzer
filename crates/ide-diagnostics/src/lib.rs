@@ -10,6 +10,7 @@ mod hir_inference_dispatch;
 mod metadata;
 mod metadata_dispatch;
 mod query;
+mod result;
 mod runner;
 mod scope_gate;
 mod single_pass;
@@ -37,9 +38,10 @@ pub use metadata::{
     DiagnosticSeverityLevel, DiagnosticType, Impact, ImpactSeverity, MetadataTag, SoftwareQuality,
 };
 pub use query::{
-    file_diagnostics_query, method_diagnostics_query, method_line_diagnostics_query,
-    module_code_diagnostics_query, set_diagnostics_lru_sweep_mode,
+    file_diagnostics_query, file_diagnostics_result_query, method_diagnostics_query,
+    method_line_diagnostics_query, module_code_diagnostics_query, set_diagnostics_lru_sweep_mode,
 };
+pub use result::{DiagnosticsCompleteness, DiagnosticsIncompleteReason, DiagnosticsResult};
 pub use scope_gate::diagnostic_in_scope;
 pub use slab::slab_verify_mismatches;
 pub use standalone_query::{sdbl_query_codes, validate_query_text, METADATA_DEPENDENT_CODES};
@@ -190,9 +192,31 @@ pub fn file_diagnostics(
     file_id: vfs::FileId,
     config: &DiagnosticsConfig,
 ) -> Vec<Diagnostic> {
+    file_diagnostics_result(db, file_id, config).diagnostics
+}
+
+/// Compute finalized diagnostics with an explicit completeness status.
+pub fn file_diagnostics_result(
+    db: &dyn ide_db::RootDatabase,
+    file_id: vfs::FileId,
+    config: &DiagnosticsConfig,
+) -> DiagnosticsResult {
     use base_db::{DiagnosticsConfigId, FileIdInput};
     let config_id = DiagnosticsConfigId::new(db, config.to_input());
-    file_diagnostics_query(db, FileIdInput::new(db, file_id), config_id).as_ref().clone()
+    file_diagnostics_result_query(db, FileIdInput::new(db, file_id), config_id).as_ref().clone()
+}
+
+/// Completeness for a diagnostics pass assembled by a caller with its own provider.
+/// The semantic projection is not queried when its owning rule is disabled.
+pub fn diagnostics_completeness(
+    db: &dyn ide_db::RootDatabase,
+    file_id: vfs::FileId,
+    config: &DiagnosticsConfig,
+) -> DiagnosticsCompleteness {
+    let input = base_db::FileIdInput::new(db, file_id);
+    crate::result::notify_projection_completeness(config, || {
+        hir::semantic_module_call_summary_query(db, input).notify_projection_incomplete
+    })
 }
 
 /// Augment a file's already-computed standalone diagnostics with the configuration-extension

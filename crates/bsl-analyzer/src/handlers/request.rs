@@ -24,6 +24,7 @@ use lsp_types::{
 };
 use rustc_hash::FxHashMap;
 use salsa::Database as _;
+use std::fmt;
 use vfs::FileId;
 
 use crate::call_hierarchy_index_state::{
@@ -34,6 +35,30 @@ use crate::global_state::{GlobalStateSnapshot, Task};
 
 const CALL_HIERARCHY_CANCELLATION_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(10);
+
+#[derive(Debug)]
+pub(crate) struct IncompleteDiagnosticsError(ide::DiagnosticsIncompleteReason);
+
+impl IncompleteDiagnosticsError {
+    pub(crate) fn new(reason: ide::DiagnosticsIncompleteReason) -> Self {
+        Self(reason)
+    }
+}
+
+impl fmt::Display for IncompleteDiagnosticsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "diagnostics are incomplete: {:?}", self.0)
+    }
+}
+
+impl std::error::Error for IncompleteDiagnosticsError {}
+
+fn require_complete_diagnostics(result: &ide::DiagnosticsResult) -> Result<()> {
+    if let Some(reason) = result.completeness.incomplete_reason() {
+        return Err(anyhow::Error::new(IncompleteDiagnosticsError::new(reason)));
+    }
+    Ok(())
+}
 
 pub fn handle_goto_definition(
     ctx: &LatencyRequestContext,
@@ -1561,7 +1586,9 @@ pub fn handle_document_diagnostic(
             && crate::diagnostics_baseline::defers_scope_line_gate(&ctx.diagnostics_baseline, true)
     });
     config.defer_scope_line_gate = late_scope.is_some();
-    let ide_diagnostics = ctx.analysis.file_diagnostics_cached(file_id, config);
+    let result = ctx.analysis.file_diagnostics_result_cached(file_id, config);
+    require_complete_diagnostics(&result)?;
+    let ide_diagnostics = &result.diagnostics;
     let text = match ctx.mem_docs.get(&uri) {
         Some(doc) => std::borrow::Cow::Borrowed(doc.text()),
         None => std::borrow::Cow::Owned(ctx.analysis.file_text(file_id).to_string()),
@@ -1831,25 +1858,37 @@ pub fn handle_workspace_diagnostic(
     let mut done = 0usize;
     for chunk in file_ids.chunks(CHUNK) {
         let computed = if dirty_ids.is_empty() {
-            ctx.analysis.workspace_diagnostics(chunk, scoped_config.clone())
+            ctx.analysis.workspace_diagnostics_result(chunk, scoped_config.clone())
         } else {
             // Dirty buffers analyze without the scope (their disk hunks are
             // stale); everything else keeps the filtered config.
             let (dirty, clean): (Vec<vfs::FileId>, Vec<vfs::FileId>) =
                 chunk.iter().copied().partition(|file_id| dirty_ids.contains(file_id));
-            let mut computed = ctx.analysis.workspace_diagnostics(&clean, scoped_config.clone());
+            let mut computed =
+                ctx.analysis.workspace_diagnostics_result(&clean, scoped_config.clone());
             let mut unscoped = ctx.diagnostics_config.clone();
             unscoped.scope = None;
-            computed.extend(ctx.analysis.workspace_diagnostics(&dirty, unscoped));
+            computed.extend(ctx.analysis.workspace_diagnostics_result(&dirty, unscoped));
             computed
         };
+        if let Some((_, result)) =
+            computed.iter().find(|(_, result)| result.completeness.incomplete_reason().is_some())
+        {
+            require_complete_diagnostics(result)?;
+        }
         let chunk_items: Vec<_> = computed
             .into_iter()
-            .filter_map(|(file_id, diagnostics)| {
+            .filter_map(|(file_id, result)| {
                 // Each file is projected through the scope it was computed under: a dirty
                 // one has none, so the shared scope must not reach it here either.
                 let late_scope = late_scope.filter(|_| !dirty_ids.contains(&file_id));
-                workspace_report_item(ctx, file_id, diagnostics.to_vec(), &previous, late_scope)
+                workspace_report_item(
+                    ctx,
+                    file_id,
+                    result.diagnostics.clone(),
+                    &previous,
+                    late_scope,
+                )
             })
             .collect();
         done += chunk.len();

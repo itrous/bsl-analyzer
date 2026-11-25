@@ -211,6 +211,7 @@ pub struct CoverageProof {
     pub total: usize,
     pub analyzed: usize,
     pub failed: bool,
+    pub incomplete: bool,
     pub unreadable: bool,
     pub cancelled: bool,
     pub truncated: bool,
@@ -225,6 +226,7 @@ impl CoverageProof {
     pub fn require_full(&self) -> Result<(), String> {
         let full = self.analyzed == self.total
             && !self.failed
+            && !self.incomplete
             && !self.unreadable
             && !self.cancelled
             && !self.truncated
@@ -247,8 +249,14 @@ fn analysis_is_full(
     selected_diagnostic: bool,
     author_filter: bool,
     has_errors: bool,
+    has_incomplete_files: bool,
 ) -> bool {
-    !scope_active && !incremental && !selected_diagnostic && !author_filter && !has_errors
+    !scope_active
+        && !incremental
+        && !selected_diagnostic
+        && !author_filter
+        && !has_errors
+        && !has_incomplete_files
 }
 
 /// Build the author filter from the CLI list (which replaces the config list,
@@ -715,6 +723,7 @@ fn analyze_salsa(
         Option<FileMetrics>,
         Option<String>,
         Option<Vec<bool>>,
+        Option<ide::DiagnosticsCompleteness>,
     );
     let mut results: Vec<FileResult> = Vec::with_capacity(file_ids.len());
     let report_mem = std::env::var_os("BSL_MEM_REPORT").is_some();
@@ -807,9 +816,12 @@ fn analyze_salsa(
                         Err(e) => {
                             let message = panic_message(e.as_ref());
                             tracing::error!("Panic analyzing {:?}: {}", path, message);
-                            return (None, None, None, Some(message), None);
+                            return (None, None, None, Some(message), None, None);
                         }
                     };
+
+                    let completeness =
+                        ide::diagnostics_completeness(db_snapshot, *file_id, &config);
 
                     // Read the already-memoised complexity for the JSONL `metrics`
                     // field: when the complexity diagnostics are enabled they have
@@ -869,6 +881,7 @@ fn analyze_salsa(
                                         "failed to read file for diagnostic conversion: {e}"
                                     )),
                                     None,
+                                    Some(completeness),
                                 );
                             }
                         };
@@ -948,7 +961,7 @@ fn analyze_salsa(
                         (None, None)
                     };
 
-                    (file_analysis, timing, metrics, None, scope_mask)
+                    (file_analysis, timing, metrics, None, scope_mask, Some(completeness))
                 })
                 .collect()
         };
@@ -1025,7 +1038,8 @@ fn analyze_salsa(
     let mut metrics_list: Vec<Option<FileMetrics>> = Vec::with_capacity(results.len());
     let mut errors_list: Vec<Option<String>> = Vec::with_capacity(results.len());
     let mut scope_masks: Vec<Option<Vec<bool>>> = Vec::with_capacity(results.len());
-    for (analysis, timing, metrics, error, scope_mask) in results {
+    let mut completeness_list = Vec::with_capacity(results.len());
+    for (analysis, timing, metrics, error, scope_mask, completeness) in results {
         file_analyses.push(analysis);
         if let Some(timing) = timing {
             all_timings.push(timing);
@@ -1033,6 +1047,25 @@ fn analyze_salsa(
         metrics_list.push(metrics);
         errors_list.push(error);
         scope_masks.push(scope_mask);
+        completeness_list.push(completeness);
+    }
+
+    let incomplete_files: Vec<_> = file_ids
+        .iter()
+        .zip(&completeness_list)
+        .filter_map(|((_, path), completeness)| {
+            completeness
+                .as_ref()
+                .and_then(|completeness| completeness.incomplete_reason())
+                .map(|reason| (path.display().to_string(), reason))
+        })
+        .collect();
+    if !jsonl {
+        for (path, reason) in &incomplete_files {
+            eprintln!(
+                "warning: diagnostics for {path} are incomplete ({reason:?}); findings may be partial"
+            );
+        }
     }
 
     let baseline_summary = if baseline_command.is_none() {
@@ -1043,6 +1076,7 @@ fn analyze_salsa(
             only_diagnostic.is_some(),
             author_filter.is_some(),
             errors_list.iter().any(Option::is_some),
+            !incomplete_files.is_empty(),
         );
         let coverage = if full {
             ide::diagnostics_baseline::DiagnosticsBaselineCoverage::Full
@@ -1053,9 +1087,14 @@ fn analyze_salsa(
                 } else {
                     file_ids
                         .iter()
-                        .zip(&errors_list)
-                        .filter(|(_, error)| error.is_none())
-                        .filter_map(|((_, path), _)| path.strip_prefix(&source_dir).ok())
+                        .enumerate()
+                        .filter(|(index, _)| {
+                            errors_list[*index].is_none()
+                                && completeness_list[*index]
+                                    .as_ref()
+                                    .is_none_or(|result| result.incomplete_reason().is_none())
+                        })
+                        .filter_map(|(_, (_, path))| path.strip_prefix(&source_dir).ok())
                         .map(|path| path.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"))
                         .collect()
                 };
@@ -1190,12 +1229,14 @@ fn analyze_salsa(
                 diagnostics,
                 metrics_list[i].clone(),
                 error,
-            );
+            )
+            .with_completeness(completeness_list[i]);
             println!("{}", serde_json::to_string(&file_event)?);
         }
 
         let done_event =
             DoneEvent::new(elapsed.as_secs_f64(), file_ids.len(), total_diagnostics, failed_files)
+                .with_incomplete_files(incomplete_files.len())
                 .with_baseline(baseline_summary.clone().unwrap_or_else(
                     ide::diagnostics_baseline::DiagnosticsBaselineSummary::disabled,
                 ));
@@ -1203,6 +1244,13 @@ fn analyze_salsa(
 
         if let Some(message) = author_fatal_msg {
             return Err(message.into());
+        }
+        if !incomplete_files.is_empty() {
+            return Err(format!(
+                "diagnostics incomplete for {} file(s); see each file event's completeness field",
+                incomplete_files.len()
+            )
+            .into());
         }
         tracing::info!("JSONL analysis complete");
         return Ok(());
@@ -1220,6 +1268,7 @@ fn analyze_salsa(
             total: all_file_ids.len(),
             analyzed: file_ids.len(),
             failed: errors_list.iter().any(Option::is_some),
+            incomplete: !incomplete_files.is_empty(),
             unreadable: false,
             cancelled: false,
             truncated: false,
@@ -1286,6 +1335,13 @@ fn analyze_salsa(
 
     tracing::info!("Analysis complete");
 
+    if !incomplete_files.is_empty() {
+        return Err(format!(
+            "diagnostics incomplete for {} file(s); report contains partial findings",
+            incomplete_files.len()
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -1326,6 +1382,7 @@ mod analyze_walk_tests {
         }
         denied!(
             failed,
+            incomplete,
             unreadable,
             cancelled,
             truncated,
@@ -1340,15 +1397,16 @@ mod analyze_walk_tests {
 
     #[test]
     fn analyze_baseline_partial_scope_marks_every_cli_filter() {
-        assert!(analysis_is_full(false, false, false, false, false));
+        assert!(analysis_is_full(false, false, false, false, false, false));
         for inputs in [
-            (true, false, false, false, false),
-            (false, true, false, false, false),
-            (false, false, true, false, false),
-            (false, false, false, true, false),
-            (false, false, false, false, true),
+            (true, false, false, false, false, false),
+            (false, true, false, false, false, false),
+            (false, false, true, false, false, false),
+            (false, false, false, true, false, false),
+            (false, false, false, false, true, false),
+            (false, false, false, false, false, true),
         ] {
-            assert!(!analysis_is_full(inputs.0, inputs.1, inputs.2, inputs.3, inputs.4));
+            assert!(!analysis_is_full(inputs.0, inputs.1, inputs.2, inputs.3, inputs.4, inputs.5));
         }
     }
 

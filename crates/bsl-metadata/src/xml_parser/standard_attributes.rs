@@ -26,6 +26,13 @@ pub(crate) struct MdoProperties {
     pub check_unique: bool,
     pub code_series: Option<String>,
     pub dependence_on_calculation_types: Option<String>,
+    explicit_hierarchical: Option<bool>,
+    hierarchical_explicitly_supplied: bool,
+    code_length_explicitly_supplied: bool,
+    description_length_explicitly_supplied: bool,
+    number_length_explicitly_supplied: bool,
+    owners_explicitly_supplied: bool,
+    owners_explicitly_empty: bool,
     pub object_belonging: ObjectBelonging,
     pub extended_configuration_object: Option<Uuid>,
 }
@@ -33,11 +40,26 @@ pub(crate) struct MdoProperties {
 impl MdoProperties {
     pub(crate) fn from_node(props_node: roxmltree::Node<'_, '_>) -> Self {
         let name = child_text(props_node, "Name").unwrap_or("").to_string();
+        let code_length_explicitly_supplied = find_child(props_node, "CodeLength").is_some();
         let code_length = child_u32(props_node, "CodeLength");
         let code_type = child_text(props_node, "CodeType").map(|s| s.to_string());
+        let number_length_explicitly_supplied = find_child(props_node, "NumberLength").is_some();
         let number_length = child_u32(props_node, "NumberLength");
         let number_type = child_text(props_node, "NumberType").map(|s| s.to_string());
+        let description_length_explicitly_supplied =
+            find_child(props_node, "DescriptionLength").is_some();
         let description_length = child_u32(props_node, "DescriptionLength");
+        let hierarchical_explicitly_supplied = find_child(props_node, "Hierarchical").is_some();
+        let hierarchical_raw = child_text(props_node, "Hierarchical");
+        let explicit_hierarchical = hierarchical_raw.and_then(|value| {
+            if value.eq_ignore_ascii_case("true") {
+                Some(true)
+            } else if value.eq_ignore_ascii_case("false") {
+                Some(false)
+            } else {
+                None
+            }
+        });
         let hierarchical = child_bool(props_node, "Hierarchical");
         let check_unique = child_bool(props_node, "CheckUnique");
         let periodicity =
@@ -48,7 +70,14 @@ impl MdoProperties {
         let (object_belonging, extended_configuration_object) =
             parse_extension_ownership(props_node);
 
-        let owners = find_child(props_node, "Owners")
+        let owners_node = find_child(props_node, "Owners");
+        let owners_explicitly_supplied = owners_node.is_some();
+        let owners_explicitly_empty = owners_node.is_some_and(|node| {
+            node.children().all(|child| {
+                !child.is_element() && child.text().map_or(true, |text| text.trim().is_empty())
+            })
+        });
+        let owners = owners_node
             .map(|owners_node| {
                 owners_node
                     .children()
@@ -72,6 +101,13 @@ impl MdoProperties {
             check_unique,
             code_series,
             dependence_on_calculation_types,
+            explicit_hierarchical,
+            hierarchical_explicitly_supplied,
+            code_length_explicitly_supplied,
+            description_length_explicitly_supplied,
+            number_length_explicitly_supplied,
+            owners_explicitly_supplied,
+            owners_explicitly_empty,
             object_belonging,
             extended_configuration_object,
         }
@@ -82,6 +118,65 @@ impl MdoProperties {
     /// standard attribute — unless its dependency is `DontUse` (НеЗависит).
     pub(crate) fn depends_on_calculation_types(&self) -> bool {
         self.dependence_on_calculation_types.as_deref().is_some_and(|dep| dep != "DontUse")
+    }
+
+    pub(crate) fn unknown_conditional_attributes(&self, template: MdoTemplateKind) -> Vec<String> {
+        standard_attributes_for(template, ObjectView::Object)
+            .iter()
+            .filter_map(|spec| {
+                let malformed = match spec.condition {
+                    PresenceCondition::Always => false,
+                    PresenceCondition::HasCode => {
+                        self.code_length_explicitly_supplied && self.code_length.is_none()
+                    }
+                    PresenceCondition::HasDescription => {
+                        self.description_length_explicitly_supplied
+                            && self.description_length.is_none()
+                    }
+                    PresenceCondition::HasNumber => {
+                        self.number_length_explicitly_supplied && self.number_length.is_none()
+                    }
+                    PresenceCondition::Hierarchical => {
+                        self.hierarchical_explicitly_supplied
+                            && self.explicit_hierarchical.is_none()
+                    }
+                    PresenceCondition::HasOwners => {
+                        self.owners_explicitly_supplied
+                            && !self.owners_explicitly_empty
+                            && self.owners.is_empty()
+                    }
+                    PresenceCondition::IsPeriodic
+                    | PresenceCondition::DependsOnCalculationTypes => false,
+                };
+                malformed.then(|| spec.kind.russian_name().to_string())
+            })
+            .collect()
+    }
+
+    pub(crate) fn known_absent_conditional_attributes(
+        &self,
+        template: MdoTemplateKind,
+    ) -> Vec<String> {
+        standard_attributes_for(template, ObjectView::Object)
+            .iter()
+            .filter_map(|spec| {
+                let refuted = match spec.condition {
+                    PresenceCondition::Always => false,
+                    PresenceCondition::HasCode => self.code_length == Some(0),
+                    PresenceCondition::HasDescription => self.description_length == Some(0),
+                    PresenceCondition::HasNumber => self.number_length == Some(0),
+                    PresenceCondition::Hierarchical => self.explicit_hierarchical == Some(false),
+                    PresenceCondition::HasOwners => self.owners_explicitly_empty,
+                    PresenceCondition::IsPeriodic => {
+                        self.periodicity.as_deref() == Some("Nonperiodical")
+                    }
+                    PresenceCondition::DependsOnCalculationTypes => {
+                        self.dependence_on_calculation_types.as_deref() == Some("DontUse")
+                    }
+                };
+                refuted.then(|| spec.kind.russian_name().to_string())
+            })
+            .collect()
     }
 }
 
@@ -158,7 +253,7 @@ fn build_attribute(spec: &StandardAttrSpec, p: &MdoProperties, mdo_type: MdoType
     }
 }
 
-fn add_standard_attributes_from_spec(
+pub(crate) fn add_standard_attributes_from_spec(
     attributes: &mut Vec<Attribute>,
     properties: &MdoProperties,
     mdo_type: MdoType,
@@ -234,147 +329,6 @@ pub(crate) fn add_accumulation_register_standard_attrs(
 ) {
     add_register_common_attrs(attributes, object_name, MdoType::AccumulationRegister);
     add_register_period_attr(attributes, object_name, MdoType::AccumulationRegister, None);
-}
-
-pub(crate) fn add_catalog_standard_attributes(
-    attributes: &mut Vec<Attribute>,
-    properties: &MdoProperties,
-    mdo_type: MdoType,
-) {
-    add_standard_attributes_from_spec(
-        attributes,
-        properties,
-        mdo_type,
-        MdoTemplateKind::Catalog,
-        ObjectView::Object,
-    );
-}
-
-pub(crate) fn add_document_standard_attributes(
-    attributes: &mut Vec<Attribute>,
-    properties: &MdoProperties,
-    mdo_type: MdoType,
-) {
-    add_standard_attributes_from_spec(
-        attributes,
-        properties,
-        mdo_type,
-        MdoTemplateKind::Document,
-        ObjectView::Object,
-    );
-}
-
-pub(crate) fn add_business_process_standard_attributes(
-    attributes: &mut Vec<Attribute>,
-    properties: &MdoProperties,
-    mdo_type: MdoType,
-) {
-    add_standard_attributes_from_spec(
-        attributes,
-        properties,
-        mdo_type,
-        MdoTemplateKind::BusinessProcess,
-        ObjectView::Object,
-    );
-}
-
-pub(crate) fn add_task_standard_attributes(
-    attributes: &mut Vec<Attribute>,
-    properties: &MdoProperties,
-    mdo_type: MdoType,
-) {
-    add_standard_attributes_from_spec(
-        attributes,
-        properties,
-        mdo_type,
-        MdoTemplateKind::Task,
-        ObjectView::Object,
-    );
-}
-
-pub(crate) fn add_exchange_plan_standard_attributes(
-    attributes: &mut Vec<Attribute>,
-    properties: &MdoProperties,
-    mdo_type: MdoType,
-) {
-    add_standard_attributes_from_spec(
-        attributes,
-        properties,
-        mdo_type,
-        MdoTemplateKind::ExchangePlan,
-        ObjectView::Object,
-    );
-}
-
-pub(crate) fn add_chart_of_characteristic_types_standard_attributes(
-    attributes: &mut Vec<Attribute>,
-    properties: &MdoProperties,
-    mdo_type: MdoType,
-) {
-    add_standard_attributes_from_spec(
-        attributes,
-        properties,
-        mdo_type,
-        MdoTemplateKind::ChartOfCharacteristicTypes,
-        ObjectView::Object,
-    );
-}
-
-pub(crate) fn add_chart_of_calculation_types_standard_attributes(
-    attributes: &mut Vec<Attribute>,
-    properties: &MdoProperties,
-    mdo_type: MdoType,
-) {
-    add_standard_attributes_from_spec(
-        attributes,
-        properties,
-        mdo_type,
-        MdoTemplateKind::ChartOfCalculationTypes,
-        ObjectView::Object,
-    );
-}
-
-pub(crate) fn add_chart_of_accounts_standard_attributes(
-    attributes: &mut Vec<Attribute>,
-    properties: &MdoProperties,
-    mdo_type: MdoType,
-) {
-    add_standard_attributes_from_spec(
-        attributes,
-        properties,
-        mdo_type,
-        MdoTemplateKind::ChartOfAccounts,
-        ObjectView::Object,
-    );
-    // `Вид` and `Забалансовый` are standard chart-of-accounts fields, but they are
-    // deliberately NOT StandardAttributeKind members: `is_standard_attribute_name`
-    // is a name-only global set, and «Вид» is a common user attribute name on other
-    // objects — listing it there would hide those user attributes from every
-    // standard-name filter (graph catalog, SDBL scope builder).
-    attributes.push(Attribute {
-        name: "Вид".to_string(),
-        name_en: Some("Type".to_string()),
-        attr_type: AttributeType::PlatformNamed("ВидСчета".to_string()),
-    });
-    attributes.push(Attribute {
-        name: "Забалансовый".to_string(),
-        name_en: Some("OffBalance".to_string()),
-        attr_type: AttributeType::Boolean,
-    });
-}
-
-pub(crate) fn add_information_register_standard_attributes_as_attrs(
-    attributes: &mut Vec<Attribute>,
-    properties: &MdoProperties,
-    mdo_type: MdoType,
-) {
-    add_standard_attributes_from_spec(
-        attributes,
-        properties,
-        mdo_type,
-        MdoTemplateKind::InformationRegister,
-        ObjectView::Object,
-    );
 }
 
 fn owner_attr_type(owners: &[String]) -> AttributeType {

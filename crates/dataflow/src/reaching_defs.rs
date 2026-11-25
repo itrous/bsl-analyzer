@@ -784,15 +784,20 @@ impl ReachingDefsResult {
 
     /// The possible writes of `var_name` that the evaluation at `point` makes itself.
     pub fn possible_writes_at(&self, point: EvalPoint, var_name: &str) -> Vec<Definition> {
-        let Some(index) = self.def_index() else { return Vec::new() };
         let var_name = var_name.fold_lower();
-        index
-            .point_writes(point)
-            .iter()
-            .map(|&idx| index.get_definition(idx))
-            .filter(|def| def.var_name == var_name)
-            .cloned()
-            .collect()
+        self.writes_at_point(point).filter(|def| def.var_name == var_name).cloned().collect()
+    }
+
+    /// Every possible write the evaluation at `point` makes itself, over all names, in index
+    /// order. [`Definition::var_name`] already holds the folded key [`Self::possible_writes_at`]
+    /// matches by. A caller that checks several names of one point iterates this once instead
+    /// of repeating the point lookup per name; no reachable state answers nothing, like the
+    /// per-name query.
+    pub fn writes_at_point(&self, point: EvalPoint) -> impl Iterator<Item = &Definition> + '_ {
+        const NO_WRITES: &[u32] = &[];
+        let index = self.def_index();
+        let rows = index.map_or(NO_WRITES, |index| index.point_writes(point));
+        rows.iter().filter_map(move |&idx| index.map(|index| index.get_definition(idx)))
     }
 
     /// The index every state numbers its definitions by; absent when no point was reached.

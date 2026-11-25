@@ -222,11 +222,11 @@ fn named_unknown_array_gaps_publish_while_only_budget_truncation_rejects() {
 }
 
 /// A module whose dynamic callback constructors alone drive the semantic notify
-/// projection past its production work budget, so `module_call_summary` reports
-/// it incomplete through the real budgeted query, with no test hook.
+/// projection past its capped production work budget, so `module_call_summary`
+/// reports it incomplete through the real budgeted query, with no test hook.
 fn budget_exhausting_files() -> [FixtureFile; 1] {
     let mut text = String::from("Процедура Начать(А)\n");
-    for i in 0..6_000 {
+    for i in 0..20_000 {
         text.push_str(&format!("О{i} = Новый(\"CallbackDescription\", А);\n"));
     }
     text.push_str("КонецПроцедуры\n\nПроцедура Завершить(Параметр) Экспорт\nКонецПроцедуры\n");
@@ -238,8 +238,8 @@ fn budget_exhausting_files() -> [FixtureFile; 1] {
 
 #[test]
 fn budget_exhausted_module_stops_the_whole_build_before_publication() {
-    // Given: a module whose dynamic callback constructors exhaust the production
-    // notify work budget, so its projection is incomplete.
+    // Given: a module whose dynamic callback constructors exhaust even the
+    // production budget's hard cap, so its projection is incomplete.
     let files = budget_exhausting_files();
     let module = ModuleId::new(FileId(0));
 
@@ -262,9 +262,9 @@ fn budget_exhausted_module_stops_the_whole_build_before_publication() {
 #[test]
 fn budget_exhausted_module_refuses_catch_up_publication() {
     // Given: an index built while the module stayed well inside the budget, and
-    // the same module edited until its constructors exhaust the production notify
-    // work budget — the real catch-up shape for an edit that turns a module
-    // pathological.
+    // the same module edited until its constructors exhaust the production
+    // notify work budget's hard cap — the real catch-up shape for an edit that
+    // turns a module pathological.
     let module = ModuleId::new(FileId(0));
     let base_files = [FixtureFile {
         path: "/src/CommonModules/Первый/Ext/Module.bsl",

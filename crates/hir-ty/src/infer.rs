@@ -5418,6 +5418,19 @@ impl<'db> InferenceContext<'db> {
             return found(self.db.unknown(), BareNameOrigin::UserBinding, all_env);
         }
 
+        // A conditionally declared standard attribute whose presence this object's own
+        // properties refute (`ЭтоГруппа` of a non-hierarchical catalog, `Код` of a
+        // zero-length code) is a proven absence: the configuration metadata decides it,
+        // so no platform member-surface attestation is needed. Only a plain value read
+        // is owned here: a bare call keeps the call channel's conservative silence, and
+        // the unknown-name miss below stays gated on that attestation.
+        if usage == BareNameUse::ReadValue
+            && !self.reading_bare_call_callee
+            && crate::this_object_attr::standard_member_known_absent(self.db, &resolver, name)
+        {
+            return BareNameResolution::Absent;
+        }
+
         self.bare_name_miss()
     }
 

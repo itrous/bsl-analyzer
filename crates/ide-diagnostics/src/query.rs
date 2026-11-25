@@ -1,7 +1,8 @@
 use crate::slab::{self, OwnedBlock, SLAB_DIAGNOSTICS};
 use crate::{
     body, normalize_diagnostics, scope_gate, AnalysisContext, BodyContext, Diagnostic,
-    DiagnosticCode, DiagnosticTag, DiagnosticsConfig, DiagnosticsContext, Fix, TextEdit,
+    DiagnosticCode, DiagnosticTag, DiagnosticsCompleteness, DiagnosticsConfig, DiagnosticsContext,
+    DiagnosticsResult, Fix, TextEdit,
 };
 use base_db::{DiagnosticsConfigId, FileIdInput};
 use hir::{DefWithBodyId, LocalRange, MethodIdInput, MethodOffset, ModuleId};
@@ -13,9 +14,9 @@ use stdx::heap::vec_bytes;
 /// `heap_size` hook: the backing vec plus each diagnostic's owned message,
 /// tags, and fix payloads. New heap-owning fields in [`Diagnostic`] or
 /// [`Fix`] must be added here too.
-fn diagnostics_heap<R>(v: &Arc<Vec<Diagnostic<R>>>) -> usize {
-    let mut bytes = vec_bytes::<Diagnostic<R>>(v.len());
-    for d in v.iter() {
+fn diagnostics_heap_values<R>(diagnostics: &[Diagnostic<R>]) -> usize {
+    let mut bytes = vec_bytes::<Diagnostic<R>>(diagnostics.len());
+    for d in diagnostics {
         bytes += d.message.capacity();
         bytes += vec_bytes::<DiagnosticTag>(d.tags.len());
         bytes += vec_bytes::<Fix<R>>(d.fixes.len());
@@ -28,6 +29,14 @@ fn diagnostics_heap<R>(v: &Arc<Vec<Diagnostic<R>>>) -> usize {
         }
     }
     bytes
+}
+
+fn diagnostics_heap<R>(v: &Arc<Vec<Diagnostic<R>>>) -> usize {
+    diagnostics_heap_values(v)
+}
+
+fn diagnostics_result_heap(v: &Arc<DiagnosticsResult>) -> usize {
+    diagnostics_heap_values(&v.diagnostics) + std::mem::size_of_val(&v.completeness)
 }
 
 /// Approximate live heap of a memoised configuration: the code lists and the
@@ -183,12 +192,12 @@ pub fn method_line_diagnostics_query<'db>(
 ///
 /// `defer_scope_line_gate` is part of the key, so the complete set a baseline classifier
 /// asks for and the scoped set every other caller gets are separate answers.
-#[salsa::tracked(lru = 32768, heap_size = diagnostics_heap, returns(clone))]
-pub fn file_diagnostics_query<'db>(
+#[salsa::tracked(lru = 32768, heap_size = diagnostics_result_heap, returns(clone))]
+pub fn file_diagnostics_result_query<'db>(
     db: &'db dyn RootDatabase,
     file_id_input: FileIdInput<'db>,
     config_id: DiagnosticsConfigId<'db>,
-) -> Arc<Vec<Diagnostic>> {
+) -> Arc<DiagnosticsResult> {
     let total_start = std::time::Instant::now();
     let file_id = file_id_input.file_id(db);
     let config = diagnostics_config_query(db, config_id);
@@ -196,7 +205,10 @@ pub fn file_diagnostics_query<'db>(
     let _span = tracing::info_span!("file_diagnostics_query", file_id = file_id.0,).entered();
 
     if !scope_gate::file_in_scope(db, None, file_id, &config) {
-        return Arc::new(Vec::new());
+        return Arc::new(DiagnosticsResult {
+            diagnostics: Vec::new(),
+            completeness: DiagnosticsCompleteness::Complete,
+        });
     }
     let config_path_input = ide_db::configuration_path_for_file(db, file_id);
     let provider = ide_db::SalsaProvider::new(db, config_path_input);
@@ -254,7 +266,21 @@ pub fn file_diagnostics_query<'db>(
         "file diagnostics query complete",
     );
 
-    Arc::new(diagnostics)
+    let completeness = crate::result::notify_projection_completeness(&config, || {
+        hir::semantic_module_call_summary_query(db, file_id_input).notify_projection_incomplete
+    });
+
+    Arc::new(DiagnosticsResult { diagnostics, completeness })
+}
+
+/// Compatibility query returning findings without completeness metadata.
+#[salsa::tracked(lru = 32768, heap_size = diagnostics_heap, returns(clone))]
+pub fn file_diagnostics_query<'db>(
+    db: &'db dyn RootDatabase,
+    file_id_input: FileIdInput<'db>,
+    config_id: DiagnosticsConfigId<'db>,
+) -> Arc<Vec<Diagnostic>> {
+    file_diagnostics_result_query(db, file_id_input, config_id).diagnostics.clone().into()
 }
 
 /// Switch the per-method diagnostics cap between the interactive profile and

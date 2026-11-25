@@ -997,6 +997,36 @@ fn dataflow_writes_i09_same_point_order() {
 }
 
 #[test]
+fn dataflow_writes_point_scan_answers_what_per_name_queries_ask() {
+    // The point scan and the per-name query must partition the same events: every
+    // write either answers, under its folded key, and nothing else.
+    let f = fixture(
+        "Процедура Т(Х, У)\n    Р = F(Х, У, \"м0\");\n    Выполнить(\"м1\");\nКонецПроцедуры\n",
+    );
+    let result = f.solve();
+
+    for point in [f.point("м0"), f.point("м1")] {
+        let mut scanned: Vec<String> =
+            result.writes_at_point(point).map(|def| def.var_name.to_string()).collect();
+        let mut asked = Vec::new();
+        for name in result.events().names() {
+            for def in result.possible_writes_at(point, name) {
+                asked.push(def.var_name.to_string());
+            }
+        }
+        scanned.sort();
+        asked.sort();
+        assert_eq!(scanned, asked, "the point scan and the per-name queries agree");
+        assert!(
+            scanned.iter().all(|var| var.as_str() == var.fold_lower()),
+            "the scan hands out folded keys"
+        );
+    }
+
+    assert_eq!(result.writes_at_point(f.point("м0")).count(), 2, "F's two path arguments");
+}
+
+#[test]
 fn dataflow_writes_i10_exceptional_sources() {
     let f = fixture(
         "Процедура Т()\n    x = \"A\";\n    Попытка\n        x = F(x);\n    Исключение\n        Если x = \"м1\" Тогда КонецЕсли;\n    КонецПопытки;\n    Если x = \"м2\" Тогда КонецЕсли;\nКонецПроцедуры\n",
@@ -1130,7 +1160,9 @@ fn dataflow_writes_i12_unavailable_is_not_proof() {
     let Stmt::Assign { value, .. } = f.body.stmt(not_a_header) else { unreachable!() };
     assert!(published.defs_for_var_at_header("x", ExprId::from_idx(*value)).is_none());
 
-    let f = fixture("Процедура Т(Усл)\n    Если Усл Тогда\n        x = \"A\";\n    КонецЕсли;\n    Если x = \"м1\" Тогда КонецЕсли;\nКонецПроцедуры\n");
+    let f = fixture(
+        "Процедура Т(Усл)\n    Если Усл Тогда\n        x = \"A\";\n    КонецЕсли;\n    Если x = \"м1\" Тогда КонецЕсли;\nКонецПроцедуры\n",
+    );
     let published = solve_executable_reaching_definitions(
         f.cfg.clone(),
         &f.body,
@@ -1171,7 +1203,8 @@ fn dataflow_writes_i12_unavailable_is_not_proof() {
             )
         };
         assert!(solve(RecoveredBody::Refuse).is_none(), "{why} publishes nothing");
-        let kept = solve(RecoveredBody::Solve).unwrap_or_else(|| panic!("{why}: solved on request"));
+        let kept =
+            solve(RecoveredBody::Solve).unwrap_or_else(|| panic!("{why}: solved on request"));
         assert_eq!(
             f.read(&kept, "м1", "x"),
             strings(&["A"]),

@@ -1753,6 +1753,8 @@ fn test_join_paren_field_resolution() {
         extended_configuration_object: None,
         common_attributes: Vec::new(),
         common_attributes_open: false,
+        known_absent_standard_attributes: Vec::new(),
+        unknown_conditional_standard_attributes: Vec::new(),
     };
     config.add_metadata_object(catalog);
 

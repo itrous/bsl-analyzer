@@ -692,6 +692,16 @@ mod tests {
         std::fs::write(dir.join(format!("{name}.xml")), xml).expect("write object metadata");
     }
 
+    fn write_catalog_xml(root: &std::path::Path, name: &str, properties: &str) {
+        let dir = root.join("Catalogs");
+        std::fs::create_dir_all(&dir).expect("create collection directory");
+        let xml = format!(
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+<Catalog uuid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"><Properties><Name>{name}</Name>{properties}</Properties></Catalog></MetaDataObject>"#,
+        );
+        std::fs::write(dir.join(format!("{name}.xml")), xml).expect("write catalog metadata");
+    }
+
     fn tokens(
         source: &str,
         diagnostics: &[crate::Diagnostic],
@@ -1062,6 +1072,114 @@ mod tests {
             "a common module has no implicit object: {diagnostics:?}"
         );
         assert!(diagnostics.iter().all(|diag| diag.code != DiagnosticCode::UnresolvedBareCall));
+    }
+
+    /// A standard attribute the object's kind declares conditionally, whose presence
+    /// this object's own properties refute (a flat catalog's `ЭтоГруппа`/`Родитель`, a
+    /// zero-length code's `Код`), is a proven miss: the configuration metadata decides
+    /// it without any platform member-surface attestation. The attestation gate must
+    /// keep covering everything else: a present conditional attribute stays resolved,
+    /// an unknown name stays indeterminate, and a bare call keeps the call channel's
+    /// silence.
+    #[test]
+    fn conditional_standard_attribute_absent_by_local_metadata_is_a_proven_miss() {
+        let source = "\
+Процедура ПередЗаписью(Отказ)
+\tЕсли НЕ ЭтоГруппа И НЕ ЗначениеЗаполнено(Код) Тогда
+\t\tЗначение = Наименование;
+\t\tЗначение2 = СовершенноНеизвестноеИмя;
+\tКонецЕсли;
+\tЗначение3 = Родитель;
+КонецПроцедуры
+
+Процедура Вызовы()
+\tЭтоГруппа();
+КонецПроцедуры
+";
+        let fixture = test_fixture::CfeFixtureBuilder::new("").build();
+        write_catalog_xml(
+            fixture.root(),
+            "Плоский",
+            "<Hierarchical>false</Hierarchical><CodeLength>0</CodeLength>\
+             <DescriptionLength>100</DescriptionLength>",
+        );
+        let diagnostics = crate::test_utils::check_cfe_at_with_unreadable(
+            "Catalogs/Плоский/Ext/ObjectModule.bsl",
+            source,
+            fixture,
+            &[],
+            crate::diagnostics,
+        );
+        let unresolved = tokens(source, &diagnostics, DiagnosticCode::UnresolvedName);
+        for name in ["ЭтоГруппа", "Код", "Родитель"] {
+            assert!(
+                unresolved.iter().any(|token| token == name),
+                "{name} is refuted by the object's own properties and must be reported: {unresolved:?}"
+            );
+        }
+        assert!(
+            !unresolved.iter().any(|token| token == "Наименование"),
+            "a present conditional attribute stays resolved: {unresolved:?}"
+        );
+        assert!(
+            !unresolved.iter().any(|token| token == "СовершенноНеизвестноеИмя"),
+            "an unknown name stays with the surface-attestation gap: {unresolved:?}"
+        );
+        assert!(
+            !is_call_callee(source, &diagnostics, DiagnosticCode::UnresolvedName, "ЭтоГруппа"),
+            "a bare call keeps the call channel's silence: {unresolved:?}"
+        );
+    }
+
+    #[test]
+    fn partial_metadata_does_not_turn_missing_conditional_properties_into_proof() {
+        let source = "\
+Процедура ПередЗаписью(Отказ)\n\tЗначение = ЭтоГруппа;\n\tЗначение2 = Родитель;\n\tЗначение3 = Код;\n\tЗначение4 = СовершенноНеизвестноеИмя;\nКонецПроцедуры\n";
+        let fixture = test_fixture::CfeFixtureBuilder::new("").build();
+        write_catalog_xml(fixture.root(), "Неполный", "");
+        let diagnostics = crate::test_utils::check_cfe_at_with_unreadable(
+            "Catalogs/Неполный/Ext/ObjectModule.bsl",
+            source,
+            fixture,
+            &[],
+            crate::diagnostics,
+        );
+        let unresolved = tokens(source, &diagnostics, DiagnosticCode::UnresolvedName);
+        assert!(
+            unresolved.is_empty(),
+            "missing properties are unknown and general surface gate stays conservative: {unresolved:?}"
+        );
+    }
+
+    #[test]
+    fn conditional_standard_attribute_present_stays_resolved() {
+        let source = "\
+Процедура ПередЗаписью(Отказ)
+\tЗначение = ЭтоГруппа;
+\tЗначение2 = Код;
+\tЗначение3 = Родитель;
+\tЗначение4 = Наименование;
+КонецПроцедуры
+";
+        let fixture = test_fixture::CfeFixtureBuilder::new("").build();
+        write_catalog_xml(
+            fixture.root(),
+            "Иерархия",
+            "<Hierarchical>true</Hierarchical><CodeLength>9</CodeLength>\
+             <DescriptionLength>25</DescriptionLength>",
+        );
+        let diagnostics = crate::test_utils::check_cfe_at_with_unreadable(
+            "Catalogs/Иерархия/Ext/ObjectModule.bsl",
+            source,
+            fixture,
+            &[],
+            crate::diagnostics,
+        );
+        let unresolved = tokens(source, &diagnostics, DiagnosticCode::UnresolvedName);
+        assert!(
+            unresolved.is_empty(),
+            "every satisfied conditional attribute resolves: {unresolved:?}"
+        );
     }
 
     #[test]

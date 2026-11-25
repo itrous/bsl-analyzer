@@ -71,12 +71,13 @@ pub use ide_db::{
 };
 pub use ide_diagnostics::{
     all_diagnostic_codes, apply_extension_merge, diagnostic_in_scope,
-    diagnostics as compute_diagnostics, docs, file_diagnostics, file_diagnostics_query,
-    get_metadata, load_vendor_support, message_with_standards, slab_verify_mismatches,
-    standard_url, standards, validate_query_text, CleanCodeAttribute, Diagnostic, DiagnosticCode,
-    DiagnosticOutput, DiagnosticSeverityLevel, DiagnosticTag, DiagnosticType, DiagnosticsConfig,
-    DiagnosticsContext, Fix, ImpactSeverity, MetadataTag, Severity, SoftwareQuality, TextEdit,
-    FOREIGN_HANDLER_BINDINGS_READERS, METADATA_DEPENDENT_CODES,
+    diagnostics as compute_diagnostics, diagnostics_completeness, docs, file_diagnostics,
+    file_diagnostics_query, file_diagnostics_result_query, get_metadata, load_vendor_support,
+    message_with_standards, slab_verify_mismatches, standard_url, standards, validate_query_text,
+    CleanCodeAttribute, Diagnostic, DiagnosticCode, DiagnosticOutput, DiagnosticSeverityLevel,
+    DiagnosticTag, DiagnosticType, DiagnosticsCompleteness, DiagnosticsConfig, DiagnosticsContext,
+    DiagnosticsIncompleteReason, DiagnosticsResult, Fix, ImpactSeverity, MetadataTag, Severity,
+    SoftwareQuality, TextEdit, FOREIGN_HANDLER_BINDINGS_READERS, METADATA_DEPENDENT_CODES,
 };
 pub use inlay_hints::{InlayHint, InlayHintKind};
 pub use name_lookup::{
@@ -153,11 +154,21 @@ impl Analysis {
         salsa::attach(&self.db, || f(self))
     }
 
-    /// A file's final diagnostics under `config`. With `config.defer_scope_line_gate` the
-    /// answer keeps the findings on lines outside the scope, for a caller that classifies
-    /// the complete set against a baseline and then applies [`diagnostic_in_scope`].
+    /// A file's findings under `config`, without their completeness metadata.
+    /// Call [`Self::diagnostics_result`] when callers must distinguish a full empty list
+    /// from a partial one. With `config.defer_scope_line_gate`, findings outside the
+    /// scope's line gate remain present for baseline classification.
     pub fn diagnostics(&self, file_id: FileId, config: &DiagnosticsConfig) -> Vec<Diagnostic> {
-        ide_diagnostics::file_diagnostics(&self.db, file_id, config)
+        self.diagnostics_result(file_id, config).diagnostics
+    }
+
+    /// Return findings and whether every enabled diagnostic rule completed.
+    pub fn diagnostics_result(
+        &self,
+        file_id: FileId,
+        config: &DiagnosticsConfig,
+    ) -> ide_diagnostics::DiagnosticsResult {
+        ide_diagnostics::file_diagnostics_result(&self.db, file_id, config)
     }
 
     pub fn goto_definition(&self, file_id: FileId, offset: u32) -> Option<NavigationTarget> {
@@ -313,6 +324,17 @@ impl Analysis {
         ide_diagnostics::file_diagnostics_query(&self.db, file_id_input, config_id)
     }
 
+    pub fn file_diagnostics_result_cached(
+        &self,
+        file_id: FileId,
+        config: DiagnosticsConfigInput,
+    ) -> Arc<ide_diagnostics::DiagnosticsResult> {
+        use ide_db::base_db::{DiagnosticsConfigId, FileIdInput};
+        let file_id_input = FileIdInput::new(&self.db, file_id);
+        let config_id = DiagnosticsConfigId::new(&self.db, config);
+        ide_diagnostics::file_diagnostics_result_query(&self.db, file_id_input, config_id)
+    }
+
     /// Diagnostics for a whole set of files (the LSP `workspace/diagnostic` sweep).
     ///
     /// A thin loop over the per-file query: each file rides the same Salsa-memoized
@@ -329,6 +351,17 @@ impl Analysis {
         file_ids: &[FileId],
         config: DiagnosticsConfigInput,
     ) -> Vec<(FileId, Arc<Vec<Diagnostic>>)> {
+        self.workspace_diagnostics_result(file_ids, config)
+            .into_iter()
+            .map(|(file_id, result)| (file_id, Arc::new(result.diagnostics.clone())))
+            .collect()
+    }
+
+    pub fn workspace_diagnostics_result(
+        &self,
+        file_ids: &[FileId],
+        config: DiagnosticsConfigInput,
+    ) -> Vec<(FileId, Arc<ide_diagnostics::DiagnosticsResult>)> {
         file_ids
             .iter()
             .filter_map(|&file_id| {
@@ -338,7 +371,7 @@ impl Analysis {
                 // analysis (`PendingWrite`) — is not a per-file fault: it must keep unwinding so
                 // the caller's `Cancelled::catch` aborts the request and retries it.
                 let computed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    self.file_diagnostics_cached(file_id, config.clone())
+                    self.file_diagnostics_result_cached(file_id, config.clone())
                 }));
                 match computed {
                     Ok(diagnostics) => Some((file_id, diagnostics)),
@@ -417,6 +450,18 @@ impl Analysis {
         config: DiagnosticsConfigInput,
         pool: &rayon::ThreadPool,
     ) -> Vec<(FileId, Arc<Vec<Diagnostic>>)> {
+        self.workspace_diagnostics_result_parallel(file_ids, config, pool)
+            .into_iter()
+            .map(|(file_id, result)| (file_id, Arc::new(result.diagnostics.clone())))
+            .collect()
+    }
+
+    pub fn workspace_diagnostics_result_parallel(
+        &self,
+        file_ids: &[FileId],
+        config: DiagnosticsConfigInput,
+        pool: &rayon::ThreadPool,
+    ) -> Vec<(FileId, Arc<ide_diagnostics::DiagnosticsResult>)> {
         use ide_db::base_db::{DiagnosticsConfigId, FileIdInput};
         use rayon::prelude::*;
 
@@ -438,7 +483,11 @@ impl Analysis {
                     let computed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let file_id_input = FileIdInput::new(&*db, file_id);
                         let config_id = DiagnosticsConfigId::new(&*db, config.clone());
-                        ide_diagnostics::file_diagnostics_query(&*db, file_id_input, config_id)
+                        ide_diagnostics::file_diagnostics_result_query(
+                            &*db,
+                            file_id_input,
+                            config_id,
+                        )
                     }));
                     match computed {
                         Ok(diagnostics) => Some((file_id, diagnostics)),

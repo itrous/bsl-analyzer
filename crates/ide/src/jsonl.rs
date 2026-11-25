@@ -55,6 +55,9 @@ pub struct FileEvent {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completeness: Option<ide_diagnostics::DiagnosticsCompleteness>,
 }
 
 impl FileEvent {
@@ -64,7 +67,15 @@ impl FileEvent {
         metrics: Option<FileMetrics>,
         error: Option<String>,
     ) -> Self {
-        Self { event_type: "file", path, diagnostics, metrics, error }
+        Self { event_type: "file", path, diagnostics, metrics, error, completeness: None }
+    }
+
+    pub fn with_completeness(
+        mut self,
+        completeness: Option<ide_diagnostics::DiagnosticsCompleteness>,
+    ) -> Self {
+        self.completeness = completeness;
+        self
     }
 }
 
@@ -80,6 +91,9 @@ pub struct DoneEvent {
     pub total_diagnostics: usize,
 
     pub failed_files: usize,
+
+    #[serde(skip_serializing_if = "is_zero")]
+    pub incomplete_files: usize,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline: Option<crate::diagnostics_baseline::DiagnosticsBaselineSummary>,
@@ -98,8 +112,14 @@ impl DoneEvent {
             total_files,
             total_diagnostics,
             failed_files,
+            incomplete_files: 0,
             baseline: None,
         }
+    }
+
+    pub fn with_incomplete_files(mut self, incomplete_files: usize) -> Self {
+        self.incomplete_files = incomplete_files;
+        self
     }
 
     pub fn with_baseline(
@@ -109,6 +129,10 @@ impl DoneEvent {
         self.baseline = Some(baseline);
         self
     }
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Default)]
@@ -123,6 +147,28 @@ pub struct JsonlSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_event_marks_incomplete_even_when_no_diagnostics_exist() {
+        let event = FileEvent::new("empty.bsl".to_string(), Vec::new(), None, None)
+            .with_completeness(Some(ide_diagnostics::DiagnosticsCompleteness::Incomplete {
+                reason: ide_diagnostics::DiagnosticsIncompleteReason::NotifyProjection,
+            }));
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["diagnostics"], serde_json::json!([]));
+        assert_eq!(
+            value["completeness"],
+            serde_json::json!({ "status": "incomplete", "reason": "notify_projection" })
+        );
+    }
+
+    #[test]
+    fn complete_empty_file_event_is_marked_complete() {
+        let event = FileEvent::new("empty.bsl".to_string(), Vec::new(), None, None)
+            .with_completeness(Some(ide_diagnostics::DiagnosticsCompleteness::Complete));
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["completeness"], serde_json::json!({ "status": "complete" }));
+    }
 
     #[test]
     fn test_start_event_serialization() {
@@ -180,13 +226,14 @@ mod tests {
 
     #[test]
     fn test_done_event_serialization() {
-        let event = DoneEvent::new(11.2, 6540, 1234, 5);
+        let event = DoneEvent::new(11.2, 6540, 1234, 5).with_incomplete_files(2);
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""type":"done""#));
         assert!(json.contains(r#""elapsed_secs":11.2"#));
         assert!(json.contains(r#""total_files":6540"#));
         assert!(json.contains(r#""total_diagnostics":1234"#));
         assert!(json.contains(r#""failed_files":5"#));
+        assert!(json.contains(r#""incomplete_files":2"#));
     }
 
     #[test]
