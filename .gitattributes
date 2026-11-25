@@ -6,6 +6,12 @@ crates/bsl-platform/data/platform_data.json -diff
 crates/bsl-platform/data/platform_facts.json -diff
 # Preserve byte-for-byte Designer XML exports, including CRLF, across checkouts.
 crates/bsl-metadata/fixtures/extension_common_attributes/**/*.xml -text whitespace=trailing-space,space-before-tab,cr-at-eol
+# Edited by tests with an LF-spelled pattern (`replacen("</ChildObjects>\n      </TabularSection>")`),
+# so on a CRLF checkout (core.autocrlf=true) the edit silently matches nothing and two ide-db
+# tests fail with no change in the code. Spelled `-text` like the export fixtures above because
+# this is a snapshot rather than a document people edit; every blob here is already LF, so
+# pinning it renormalizes nothing.
+crates/bsl-metadata/fixtures/extension_metadata/** -text
 # Expected analyze output pins line and column numbers of these sources; keep their
 # bytes identical on every checkout.
 crates/bsl-analyzer/tests/fixtures/foreign_handler_bindings/** -text
