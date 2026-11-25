@@ -126,7 +126,6 @@ jobs:
             inventory::no_generic_or_unclassified_production_lease_callers
             inventory::fence_callers_are_exactly_classified
             inventory::request_paths_do_not_call_lease_or_mutation_helpers
-            inventory::production_source_handles_checkout_line_endings
             inventory::production_source_keeps_the_request_handlers_of_lib_rs
             inventory::production_source_drops_the_test_modules_of_real_sources
             inventory::the_request_path_gate_fails_on_an_injected_lease_call
@@ -151,8 +150,6 @@ jobs:
             state::overlay_backlog::tests::point_batches_and_full_plans_do_not_roll_each_other_back
             tools::search::acquire::tests::acquisitions_are_served_in_ticket_order_with_one_raw_waiter
             inventory::the_search_engine_is_held_only_through_its_admission
-            inventory::production_source_ends_a_gated_variant_or_arm_at_its_comma
-            inventory::production_source_keeps_the_tail_of_a_gated_statement_with_generic_arguments
             tools::search::render::tests::answers_pass_the_schema_their_profile_publishes
             contract::tests::mcp_surface_snapshot
             graph::state::tests::freshness_rests_on_the_drift_watch
@@ -351,8 +348,14 @@ jobs:
             point_refresh::tests::a_baseline_mode_change_discards_a_prepared_point_batch
             engine::tests::a_pause_outliving_its_pass_leaves_the_flag_down
           )
+          test_utils_names=(
+            production_source::tests::production_source_handles_checkout_line_endings
+            production_source::tests::production_source_ends_a_gated_variant_or_arm_at_its_comma
+            production_source::tests::production_source_keeps_the_tail_of_a_gated_statement_with_generic_arguments
+          )
           list_tests --exact mcp_server --workspace --lib -- "${mcp_server_names[@]}"
           list_tests --exact bsl_search --workspace --lib -- "${bsl_search_names[@]}"
+          list_tests --exact test_utils --workspace --lib -- "${test_utils_names[@]}"
           list_tests mcp_server --workspace --lib -- workspace_cache_ vector_lifecycle
           list_tests bsl_search --workspace --lib -- lifecycle
           list_tests bsl_analyzer_app --workspace --bin bsl-analyzer-app -- workspace_cache_scope_ cli::logging
@@ -526,7 +529,6 @@ jobs:
             inventory::no_generic_or_unclassified_production_lease_callers
             inventory::fence_callers_are_exactly_classified
             inventory::request_paths_do_not_call_lease_or_mutation_helpers
-            inventory::production_source_handles_checkout_line_endings
             inventory::production_source_keeps_the_request_handlers_of_lib_rs
             inventory::production_source_drops_the_test_modules_of_real_sources
             inventory::the_request_path_gate_fails_on_an_injected_lease_call
@@ -548,8 +550,6 @@ jobs:
             state::overlay_backlog::tests::point_batches_and_full_plans_do_not_roll_each_other_back
             tools::search::acquire::tests::acquisitions_are_served_in_ticket_order_with_one_raw_waiter
             inventory::the_search_engine_is_held_only_through_its_admission
-            inventory::production_source_ends_a_gated_variant_or_arm_at_its_comma
-            inventory::production_source_keeps_the_tail_of_a_gated_statement_with_generic_arguments
             tools::search::render::tests::answers_pass_the_schema_their_profile_publishes
             contract::tests::mcp_surface_snapshot
             graph::state::tests::freshness_rests_on_the_drift_watch
@@ -713,8 +713,14 @@ jobs:
             point_refresh::tests::a_baseline_mode_change_discards_a_prepared_point_batch
             engine::tests::a_pause_outliving_its_pass_leaves_the_flag_down
           )
+          test_utils_names=(
+            production_source::tests::production_source_handles_checkout_line_endings
+            production_source::tests::production_source_ends_a_gated_variant_or_arm_at_its_comma
+            production_source::tests::production_source_keeps_the_tail_of_a_gated_statement_with_generic_arguments
+          )
           run_tests --exact -p mcp-server --lib -- "${mcp_server_names[@]}"
           run_tests --exact -p bsl-search --lib -- "${bsl_search_names[@]}"
+          run_tests --exact -p test-utils --lib -- "${test_utils_names[@]}"
       - name: Vector lifecycle and fenced search construction
         shell: bash
         run: |
