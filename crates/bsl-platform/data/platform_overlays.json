@@ -738,6 +738,33 @@
       "verified_against_version": "8.3.17",
       "evidence_source": "platform_facts.json holds СообщениеПользователю / UserMessage with 2 methods (ids 2030-2031, one contiguous block bounded by records of other types) and 5 properties. The installed 8.3.17 platform help (HBK) lists the same 2 methods and the same 5 properties. The type name is unique in the facts in both languages (СообщениеПользователю / UserMessage resolve to one type).",
       "rationale": "СообщениеПользователю is a core platform type that real code calls constantly, and a mistyped member on it is the commonest defect the check could name. The extract lists its whole surface at 8.3.17 and 8.3.27 (the newer release only adds members), so a member outside it fails at run time and the miss is a defect of the checked code, not a gap in the extract."
+    },
+    {
+      "type": "Color",
+      "verified_against_version": "8.3.17",
+      "evidence_source": "platform_facts.json holds Цвет / Color with 1 method (id 3996, a block of its own bounded by records of other types) and 4 properties (ids 9085-9088, one contiguous block). The installed 8.3.17 platform help (HBK) lists exactly those 4 properties (Синий, Красный, Зеленый, Вид) and no method; the facts add only ПолучитьАбсолютный, which the extract dates to 8.3.23 - newer than the help, never a member the help has and the facts lack. The type name is unique in the facts in both languages (Цвет / Color resolve to one type), and no docs-gap overlay of crates/bsl-platform/src/db.rs covers it.",
+      "rationale": "Цвет is a value object: its three components and its kind are the whole surface, and a colour is never addressed by element name. A frequency measurement over five configurations (28 912 modules) counts 7 234 constructions of it, so a mistyped component is a defect worth naming."
+    },
+    {
+      "type": "NumberQualifiers",
+      "verified_against_version": "8.3.17",
+      "verified_surface": ["fields"],
+      "evidence_source": "platform_facts.json holds КвалификаторыЧисла / NumberQualifiers with 3 properties (ids 12317-12319, one contiguous block bounded by records of other types) and no method. The installed 8.3.17 platform help (HBK) lists the same three (Разрядность, РазрядностьДробнойЧасти, ДопустимыйЗнак). Its answer carries three further names (КвалификаторыЧисла, КвалификаторыСтроки, КвалификаторыДаты, each typed Unknown) which are the properties of ОписаниеТипов that the help index mis-attributes to the types they return, not members of this type. The type name is unique in the facts in both languages, and no docs-gap overlay of crates/bsl-platform/src/db.rs covers it.",
+      "rationale": "A qualifier is a value object whose properties real code reads and writes constantly (8 631 constructions over the measured corpus), and they are not element names, so a mistyped property silently reads Undefined instead of the intended digits. Only the property surface is attested: a help index that mis-attributes properties is no evidence that the type has no method."
+    },
+    {
+      "type": "StringQualifiers",
+      "verified_against_version": "8.3.17",
+      "verified_surface": ["fields"],
+      "evidence_source": "platform_facts.json holds КвалификаторыСтроки / StringQualifiers with 2 properties (ids 12320-12321, one contiguous block bounded by records of other types) and no method. The installed 8.3.17 platform help (HBK) lists the same two (ДопустимаяДлина, Длина). Its answer carries three further names (КвалификаторыЧисла, КвалификаторыСтроки, КвалификаторыДаты, each typed Unknown) which are the properties of ОписаниеТипов that the help index mis-attributes to the types they return, not members of this type. The type name is unique in the facts in both languages, and no docs-gap overlay of crates/bsl-platform/src/db.rs covers it.",
+      "rationale": "A qualifier is a value object whose properties real code reads and writes constantly (7 579 constructions over the measured corpus), and they are not element names, so a mistyped property silently reads Undefined instead of the intended length. Only the property surface is attested: a help index that mis-attributes properties is no evidence that the type has no method."
+    },
+    {
+      "type": "DateQualifiers",
+      "verified_against_version": "8.3.17",
+      "verified_surface": ["fields"],
+      "evidence_source": "platform_facts.json holds КвалификаторыДаты / DateQualifiers with 1 property (id 12316) and no method. The installed 8.3.17 platform help (HBK) lists the same one (ЧастиДаты). Its answer carries three further names (КвалификаторыЧисла, КвалификаторыСтроки, КвалификаторыДаты, each typed Unknown) which are the properties of ОписаниеТипов that the help index mis-attributes to the types they return, not members of this type. The type name is unique in the facts in both languages, and no docs-gap overlay of crates/bsl-platform/src/db.rs covers it.",
+      "rationale": "A qualifier is a value object whose properties real code reads and writes constantly (1 270 constructions over the measured corpus), and they are not element names, so a mistyped property silently reads Undefined instead of the intended date parts. Only the property surface is attested: a help index that mis-attributes properties is no evidence that the type has no method."
     }
   ],
   "parameter_passing_attestations": [

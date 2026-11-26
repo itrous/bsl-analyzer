@@ -1020,6 +1020,52 @@ mod tests {
         }
     }
 
+    /// A colour is attested for its methods too, so a call it does not have is reported.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_a_color_method_is_reported() {
+        let umc = platform_umc(
+            "Процедура Тест()
+    Ц = Новый Цвет;
+    Ц.НетТакогоМетода();
+КонецПроцедуры",
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(umc.len(), 1, "expected one UnresolvedMethodCall, got: {umc:?}");
+            assert!(umc[0].contains("НетТакогоМетода"), "message must name the method: {umc:?}");
+            assert!(umc[0].contains("Цвет"), "message must name the receiver type: {umc:?}");
+        } else {
+            assert!(umc.is_empty(), "an unknown platform version keeps the miss silent: {umc:?}");
+        }
+    }
+
+    /// THE CONTROL for the fields-only attestation: the qualifiers method surface is deliberately unattested, so an unknown call stays silent.
+    #[test]
+    fn a_miss_on_number_qualifiers_method_stays_silent_because_only_fields_are_attested() {
+        let umc = platform_umc(
+            "Процедура Тест()
+    К = Новый КвалификаторыЧисла;
+    К.НетТакогоМетода();
+КонецПроцедуры",
+        );
+        assert!(umc.is_empty(), "a receiver not attested for methods stays open: {umc:?}");
+    }
+
+    /// THE CONTROL that closedness did not spread: a type nobody attested stays open.
+    #[test]
+    fn a_miss_on_an_unattested_value_storage_stays_silent() {
+        let umc = platform_umc(
+            "Процедура Тест()
+    Х = Новый ХранилищеЗначения(1);
+    Х.НетТакогоМетода();
+КонецПроцедуры",
+        );
+        assert!(umc.is_empty(), "a receiver not attested for methods stays open: {umc:?}");
+    }
+
     /// The other half of the contract, on the profile that exercises it: with a corpus
     /// whose platform version cannot be determined the completeness gate stays shut, so
     /// the very same call is silent. The controls say why that silence is the contract

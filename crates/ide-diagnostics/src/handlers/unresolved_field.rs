@@ -902,6 +902,96 @@ mod tests {
         );
     }
 
+    /// A colour is attested for its properties, so a component it does not have is reported.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_a_color_is_reported() {
+        let unresolved = unresolved_fields(
+            r#"Процедура Тест()
+    Ц = Новый Цвет;
+    Нет = Ц.НетТакогоПоля;
+КонецПроцедуры"#,
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(unresolved.len(), 1, "expected one miss, got: {unresolved:?}");
+            assert!(
+                unresolved[0].message.contains("НетТакогоПоля"),
+                "message must name the missing field, got: {}",
+                unresolved[0].message
+            );
+            assert!(
+                unresolved[0].message.contains("Цвет"),
+                "message must name the receiver type, got: {}",
+                unresolved[0].message
+            );
+        } else {
+            assert!(
+                unresolved.is_empty(),
+                "an unknown platform version keeps the miss silent: {unresolved:?}"
+            );
+        }
+    }
+
+    /// THE CONTROL: a component the colour really has is no miss.
+    #[test]
+    fn a_real_property_of_a_color_stays_silent() {
+        let unresolved = unresolved_fields(
+            r#"Процедура Тест()
+    Ц = Новый Цвет;
+    Синий = Ц.Синий;
+КонецПроцедуры"#,
+        );
+        assert!(unresolved.is_empty(), "a property the platform has is no miss: {unresolved:?}");
+    }
+
+    /// Number qualifiers are attested for their properties, so a property they do not have is reported.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_number_qualifiers_is_reported() {
+        let unresolved = unresolved_fields(
+            r#"Процедура Тест()
+    К = Новый КвалификаторыЧисла;
+    Нет = К.НетТакогоПоля;
+КонецПроцедуры"#,
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(unresolved.len(), 1, "expected one miss, got: {unresolved:?}");
+            assert!(
+                unresolved[0].message.contains("НетТакогоПоля"),
+                "message must name the missing field, got: {}",
+                unresolved[0].message
+            );
+            assert!(
+                unresolved[0].message.contains("КвалификаторыЧисла"),
+                "message must name the receiver type, got: {}",
+                unresolved[0].message
+            );
+        } else {
+            assert!(
+                unresolved.is_empty(),
+                "an unknown platform version keeps the miss silent: {unresolved:?}"
+            );
+        }
+    }
+
+    /// THE CONTROL: a property the number qualifiers really have is no miss.
+    #[test]
+    fn a_real_property_of_number_qualifiers_stays_silent() {
+        let unresolved = unresolved_fields(
+            r#"Процедура Тест()
+    К = Новый КвалификаторыЧисла;
+    Р = К.Разрядность;
+КонецПроцедуры"#,
+        );
+        assert!(unresolved.is_empty(), "a property the platform has is no miss: {unresolved:?}");
+    }
+
     /// The other half of the contract, on the profile that exercises it: with a corpus
     /// whose platform version cannot be determined the completeness gate stays shut, so
     /// the very same miss is silent. The controls say why that silence is the contract

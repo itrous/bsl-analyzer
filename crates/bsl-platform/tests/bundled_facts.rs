@@ -28,6 +28,7 @@ fn surfaces_of(data: &PlatformData, name: &str) -> (bool, bool) {
 const BOTH: (bool, bool) = (true, true);
 const NEITHER: (bool, bool) = (false, false);
 const METHODS_ONLY: (bool, bool) = (true, false);
+const FIELDS_ONLY: (bool, bool) = (false, true);
 
 const RECORD_KEYS: &[(&str, &[&str])] = &[
     (
@@ -301,6 +302,23 @@ fn the_curated_overlays_reach_the_built_in_facts() {
         assert!(
             surfaces_of(&data, name) == METHODS_ONLY,
             "{name} is attested for its methods and not for its properties"
+        );
+    }
+    for name in ["Цвет", "Color"] {
+        assert!(surfaces_of(&data, name) == BOTH, "{name} is attested");
+    }
+    // A qualifier's method surface is deliberately unattested: only its properties are.
+    for name in [
+        "КвалификаторыЧисла",
+        "NumberQualifiers",
+        "КвалификаторыСтроки",
+        "StringQualifiers",
+        "КвалификаторыДаты",
+        "DateQualifiers",
+    ] {
+        assert!(
+            surfaces_of(&data, name) == FIELDS_ONLY,
+            "{name} is attested for its properties and not for its methods"
         );
     }
     // The collections that address their elements by name are attested for the
