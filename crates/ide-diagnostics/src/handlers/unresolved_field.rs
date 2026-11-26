@@ -1364,37 +1364,23 @@ mod tests {
         assert!(unresolved.is_empty(), "a property the platform has is no miss: {unresolved:?}");
     }
 
-    /// A form attribute is attested for its properties, so a property it does not have is reported.
+    /// A form attribute stays OPEN, although its field composition was verified across three
+    /// platform builds: the guard of `curated_attestations_stay_off_types_the_extract_cannot_complete`
+    /// treats every type whose name holds "form" as extended by a configuration and allows an
+    /// attestation of its methods alone, and this type has no methods at all. So nothing is
+    /// attestable here until that guard is reconsidered, which is a decision of its own.
     #[test]
-    #[cfg_attr(
-        corpus_contract,
-        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
-    )]
-    fn a_miss_on_a_form_attribute_property_is_reported() {
+    fn a_miss_on_a_form_attribute_stays_silent_because_the_type_is_not_attested() {
         let unresolved = unresolved_fields(
             r#"Процедура Тест()
     О = Новый РеквизитФормы("Имя", Новый ОписаниеТипов("Строка"));
     Нет = О.НетТакогоПоля;
 КонецПроцедуры"#,
         );
-        if crate::test_utils::built_in_facts_are_served() {
-            assert_eq!(unresolved.len(), 1, "expected one miss, got: {unresolved:?}");
-            assert!(
-                unresolved[0].message.contains("НетТакогоПоля"),
-                "message must name the missing field, got: {}",
-                unresolved[0].message
-            );
-            assert!(
-                unresolved[0].message.contains("РеквизитФормы"),
-                "message must name the receiver type, got: {}",
-                unresolved[0].message
-            );
-        } else {
-            assert!(
-                unresolved.is_empty(),
-                "an unknown platform version keeps the miss silent: {unresolved:?}"
-            );
-        }
+        assert!(
+            unresolved.is_empty(),
+            "an unattested type must accept any field, got: {unresolved:?}"
+        );
     }
 
     /// THE CONTROL: a property the form attribute really has is no miss.
