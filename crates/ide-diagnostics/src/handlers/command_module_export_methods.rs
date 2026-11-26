@@ -297,6 +297,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn known_value_receiver_does_not_protect_a_command_handler() {
+        let code = r#"&НаКлиенте
+Процедура Регистрация()
+    Запрос = Новый Запрос("ВЫБРАТЬ 1");
+    Результат = Запрос.Выполнить();
+    Оповещение = Новый ОписаниеОповещения("Обработчик", Результат);
+КонецПроцедуры
+
+Процедура Обработчик(Параметр) Экспорт
+    Сообщить(1);
+КонецПроцедуры
+"#;
+        let diagnostics = check_command_at_with(code, |ctx| {
+            let candidates = ctx.notify_candidates();
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate.callback_name.as_str() == "Обработчик")
+                .expect("the callback candidate is exposed");
+            assert_eq!(
+                candidate.signature_protection(),
+                hir::NotifySignatureProtection::NotProtected,
+                "{candidate:#?}"
+            );
+            assert!(!candidate.protects_local_method);
+            let mut diagnostics = super::check(ctx);
+            diagnostics.extend(crate::handlers::unused_parameters::check(ctx));
+            diagnostics
+        });
+        let handler_start = code.rfind("Процедура Обработчик").unwrap();
+        for code in [DiagnosticCode::UnusedParameters, DiagnosticCode::CommandModuleExportMethods] {
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == code
+                        && usize::from(diagnostic.range.start()) >= handler_start
+                }),
+                "{code:?} must report the unrelated handler: {diagnostics:#?}"
+            );
+        }
+    }
+
     const EXPORTED: &str = r#"&НаКлиенте
 Процедура ОбработкаКоманды(Накладная, ПараметрыВыполнения) Экспорт
 	НапечататьЭтикетки(Накладная);

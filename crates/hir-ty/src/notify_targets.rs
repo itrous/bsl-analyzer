@@ -1584,12 +1584,16 @@ fn normalize_receiver(
     inference
         .notify_receiver_resolution(receiver)
         .map_or(NotifyTarget::Unsupported, |(origin, ty)| {
-            normalize_resolved_receiver(origin, db.lookup_type(ty))
+            normalize_resolved_receiver(origin, db, ty)
         })
 }
 
-fn normalize_resolved_receiver(origin: BareNameOrigin, ty: &TypeKind) -> NotifyTarget {
-    match (origin, ty) {
+fn normalize_resolved_receiver(
+    origin: BareNameOrigin,
+    db: &dyn bsl_types::intern::TypeKernelDb,
+    ty: bsl_types::kind::TypeId,
+) -> NotifyTarget {
+    match (origin, db.lookup_type(ty)) {
         (BareNameOrigin::SelfName, _) => NotifyTarget::ThisObject,
         (BareNameOrigin::CommonModule, TypeKind::CommonModule(module)) => {
             NotifyTarget::Module(Name::new(&module.name))
@@ -1601,37 +1605,76 @@ fn normalize_resolved_receiver(origin: BareNameOrigin, ty: &TypeKind) -> NotifyT
             | BareNameOrigin::ObjectMember
             | BareNameOrigin::FormMember,
             ty,
-        ) if !is_known_data_value(ty) => NotifyTarget::LocalBinding,
+        ) if !is_known_data_value(db, ty) => NotifyTarget::LocalBinding,
         _ => NotifyTarget::Unsupported,
     }
 }
 
-/// Whether a value of this type is provably not a module-object reference: a concrete
-/// data value never normalizes as a callback receiver, so a local of such a type is
-/// proven foreign, while unknown or object-shaped types keep the uncertainty.
-fn is_known_data_value(ty: &TypeKind) -> bool {
-    matches!(
-        ty,
+/// Whether this type proves the receiver cannot be the current module object.
+/// Object-shaped context types deliberately remain unknown; unions prove this only
+/// when every alternative independently proves it.
+fn is_known_data_value(db: &dyn bsl_types::intern::TypeKernelDb, ty: &TypeKind) -> bool {
+    match ty {
         TypeKind::Never
-            | TypeKind::Null
-            | TypeKind::Undefined
-            | TypeKind::Number(_)
-            | TypeKind::String(_)
-            | TypeKind::Date(_)
-            | TypeKind::Boolean
-            | TypeKind::Uuid
-            | TypeKind::Array(_)
-            | TypeKind::Map(_)
-            | TypeKind::Structure(_)
-            | TypeKind::ValueList(_)
-            | TypeKind::ValueTable(_)
-            | TypeKind::ValueTableRow(_)
-    )
+        | TypeKind::Null
+        | TypeKind::Undefined
+        | TypeKind::Number(_)
+        | TypeKind::String(_)
+        | TypeKind::Date(_)
+        | TypeKind::Boolean
+        | TypeKind::Uuid
+        | TypeKind::Array(_)
+        | TypeKind::Map(_)
+        | TypeKind::Structure(_)
+        | TypeKind::ValueList(_)
+        | TypeKind::ValueTable(_)
+        | TypeKind::ValueTableRow(_)
+        | TypeKind::MetadataRef(_)
+        | TypeKind::MetadataReferenceCollection(_)
+        | TypeKind::MetadataReference { .. }
+        | TypeKind::MetadataObjectCollection(_)
+        | TypeKind::TabularSection { .. }
+        | TypeKind::TabularSectionRow { .. }
+        | TypeKind::RegisterDimension { .. }
+        | TypeKind::RegisterResource { .. }
+        | TypeKind::RegisterAttribute { .. }
+        | TypeKind::RegisterFilter { .. }
+        | TypeKind::Attribute { .. }
+        | TypeKind::FormData { .. }
+        | TypeKind::FormControl { .. }
+        | TypeKind::ValueStorage
+        | TypeKind::TypeDescriptor
+        | TypeKind::Function(_)
+        | TypeKind::QueryResult(_)
+        | TypeKind::QueryResultSelection(_)
+        | TypeKind::QueryBatchResult { .. }
+        | TypeKind::Query { .. }
+        | TypeKind::ManagerCollection(_) => true,
+        TypeKind::Union(members) => {
+            !members.is_empty()
+                && members.iter().all(|member| is_known_data_value(db, db.lookup_type(*member)))
+        }
+        // Unknown, broad references and module/object context types may include self.
+        TypeKind::Unknown
+        | TypeKind::Any
+        | TypeKind::AnyMetadataRef { .. }
+        | TypeKind::AnyRef
+        | TypeKind::MetadataObject(_)
+        | TypeKind::ThisObject { .. }
+        | TypeKind::ThisManager { .. }
+        | TypeKind::CommonModule(_)
+        | TypeKind::PlatformObject(_)
+        | TypeKind::ObjectManager(_) => false,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bsl_types::builders::Builders;
+    use bsl_types::intern::TypeKernelDb;
+    use bsl_types::testing::InMemoryDb;
 
     fn candidate(
         receiver_syntax: NotifyReceiverSyntax,
@@ -1786,10 +1829,12 @@ mod tests {
 
     #[test]
     fn resolved_object_shaped_bare_receivers_are_conservatively_protected() {
+        let db = InMemoryDb::new();
+        let unknown = db.unknown();
         for origin in
             [BareNameOrigin::GlobalExport, BareNameOrigin::ObjectMember, BareNameOrigin::FormMember]
         {
-            let target = normalize_resolved_receiver(origin, &TypeKind::Unknown);
+            let target = normalize_resolved_receiver(origin, &db, unknown);
             assert_eq!(target, NotifyTarget::LocalBinding, "{origin:?}");
             let registration = NotifyReg {
                 caller: CallerId::ModuleCode,
@@ -1818,7 +1863,8 @@ mod tests {
     }
 
     #[test]
-    fn known_data_and_unresolved_receivers_keep_their_existing_verdicts() {
+    fn concrete_value_receivers_are_foreign_but_self_and_unknown_stay_conservative() {
+        let db = InMemoryDb::new();
         for origin in [
             BareNameOrigin::FlowLocal,
             BareNameOrigin::UserBinding,
@@ -1827,11 +1873,71 @@ mod tests {
             BareNameOrigin::FormMember,
         ] {
             assert_eq!(
-                normalize_resolved_receiver(origin, &TypeKind::Boolean),
+                normalize_resolved_receiver(origin, &db, db.boolean()),
                 NotifyTarget::Unsupported,
                 "known data for {origin:?} cannot be the current object"
             );
         }
+
+        let value_storage = db.value_storage();
+        let metadata_ref = db.metadata_ref(
+            bsl_types::kind::MetadataKind::CatalogRef,
+            "Контрагенты".to_string(),
+            &bsl_types::testing::RootConfigCtx,
+        );
+        let query_result = db.query_result(None, bsl_types::facet::ProjectionSource::Unknown);
+        for ty in [value_storage, metadata_ref, query_result] {
+            assert_eq!(
+                normalize_resolved_receiver(BareNameOrigin::FlowLocal, &db, ty),
+                NotifyTarget::Unsupported,
+                "{:#?} is a concrete value, not the current module object",
+                db.lookup_type(ty)
+            );
+        }
+
+        let only_values = db.union(vec![value_storage, db.boolean()]);
+        assert_eq!(
+            normalize_resolved_receiver(BareNameOrigin::FlowLocal, &db, only_values),
+            NotifyTarget::Unsupported,
+            "a union is foreign only when every alternative is known data"
+        );
+        let mixed_with_unknown = db.union(vec![value_storage, db.any_ref()]);
+        assert_eq!(
+            normalize_resolved_receiver(BareNameOrigin::FlowLocal, &db, mixed_with_unknown),
+            NotifyTarget::LocalBinding,
+            "a broad reference union arm preserves the possibility of self"
+        );
+        assert!(
+            !is_known_data_value(&db, &TypeKind::Union(Arc::from([value_storage, db.unknown()])),),
+            "an explicit unknown union arm cannot prove a foreign receiver"
+        );
+        assert_eq!(
+            normalize_resolved_receiver(BareNameOrigin::SelfName, &db, db.unknown()),
+            NotifyTarget::ThisObject,
+            "explicit self stays self regardless of inferred type"
+        );
+        let this_object = db.mk_this_object(
+            bsl_types::kind::ConfigId::Root,
+            bsl_types::facet::MdoRefFacet::new(
+                bsl_metadata::MdoType::Catalog,
+                "Контрагенты".to_string(),
+            ),
+        );
+        assert_eq!(
+            normalize_resolved_receiver(BareNameOrigin::FlowLocal, &db, this_object),
+            NotifyTarget::LocalBinding,
+            "a local assigned from ЭтотОбъект remains conservatively possible self"
+        );
+        let metadata_object = db.metadata_object(
+            bsl_types::kind::MetadataKind::CatalogObject,
+            "Контрагенты".to_string(),
+            &bsl_types::testing::RootConfigCtx,
+        );
+        assert_eq!(
+            normalize_resolved_receiver(BareNameOrigin::FlowLocal, &db, metadata_object),
+            NotifyTarget::LocalBinding,
+            "an object of the same metadata type can execute this module's handler"
+        );
 
         let unresolved = candidate(
             NotifyReceiverSyntax::BareName,
