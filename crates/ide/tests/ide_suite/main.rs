@@ -101,6 +101,7 @@ mod narrow_arg_validation;
 mod narrow_ternary_guard;
 mod narrow_type_of_expr;
 mod narrow_undefined_branch_receiver;
+mod notify_projection_outgoing;
 mod ordinary_form_controls;
 mod ordinary_form_module;
 mod ordinary_form_sidecar;

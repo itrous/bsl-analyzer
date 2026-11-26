@@ -225,19 +225,22 @@ fn command_module_this_object_shadowed_by_parameter_or_local_is_not_a_receiver()
             .all(|diagnostic| diagnostic.code != crate::DiagnosticCode::MissingNotifyHandler),
         "unknown receivers are not judged as command-local handlers: {diagnostics:#?}"
     );
+    // A parameter receiver of unknown runtime value is uncertainty: it may hold
+    // `ЭтотОбъект`, so the same-named method stays a possible callback and is not
+    // reported unused.
     assert!(
         diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code == crate::DiagnosticCode::UnusedLocalMethod
-                && diagnostic.message.contains("ПараметрОбработчик")),
-        "the parameter-shadowed registration must not protect the same-named method: {diagnostics:#?}"
+            .all(|diagnostic| !(diagnostic.code == crate::DiagnosticCode::UnusedLocalMethod
+                && diagnostic.message.contains("ПараметрОбработчик"))),
+        "the parameter-shadowed registration must keep its same-named method protected: {diagnostics:#?}"
     );
     assert!(
         diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == crate::DiagnosticCode::UnusedLocalMethod
                 && diagnostic.message.contains("ЛокальныйОбработчик")),
-        "the local-shadowed registration must not protect the same-named method: {diagnostics:#?}"
+        "the known-structure local registration must not protect the same-named method: {diagnostics:#?}"
     );
 }
 
@@ -918,6 +921,8 @@ fn notify_registrations_use_live_branches_and_type_availability() {
                     target_for(name)
                 );
             }
+            // The receiver is a live local assigned `Неопределено`: a known data value,
+            // so the target is proven foreign rather than uncertain.
             assert_eq!(target_for("AfterLiveAssignment"), &NotifyTarget::Unsupported);
 
             let graph = db.resolved_module_summary(module);

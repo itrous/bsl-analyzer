@@ -205,7 +205,11 @@ impl Analysis {
         call_hierarchy::incoming_calls(&self.db, file_id, offset, &index)
     }
 
-    pub fn call_hierarchy_outgoing(&self, file_id: FileId, offset: u32) -> Vec<CallHierarchyCall> {
+    pub fn call_hierarchy_outgoing(
+        &self,
+        file_id: FileId,
+        offset: u32,
+    ) -> Option<Vec<CallHierarchyCall>> {
         let offset = TextSize::from(offset);
         call_hierarchy::outgoing_calls(&self.db, file_id, offset)
     }

@@ -652,6 +652,17 @@ pub(crate) enum QualifiedLookup {
 /// global-context idle handler that names no module. An absent handler yields no edge;
 /// a visibility-blocked handler is retained as an unresolved edge. Inventing edges for
 /// unknown receivers is worse than omitting them.
+///
+/// Every notify-graph publication path converges here — the Salsa
+/// `workspace_call_graph_query` fold, the batched full build, and the incremental
+/// reprojection — so this is where a projection that stopped at its work budget is
+/// withheld: `notify_projection_incomplete` means only a prefix of the module's
+/// registrations was read, and a resolved prefix is indistinguishable from a complete
+/// projection. Publishing it would serve speculative `notify_ref` edges to every
+/// consumer, so the whole notify projection stays unpublished instead — the same
+/// contract [`crate::call_graph::ModuleCallSummary::method_pair_subset`] applies to
+/// the incoming index. Idle handlers are collected outside the notify projection's
+/// budget and are not affected by the flag.
 pub(crate) fn resolve_callback_edges(
     summary: &crate::call_graph::ModuleCallSummary,
     find_local: impl Fn(&crate::name::Name) -> Option<crate::MethodId>,
@@ -664,7 +675,9 @@ pub(crate) fn resolve_callback_edges(
 
     let mut out = Vec::new();
 
-    for reg in &summary.notify_regs {
+    let notify_regs =
+        if summary.notify_projection_incomplete { &[][..] } else { &summary.notify_regs[..] };
+    for reg in notify_regs {
         let resolved = match &reg.target {
             NotifyTarget::ThisObject => find_local(&reg.callback_name)
                 .map(|m| (ResolvedTarget::Method(m), EdgeProvenance::StringResolved)),
@@ -685,7 +698,9 @@ pub(crate) fn resolve_callback_edges(
                     QualifiedLookup::Absent => None,
                 }
             }
-            NotifyTarget::NotCompiled { .. } | NotifyTarget::Unsupported => None,
+            NotifyTarget::NotCompiled { .. }
+            | NotifyTarget::Unsupported
+            | NotifyTarget::LocalBinding => None,
         };
         if let Some((target, provenance)) = resolved {
             out.push(ResolvedCallEdge {

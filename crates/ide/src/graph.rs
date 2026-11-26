@@ -1166,6 +1166,27 @@ pub fn build_workspace_graph_rows(
         clear_node_caches(&pool);
     }
 
+    // A partial semantic notify projection is indistinguishable from a complete
+    // projection after it has been resolved to edges. Screen the complete workspace
+    // before the first sink write so a failed build cannot expose or persist a prefix.
+    for (i, &batch) in batches.iter().enumerate() {
+        note("notify_projection_gate", i, batch);
+        let db = open_batch(batch);
+        if let Some(module) = batch
+            .iter()
+            .copied()
+            .find(|module| db.module_call_summary(*module).notify_projection_incomplete)
+        {
+            dropper.finish()?;
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("notify projection incomplete for module {module:?}; refusing persistent graph build"),
+            )));
+        }
+        dropper.send(db)?;
+        clear_node_caches(&pool);
+    }
+
     // Capture each module's body-free signature hash from the resident index, for
     // persisting alongside the per-file fingerprint so an incremental rebuild can tell
     // a body-only edit (sig unchanged) from a resolution-affecting one.
@@ -1260,6 +1281,12 @@ pub fn build_workspace_graph_rows(
         note("call_edges", i, batch);
         let db = open_batch(batch);
         let proj = project_batch_call_edges(&pool, &db, batch, &index, &mut state);
+        if let Some(module) = proj.notify_projection_incomplete.first() {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("notify projection incomplete for module {module:?}; refusing persistent graph build"),
+            )));
+        }
         if fused.is_some() {
             accumulate_method_edges(&proj.edges, &mut method_edge_facts, &index);
         }
@@ -1504,6 +1531,22 @@ pub fn reproject_changed_modules(
     // same root — otherwise a link in the declared spelling would leave the build minting
     // basenames while everything served here minted the real rel.
     let strip_root = workspace_root.map(StripRoot::resolve);
+    // Check changed modules before constructing any replacement rows. The caller
+    // applies these rows transactionally, so an incomplete semantic projection must
+    // fail before it can open a persistence transaction or update freshness metadata.
+    let changed_db = open_batch(changed);
+    if let Some(module) = changed
+        .iter()
+        .copied()
+        .find(|module| changed_db.module_call_summary(*module).notify_projection_incomplete)
+    {
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("notify projection incomplete for module {module:?}; refusing persistent graph update"),
+        )));
+    }
+    drop(changed_db);
+
     let encoder = GraphRowEncoder::new(
         &index,
         paths,
@@ -1530,6 +1573,12 @@ pub fn reproject_changed_modules(
     let db = open_batch(changed);
     let mut state = GraphBuildState::new();
     let call_proj = project_batch_call_edges(&pool, &db, changed, &index, &mut state);
+    if let Some(module) = call_proj.notify_projection_incomplete.first() {
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("notify projection incomplete for module {module:?}; refusing persistent graph update"),
+        )));
+    }
     let mut projected = call_proj.edges;
     projected.extend(project_batch_query_edges(&pool, &db, changed, &mut state));
 
@@ -3406,6 +3455,94 @@ mod tests {
             db.set_file_text(fid, text);
         }
         Analysis::from_database(db)
+    }
+
+    fn exhausted_notify_projection_workspace() -> Analysis {
+        // These writes exhaust the lower alias resolver's bounded walk.
+        let mut code = String::from("Процедура Тест()\nПерем А;\n");
+        for _ in 0..5_000 {
+            code.push_str("А = НеизвестноеЗначение;\n");
+        }
+        code.push_str("О = Новый(\"CallbackDescription\", А);\nКонецПроцедуры\n");
+        workspace(&[("/src/CommonModules/Тест/Ext/Module.bsl", &code)])
+    }
+
+    #[test]
+    fn call_batch_projection_reports_exhausted_notify_projection() {
+        let analysis = exhausted_notify_projection_workspace();
+        let module = ModuleId::new(FileId(0));
+        let modules = [module];
+        let index = GraphIndex::build(analysis.database(), &modules);
+        let pool = rayon::ThreadPoolBuilder::new().build().unwrap();
+        let mut state = GraphBuildState::new();
+
+        let projection =
+            project_batch_call_edges(&pool, analysis.database(), &modules, &index, &mut state);
+
+        assert_eq!(projection.notify_projection_incomplete, vec![module]);
+    }
+
+    #[test]
+    fn persistent_graph_build_rejects_exhausted_notify_projection_before_sink_writes() {
+        let analysis = exhausted_notify_projection_workspace();
+        let module = ModuleId::new(FileId(0));
+        assert!(analysis.database().module_call_summary(module).notify_projection_incomplete);
+        let modules = [module];
+        let batches = [modules.as_slice()];
+        let paths = FxHashMap::from_iter([(
+            module.file_id,
+            "CommonModules/Тест/Ext/Module.bsl".to_owned(),
+        )]);
+        let mdo_files = hir::graph_index::MdoFiles::default();
+        let mut open_batch = |_: &[ModuleId]| analysis.database().clone();
+        let mut persisted_rows = Vec::new();
+        let mut sink = |nodes: &[NodeRow], edges: &[EdgeRow]| {
+            persisted_rows.push((nodes.len(), edges.len()));
+            Ok(())
+        };
+
+        let result = build_workspace_graph_rows(
+            &modules,
+            &paths,
+            None,
+            &mdo_files,
+            &batches,
+            &mut open_batch,
+            &mut sink,
+            None,
+            None,
+        );
+
+        assert!(result.is_err(), "incomplete notify projection must reject graph build");
+        assert!(persisted_rows.is_empty(), "a rejected build must not publish even a row prefix");
+    }
+
+    #[test]
+    fn persistent_graph_update_rejects_exhausted_notify_projection_before_rows_exist() {
+        let analysis = exhausted_notify_projection_workspace();
+        let module = ModuleId::new(FileId(0));
+        assert!(analysis.database().module_call_summary(module).notify_projection_incomplete);
+        let modules = [module];
+        let batches = [modules.as_slice()];
+        let paths = FxHashMap::from_iter([(
+            module.file_id,
+            "CommonModules/Тест/Ext/Module.bsl".to_owned(),
+        )]);
+        let mdo_files = hir::graph_index::MdoFiles::default();
+        let mut open_batch = |_: &[ModuleId]| analysis.database().clone();
+
+        let result = reproject_changed_modules(
+            &modules,
+            &modules,
+            &paths,
+            None,
+            &mdo_files,
+            &batches,
+            &mut open_batch,
+            None,
+        );
+
+        assert!(result.is_err(), "incomplete notify projection must reject incremental update");
     }
 
     /// Two common modules: a client-dispatched caller invoking a server-only

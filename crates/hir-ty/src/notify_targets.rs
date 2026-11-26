@@ -59,6 +59,9 @@ pub enum NotifySignatureProtection {
 pub enum NotifyCandidateReceiver {
     ThisObject,
     ForeignModule(Name),
+    /// A resolved local/global/object/form value whose runtime receiver is unknown:
+    /// it may hold `ЭтотОбъект`, but is not itself a proven callback reference.
+    LocalBinding,
     Unknown,
     NotCompiled,
 }
@@ -98,9 +101,15 @@ impl NotifyCandidate {
             NotifyReceiverSyntax::SelfName | NotifyReceiverSyntax::Other
         );
         let resolved_this_object = matches!(self.receiver, NotifyCandidateReceiver::ThisObject);
-        let unresolved_dynamic_array = self.kind == NotifyCandidateKind::DynamicArray
-            && matches!(self.receiver, NotifyCandidateReceiver::Unknown);
-        if resolved_this_object || syntax_may_be_local || unresolved_dynamic_array {
+        // A dynamic array's contents may name a local handler, and a resolved bare
+        // receiver may still be `ЭтотОбъект`. Neither uncertainty may become a proven-
+        // foreign verdict; an unresolved name is not promoted to an object value.
+        let receiver_may_be_local = matches!(
+            self.receiver,
+            NotifyCandidateReceiver::Unknown | NotifyCandidateReceiver::LocalBinding
+        ) && (self.kind == NotifyCandidateKind::DynamicArray
+            || self.receiver == NotifyCandidateReceiver::LocalBinding);
+        if resolved_this_object || syntax_may_be_local || receiver_may_be_local {
             NotifySignatureProtection::Protected
         } else {
             NotifySignatureProtection::NotProtected
@@ -1203,6 +1212,7 @@ fn classify_registration(
             NotifyCandidateReceiver::ThisObject
         }
         NotifyTarget::Module(module) => NotifyCandidateReceiver::ForeignModule(module.clone()),
+        NotifyTarget::LocalBinding => NotifyCandidateReceiver::LocalBinding,
         NotifyTarget::NotCompiled { .. } => NotifyCandidateReceiver::NotCompiled,
         NotifyTarget::Unsupported => NotifyCandidateReceiver::Unknown,
     };
@@ -1220,6 +1230,9 @@ fn classify_registration(
             NotifyTarget::Module(module) => {
                 current_common_module.is_some_and(|current| module.eq_ignore_case(current))
             }
+            // An uncertain receiver may be the current object. Preserve the local
+            // method conservatively without creating a NotifyRef edge.
+            NotifyTarget::LocalBinding => true,
             NotifyTarget::Unsupported => kind == NotifyCandidateKind::DynamicArray,
             NotifyTarget::NotCompiled { .. } => false,
         },
@@ -1568,14 +1581,52 @@ fn normalize_receiver(
     inference: &InferOwnerResult,
     receiver: ExprId,
 ) -> NotifyTarget {
-    match inference.notify_receiver_resolution(receiver) {
-        Some((BareNameOrigin::CommonModule, ty)) => match db.lookup_type(ty) {
-            TypeKind::CommonModule(module) => NotifyTarget::Module(Name::new(&module.name)),
-            _ => NotifyTarget::Unsupported,
-        },
-        Some((BareNameOrigin::SelfName, _)) => NotifyTarget::ThisObject,
+    inference
+        .notify_receiver_resolution(receiver)
+        .map_or(NotifyTarget::Unsupported, |(origin, ty)| {
+            normalize_resolved_receiver(origin, db.lookup_type(ty))
+        })
+}
+
+fn normalize_resolved_receiver(origin: BareNameOrigin, ty: &TypeKind) -> NotifyTarget {
+    match (origin, ty) {
+        (BareNameOrigin::SelfName, _) => NotifyTarget::ThisObject,
+        (BareNameOrigin::CommonModule, TypeKind::CommonModule(module)) => {
+            NotifyTarget::Module(Name::new(&module.name))
+        }
+        (
+            BareNameOrigin::FlowLocal
+            | BareNameOrigin::UserBinding
+            | BareNameOrigin::GlobalExport
+            | BareNameOrigin::ObjectMember
+            | BareNameOrigin::FormMember,
+            ty,
+        ) if !is_known_data_value(ty) => NotifyTarget::LocalBinding,
         _ => NotifyTarget::Unsupported,
     }
+}
+
+/// Whether a value of this type is provably not a module-object reference: a concrete
+/// data value never normalizes as a callback receiver, so a local of such a type is
+/// proven foreign, while unknown or object-shaped types keep the uncertainty.
+fn is_known_data_value(ty: &TypeKind) -> bool {
+    matches!(
+        ty,
+        TypeKind::Never
+            | TypeKind::Null
+            | TypeKind::Undefined
+            | TypeKind::Number(_)
+            | TypeKind::String(_)
+            | TypeKind::Date(_)
+            | TypeKind::Boolean
+            | TypeKind::Uuid
+            | TypeKind::Array(_)
+            | TypeKind::Map(_)
+            | TypeKind::Structure(_)
+            | TypeKind::ValueList(_)
+            | TypeKind::ValueTable(_)
+            | TypeKind::ValueTableRow(_)
+    )
 }
 
 #[cfg(test)]
@@ -1686,6 +1737,133 @@ mod tests {
             .signature_protection(),
             NotifySignatureProtection::Indeterminate
         );
+    }
+
+    #[test]
+    fn signature_verdict_protects_a_local_binding_that_may_be_this_object() {
+        // A local binding of unknown runtime value may hold `ЭтотОбъект`, so a static
+        // constructor stays protected without asserting a local callback reference.
+        for kind in [NotifyCandidateKind::Static, NotifyCandidateKind::DynamicArray] {
+            assert_eq!(
+                candidate(
+                    NotifyReceiverSyntax::BareName,
+                    NotifyCandidateReceiver::LocalBinding,
+                    kind,
+                    false
+                )
+                .signature_protection(),
+                NotifySignatureProtection::Protected,
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classification_conservatively_protects_an_uncertain_receiver() {
+        let registration = NotifyReg {
+            caller: CallerId::ModuleCode,
+            callback_expr: ExprId::from_raw(0.into()),
+            callback_name: Name::new("H"),
+            receiver_syntax: NotifyReceiverSyntax::BareName,
+            target: NotifyTarget::LocalBinding,
+            environments: NotifyRegistrationEnvironments::default(),
+            range: TextRange::empty(TextSize::new(0)),
+        };
+        let classified = classify_registration(
+            ExprId::from_raw(0.into()),
+            NotifyCallbackSlot::Handler,
+            NotifyCandidateKind::Static,
+            registration,
+            None,
+            true,
+        );
+        assert_eq!(classified.receiver, NotifyCandidateReceiver::LocalBinding);
+        assert!(
+            classified.protects_local_method,
+            "an uncertain receiver must conservatively protect the local method"
+        );
+    }
+
+    #[test]
+    fn resolved_object_shaped_bare_receivers_are_conservatively_protected() {
+        for origin in
+            [BareNameOrigin::GlobalExport, BareNameOrigin::ObjectMember, BareNameOrigin::FormMember]
+        {
+            let target = normalize_resolved_receiver(origin, &TypeKind::Unknown);
+            assert_eq!(target, NotifyTarget::LocalBinding, "{origin:?}");
+            let registration = NotifyReg {
+                caller: CallerId::ModuleCode,
+                callback_expr: ExprId::from_raw(0.into()),
+                callback_name: Name::new("H"),
+                receiver_syntax: NotifyReceiverSyntax::BareName,
+                target,
+                environments: NotifyRegistrationEnvironments::default(),
+                range: TextRange::empty(TextSize::new(0)),
+            };
+            let candidate = classify_registration(
+                ExprId::from_raw(0.into()),
+                NotifyCallbackSlot::Handler,
+                NotifyCandidateKind::Static,
+                registration,
+                None,
+                true,
+            );
+            assert_eq!(
+                candidate.signature_protection(),
+                NotifySignatureProtection::Protected,
+                "{origin:?}"
+            );
+            assert!(candidate.protects_local_method, "{origin:?}");
+        }
+    }
+
+    #[test]
+    fn known_data_and_unresolved_receivers_keep_their_existing_verdicts() {
+        for origin in [
+            BareNameOrigin::FlowLocal,
+            BareNameOrigin::UserBinding,
+            BareNameOrigin::GlobalExport,
+            BareNameOrigin::ObjectMember,
+            BareNameOrigin::FormMember,
+        ] {
+            assert_eq!(
+                normalize_resolved_receiver(origin, &TypeKind::Boolean),
+                NotifyTarget::Unsupported,
+                "known data for {origin:?} cannot be the current object"
+            );
+        }
+
+        let unresolved = candidate(
+            NotifyReceiverSyntax::BareName,
+            NotifyCandidateReceiver::Unknown,
+            NotifyCandidateKind::Static,
+            false,
+        );
+        assert_eq!(
+            unresolved.signature_protection(),
+            NotifySignatureProtection::NotProtected,
+            "an absent/unresolved bare name is not promoted to an object-shaped value"
+        );
+
+        let unknown_array = candidate(
+            NotifyReceiverSyntax::BareName,
+            NotifyCandidateReceiver::Unknown,
+            NotifyCandidateKind::DynamicArray,
+            false,
+        );
+        assert_eq!(
+            unknown_array.signature_protection(),
+            NotifySignatureProtection::Protected,
+            "the pre-existing fully unknown array boundary remains unchanged"
+        );
+
+        let unavailable = candidate(
+            NotifyReceiverSyntax::BareName,
+            NotifyCandidateReceiver::NotCompiled,
+            NotifyCandidateKind::Static,
+            false,
+        );
+        assert_eq!(unavailable.signature_protection(), NotifySignatureProtection::NotProtected);
     }
 
     #[test]

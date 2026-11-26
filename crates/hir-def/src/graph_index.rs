@@ -954,6 +954,9 @@ fn reference_targets(
 /// refs gathered in the same pass (caller, target module, lowercased method).
 pub struct BatchCallProjection {
     pub edges: Vec<WorkspaceCallEdge>,
+    /// Modules whose notify edges were only partially projected because the
+    /// semantic alias walk exhausted its budget. Such a batch is not safe to persist.
+    pub notify_projection_incomplete: Vec<ModuleId>,
     pub unresolved: Vec<(ModuleId, ModuleId, String)>,
     /// Calls to a metadata-declared common module whose body file is not present in
     /// the current graph. The module name is retained so adding its BSL body can
@@ -1071,16 +1074,22 @@ pub fn project_batch_call_edges<DB: ConfigsDatabase + Clone + Send>(
     // no extra body lowering; edge projection is unchanged → edge output is identical.
     let results: Vec<_> = parallel_per_module(pool, db, batch, |db, module| {
         let summary = resolve_module_summary_via_index(db, module, index);
+        let notify_projection_incomplete =
+            db.module_call_summary(module).notify_projection_incomplete;
         let unresolved = extract_unresolved_refs(db, module, index);
         let unresolved_declared_common = extract_missing_common_module_refs(db, module);
-        (summary, unresolved, unresolved_declared_common)
+        (summary, notify_projection_incomplete, unresolved, unresolved_declared_common)
     });
 
     let mut edges = Vec::new();
+    let mut notify_projection_incomplete = Vec::new();
     let mut unresolved = Vec::new();
     let mut unresolved_declared_common = Vec::new();
     let dispatch = |node: &GraphNode| index.dispatch(node);
-    for (summary, unres, declared) in &results {
+    for (summary, incomplete, unres, declared) in &results {
+        if *incomplete {
+            notify_projection_incomplete.push(summary.module);
+        }
         edges.extend(crate::queries::project_module_call_edges(
             summary,
             &dispatch,
@@ -1091,7 +1100,12 @@ pub fn project_batch_call_edges<DB: ConfigsDatabase + Clone + Send>(
         }
         unresolved_declared_common.extend(declared.iter().cloned());
     }
-    BatchCallProjection { edges, unresolved, unresolved_declared_common }
+    BatchCallProjection {
+        edges,
+        notify_projection_incomplete,
+        unresolved,
+        unresolved_declared_common,
+    }
 }
 
 /// Keep a reverse reference for a qualified call only when its common-module

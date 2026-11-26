@@ -170,6 +170,12 @@ pub fn notify_handler_availability_for_method_bodies_in_registration(
         ));
     }
 
+    enum EnvironmentVerdict {
+        Exported,
+        NotExported,
+        Unknown,
+    }
+
     let mut has_unexported_registration_env = false;
     let mut has_missing_registration_env = false;
     let mut has_undecided_registration_env = false;
@@ -180,13 +186,13 @@ pub fn notify_handler_availability_for_method_bodies_in_registration(
             &body_environments
         {
             environment_verdict = if exported_definite.contains(environment) {
-                Some(Availability::Exported)
+                Some(EnvironmentVerdict::Exported)
             } else if exported_possible.contains(environment) {
-                Some(Availability::Unknown)
+                Some(EnvironmentVerdict::Unknown)
             } else if other_definite.contains(environment) {
-                Some(Availability::NotExported)
+                Some(EnvironmentVerdict::NotExported)
             } else if other_possible.contains(environment) {
-                Some(Availability::Unknown)
+                Some(EnvironmentVerdict::Unknown)
             } else {
                 None
             };
@@ -196,10 +202,9 @@ pub fn notify_handler_availability_for_method_bodies_in_registration(
         }
 
         match environment_verdict {
-            Some(Availability::Exported) => {}
-            Some(Availability::NotExported) => has_unexported_registration_env = true,
-            Some(Availability::NotFound) => has_missing_registration_env = true,
-            Some(Availability::Unknown) => has_undecided_registration_env = true,
+            Some(EnvironmentVerdict::Exported) => {}
+            Some(EnvironmentVerdict::NotExported) => has_unexported_registration_env = true,
+            Some(EnvironmentVerdict::Unknown) => has_undecided_registration_env = true,
             None if incomplete_tail => has_undecided_registration_env = true,
             None => has_missing_registration_env = true,
         }

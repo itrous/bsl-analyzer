@@ -98,9 +98,9 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
                     (v, format!("{}.{}", module_name.as_str(), reg.callback_name.as_str()))
                 })
             }
-            hir::NotifyCandidateReceiver::Unknown | hir::NotifyCandidateReceiver::NotCompiled => {
-                None
-            }
+            hir::NotifyCandidateReceiver::Unknown
+            | hir::NotifyCandidateReceiver::LocalBinding
+            | hir::NotifyCandidateReceiver::NotCompiled => None,
         };
         let Some((verdict, detail)) = verdict else { continue };
         let message = message(verdict, &detail);

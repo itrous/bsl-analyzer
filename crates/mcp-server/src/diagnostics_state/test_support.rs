@@ -594,3 +594,84 @@ pub(crate) fn finality_ready_state(root: &Path) -> DiagnosticsState {
     );
     state
 }
+
+/// The module of the notification-exhaustion counterexample, relative to its workspace.
+pub(crate) const NOTIFY_EXHAUSTION_MODULE_REL: &str = "CommonModules/Клиент/Ext/Module.bsl";
+pub(crate) const NOTIFY_EXHAUSTION_NEIGHBOUR_REL: &str = "CommonModules/Сервер/Ext/Module.bsl";
+
+/// A client common module whose notification projection exhausts its production work
+/// budget, so its `DiagnosticsResult` reports the notify projection incomplete.
+///
+/// The exhaustion comes from thousands of MODULE-LEVEL conditional regions: they charge
+/// the projection's conditional index (one entry each plus the log-linear range sort)
+/// past the budget cap while the module's own bodies stay tiny. In-method regions would
+/// lose this race — the budget grows with body items, so regions inside a method feed
+/// the budget faster than the sort spends it.
+pub(crate) fn notify_exhaustion_module_text() -> String {
+    const REGIONS: usize = 65_536;
+    let mut text = String::with_capacity(REGIONS * 24 + 256);
+    for _ in 0..REGIONS {
+        text.push_str("#Если Сервер Тогда\n#КонецЕсли\n");
+    }
+    text.push_str(
+        "&НаКлиенте\nПроцедура Зарегистрировать()\n\tОписание = Новый ОписаниеОповещения(\"Обработчик\", ЭтотОбъект);\nКонецПроцедуры\n\n&НаКлиенте\nПроцедура Обработчик(Параметр)\nКонецПроцедуры\n",
+    );
+    text
+}
+
+/// A workspace holding the exhaustion module ([`notify_exhaustion_module_text`] at
+/// [`NOTIFY_EXHAUSTION_MODULE_REL`]), a small server module that analyzes to completion,
+/// and the optional diagnostics baseline written at `baseline.json`.
+pub(crate) fn notify_exhaustion_workspace(
+    baseline: Option<ide::diagnostics_baseline::DiagnosticsBaseline>,
+) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_common_module(root, "Клиент", false, &notify_exhaustion_module_text());
+    write_common_module(root, "Сервер", true, "Процедура Считать() Экспорт\nКонецПроцедуры\n");
+    if let Some(baseline) = baseline {
+        write(root, "bsl-analyzer.toml", "[diagnostics.baseline]\npath = \"baseline.json\"\n");
+        fs::write(
+            root.join("baseline.json"),
+            ide::diagnostics_baseline::diagnostics_baseline_json(&baseline).unwrap(),
+        )
+        .unwrap();
+    }
+    dir
+}
+
+/// The baseline entries of the exhaustion stand: the module-level `CodeOutOfRegion`
+/// finding of each module, recorded by occurrence, plus a phantom seventh occurrence of
+/// the exhaustion module's finding that the text does not produce. Only a run that
+/// proves a file analyzed in full may report the phantom resolved.
+pub(crate) fn notify_exhaustion_baseline_entries(
+) -> Vec<ide::diagnostics_baseline::DiagnosticsBaselineEntry> {
+    use ide::diagnostics_baseline::{
+        diagnostic_fingerprint, DiagnosticsBaselineEntry, DiagnosticsBaselineRange,
+    };
+    let entry = |path: &str, snippet: &str, occurrence: u32| DiagnosticsBaselineEntry {
+        fingerprint: diagnostic_fingerprint(path, "CodeOutOfRegion", snippet, occurrence),
+        path: path.to_owned(),
+        code: "CodeOutOfRegion".to_owned(),
+        snippet: snippet.to_owned(),
+        occurrence,
+        message: "CodeOutOfRegion".to_owned(),
+        severity: "warning".to_owned(),
+        range: DiagnosticsBaselineRange {
+            start_line: 0,
+            start_column: 0,
+            end_line: 0,
+            end_column: 8,
+        },
+    };
+    let module = NOTIFY_EXHAUSTION_MODULE_REL;
+    let neighbour = NOTIFY_EXHAUSTION_NEIGHBOUR_REL;
+    // The two methods sit outside any #Область, so each yields one CodeOutOfRegion
+    // finding whose snippet is the method's own declaration line.
+    let registered = entry(module, "Процедура Зарегистрировать()", 0);
+    let mut phantom = registered.clone();
+    phantom.occurrence = 7;
+    phantom.fingerprint =
+        diagnostic_fingerprint(module, "CodeOutOfRegion", "Процедура Зарегистрировать()", 7);
+    vec![registered, phantom, entry(neighbour, "Процедура Считать() Экспорт", 0)]
+}

@@ -158,6 +158,8 @@ Observed = Handlers;
                             "{case}: expected the overlapping local's structure type, got {:?}",
                             db.lookup_type(ordinary_ty)
                         );
+                        // A local of a known data type is proven foreign: its value can
+                        // never be the current module object.
                         assert!(
                             summary
                                 .notify_regs
@@ -175,7 +177,7 @@ Observed = Handlers;
                             summary
                                 .notify_regs
                                 .iter()
-                                .all(|reg| { matches!(reg.target, NotifyTarget::Unsupported) }),
+                                .all(|reg| { matches!(reg.target, NotifyTarget::LocalBinding) }),
                             "{case}: {:#?}",
                             summary.notify_regs
                         );
@@ -190,7 +192,7 @@ Observed = Handlers;
                             summary
                                 .notify_regs
                                 .iter()
-                                .all(|reg| { matches!(reg.target, NotifyTarget::Unsupported) }),
+                                .all(|reg| { matches!(reg.target, NotifyTarget::LocalBinding) }),
                             "{case}: {:#?}",
                             summary.notify_regs
                         );

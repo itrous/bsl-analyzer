@@ -4181,6 +4181,189 @@ fn an_unread_manager_module_still_yields_a_platform_manager_edge() {
     );
 }
 
+/// A semantic notify projection that stopped at its work budget must not publish
+/// `notify_ref` edges into the workspace graph. Every publication path — the Salsa
+/// fold, the batched full build, the incremental reprojection — resolves callbacks
+/// through the shared `resolve_callback_edges`, which the index projection carries:
+/// a truncated summary fed to it must produce no notify edges while direct calls
+/// survive. The truncated summary comes from the production work-limit hook, not
+/// from a hand-assembled struct.
+#[test]
+fn truncated_notify_projection_publishes_no_notify_ref_edges() {
+    use base_db::FileIdInput;
+    use hir::call_graph::{EdgeKind, EdgeProvenance, ResolvedTarget};
+    use hir::graph_index::{resolve_summary_via_index, GraphIndex};
+    use hir::{semantic_notify_facts_with_work_limit, ConfigsDatabase};
+
+    let mut db = RootDatabaseImpl::new();
+    let caller = FileId(0);
+    let target = FileId(1);
+    let mut file_set = FileSet::new();
+    file_set.insert(caller, VfsPath::new("/src/CommonModules/Первый/Ext/Module.bsl"));
+    file_set.insert(target, VfsPath::new("/src/CommonModules/Второй/Ext/Module.bsl"));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    db.set_file_source_root(caller, SourceRootId(0));
+    db.set_file_source_root(target, SourceRootId(0));
+    db.set_file_text(
+        caller,
+        "Процедура Начать()\n\
+         Внутренний();\n\
+         Оп = Новый ОписаниеОповещения(\"Завершить\", Второй);\n\
+         КонецПроцедуры\n\
+         Процедура Внутренний() Экспорт КонецПроцедуры",
+    );
+    db.set_file_text(target, "Процедура Завершить() Экспорт КонецПроцедуры");
+    let module = ModuleId::new(caller);
+
+    let notify_refs = |summary: &hir::ResolvedModuleSummary| {
+        summary
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::NotifyRef)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    // Control: with the budget intact the registration resolves into a notify_ref
+    // edge — without this half the assertions below pass on a fixture that never
+    // produced one.
+    let complete = db.module_call_summary(module);
+    assert!(
+        !complete.notify_projection_incomplete,
+        "control: this fixture completes its notify projection"
+    );
+    let complete_resolved = db.resolved_module_summary(module);
+    let baseline = notify_refs(&complete_resolved);
+    assert!(
+        baseline.iter().all(|edge| edge.provenance == EdgeProvenance::StringResolved
+            && matches!(edge.target, ResolvedTarget::Method(_))),
+        "control: the complete projection resolves the registration: {baseline:#?}"
+    );
+    assert_eq!(baseline.len(), 1, "one registration, one edge: {baseline:#?}");
+
+    // The same module under an exhausted budget: the projection itself, not a
+    // hand-built flag, marks the summary incomplete.
+    let truncated = semantic_notify_facts_with_work_limit(&db, FileIdInput::new(&db, caller), 0);
+    assert!(truncated.summary.notify_projection_incomplete);
+
+    let index = GraphIndex::build(&db, &[module, ModuleId::new(target)]);
+    let projected = resolve_summary_via_index(&db, module, &truncated.summary, &index);
+    assert!(
+        notify_refs(&projected).is_empty(),
+        "a truncated projection must not publish notify_ref edges: {projected:#?}"
+    );
+    assert!(
+        projected.edges.iter().any(|edge| edge.kind == EdgeKind::DirectLocal),
+        "withholding the notify projection must not drop direct-call edges: {projected:#?}"
+    );
+
+    // The Salsa fold and the index projection must agree on the same complete
+    // input — the filter sits in the function both call, so neither path may
+    // diverge into publishing what the other withholds.
+    assert_eq!(
+        notify_refs(&resolve_summary_via_index(&db, module, &complete, &index)),
+        notify_refs(&complete_resolved),
+        "the index projection and the Salsa fold must agree on a complete projection",
+    );
+}
+
+/// The real production budget, not the work-limit hook: a module whose first
+/// method registers a handler and whose second method exhausts the notify budget
+/// keeps the registration as a read prefix. Both full-build publication paths —
+/// the Salsa fold (`workspace_call_graph`) and the batched index projection
+/// (`workspace_call_graph_via_index`) — must publish no `notify_ref` edge from
+/// that prefix while direct-call edges survive, and a sibling module with an
+/// intact projection must still publish its reference.
+#[test]
+fn full_build_publishes_no_notify_edges_from_a_partially_read_projection() {
+    use base_db::SourceDatabase as _;
+    use hir::call_graph::{EdgeKind, GraphNode};
+    use hir::graph_index::{workspace_call_graph_via_index, GraphIndex};
+    use hir::{ConfigsDatabase, MethodId, MethodKey};
+
+    let mut text = String::from(
+        "Процедура Начать()\n\
+         Внутренний();\n\
+         Хоро = Новый ОписаниеОповещения(\"Цель\", Второй);\n\
+         КонецПроцедуры\n\
+         Процедура Внутренний() Экспорт\n\
+         КонецПроцедуры\n\
+         Процедура Масса(А)\n",
+    );
+    for i in 0..3_000 {
+        text.push_str(&format!("О{i} = Новый(\"CallbackDescription\", А);\n"));
+    }
+    text.push_str("КонецПроцедуры\n");
+
+    let files: [(&str, &str); 3] = [
+        ("/src/CommonModules/Первый/Ext/Module.bsl", &text),
+        ("/src/CommonModules/Второй/Ext/Module.bsl", "Процедура Цель() Экспорт\nКонецПроцедуры"),
+        (
+            "/src/CommonModules/Контроль/Ext/Module.bsl",
+            "Процедура Старт()\n\
+             Хоро = Новый ОписаниеОповещения(\"Цель\", Второй);\n\
+             КонецПроцедуры",
+        ),
+    ];
+    let mut db = RootDatabaseImpl::new();
+    let mut file_set = FileSet::new();
+    for (index, (path, _)) in files.iter().enumerate() {
+        file_set.insert(FileId(index as u32), VfsPath::new(*path));
+    }
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    for (index, (_, file_text)) in files.iter().enumerate() {
+        let file_id = FileId(index as u32);
+        db.set_file_source_root(file_id, SourceRootId(0));
+        db.set_file_text(file_id, file_text);
+    }
+    let big = ModuleId::new(FileId(0));
+    let modules = vec![big, ModuleId::new(FileId(1)), ModuleId::new(FileId(2))];
+
+    // Control of the shape: the real budget exhausted, the registration read
+    // before the exhaustion survived as a one-entry prefix.
+    let summary = db.module_call_summary(big);
+    assert!(summary.notify_projection_incomplete, "the fixture must exhaust the budget");
+    assert_eq!(
+        summary.notify_regs.len(),
+        1,
+        "the fixture must keep the read registration: {summary:#?}"
+    );
+    assert_eq!(summary.notify_regs[0].callback_name.as_str(), "Цель");
+
+    let notify_edges = |graph: &hir::WorkspaceCallGraph| {
+        graph.edges().filter(|edge| edge.kind == EdgeKind::NotifyRef).count()
+    };
+    let start =
+        GraphNode::Method(MethodId { module: big, local_id: MethodKey::first("Начать") });
+    let keeps_direct_calls = |graph: &hir::WorkspaceCallGraph| {
+        graph.callees(&start).iter().any(|edge| {
+            edge.kind == EdgeKind::DirectLocal
+                && matches!(&edge.to, GraphNode::Method(m) if m.module == big)
+        })
+    };
+
+    // Full build, Salsa fold: the withheld prefix must not appear, the direct
+    // call must, and the sibling module's intact projection publishes exactly
+    // its own reference — proving the absence above is not vacuous.
+    let folded = db.workspace_call_graph(SourceRootId(0));
+    assert_eq!(
+        notify_edges(&folded),
+        1,
+        "only the intact sibling module publishes a notify_ref edge: {folded:#?}"
+    );
+    assert!(keeps_direct_calls(&folded), "the direct call survives the withholding: {folded:#?}");
+
+    // Full build, batched index projection: byte-identical contract.
+    let index = GraphIndex::build(&db, &modules);
+    let batched = workspace_call_graph_via_index(&db, &modules, &index);
+    assert_eq!(
+        notify_edges(&batched),
+        1,
+        "the batched full build must agree with the fold: {batched:#?}"
+    );
+    assert!(keeps_direct_calls(&batched), "the direct call survives in the batched build");
+}
+
 #[test]
 fn workspace_call_graph_via_index_matches_salsa_fold() {
     use bsl_metadata::MdoType;

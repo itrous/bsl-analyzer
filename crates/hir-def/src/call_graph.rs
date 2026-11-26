@@ -40,9 +40,11 @@ pub struct ModuleCallSummary {
     /// list is module-level uncertainty: consumers must not infer that unlisted local methods
     /// or exports are unused merely because a callback was not recovered from these sites.
     pub notify_dynamic_signature_analysis_incomplete: Vec<DynamicNotifySignatureAnalysisGap>,
-    /// The semantic notify projection stopped at its work budget. This is distinct
-    /// from a named unknown-array alternative: the latter is an intentional
-    /// conservative boundary, not evidence that registrations were only partly read.
+    /// A notify analysis pass stopped at its work budget: either the semantic projection's
+    /// shared limit or the lower alias pass over one body. This is distinct from a named
+    /// unknown-array alternative: the latter is an intentional conservative boundary, not
+    /// evidence that registrations were only partly read. Suppressed findings behind this
+    /// flag must reach consumers as incompleteness, never as a complete empty answer.
     pub notify_projection_incomplete: bool,
     /// Platform-validated registrations. Raw `hir-def` summaries leave this empty.
     pub notify_regs: Vec<NotifyReg>,
@@ -469,6 +471,9 @@ pub enum NotifyTarget {
     ThisObject,
     /// The receiver resolves to a common module.
     Module(Name),
+    /// The resolved bare receiver has unknown runtime identity — it may be the current
+    /// module object — but is not proven to reference any particular local callback.
+    LocalBinding,
     /// The receiver cannot be resolved as a current object or common module.
     Unsupported,
 }
@@ -898,6 +903,9 @@ pub(crate) fn extract_call_summary_with_cancellation(
     let mut set_action_regs = Vec::new();
     let mut name_literals: FxHashSet<MethodKey> = FxHashSet::default();
     let mut name_literal_ref_sites = Vec::new();
+    // Set when a body's lower alias pass stopped at its work budget; the semantic
+    // projection adds its own stops on top of this.
+    let mut notify_projection_incomplete = false;
 
     // Bodies come in item order, which is deterministic.
     for (local_id, lower_result) in module_bodies.iter_lower_results() {
@@ -917,6 +925,7 @@ pub(crate) fn extract_call_summary_with_cancellation(
             &mut set_action_regs,
             &mut name_literals,
             &mut name_literal_ref_sites,
+            &mut notify_projection_incomplete,
             cancel,
         );
     }
@@ -938,6 +947,7 @@ pub(crate) fn extract_call_summary_with_cancellation(
             &mut set_action_regs,
             &mut name_literals,
             &mut name_literal_ref_sites,
+            &mut notify_projection_incomplete,
             cancel,
         );
     }
@@ -978,7 +988,7 @@ pub(crate) fn extract_call_summary_with_cancellation(
         notify_dynamic_signature_handlers,
         notify_dynamic_signature_handler_sites,
         notify_dynamic_signature_analysis_incomplete,
-        notify_projection_incomplete: false,
+        notify_projection_incomplete,
         notify_regs: Vec::new(),
         idle_handler_regs,
         set_action_regs,
@@ -1124,6 +1134,7 @@ fn extract_from_body(
     set_action_regs: &mut Vec<SetActionReg>,
     name_literals: &mut FxHashSet<MethodKey>,
     name_literal_ref_sites: &mut Vec<NameLiteralRefSite>,
+    notify_projection_incomplete: &mut bool,
     cancel: &mut dyn FnMut(),
 ) {
     let common_bindings = crate::common_module_ref::common_module_var_bindings(body);
@@ -1145,6 +1156,11 @@ fn extract_from_body(
         if !resolver_initialized {
             alias_resolver = DynamicArrayResolver::new(body, source_map, cancel);
             resolver_initialized = true;
+            // Construction fails only when its work budget ran out (cancellation
+            // unwinds instead), so every gap below is a stop, not a known-unknown.
+            if alias_resolver.is_none() {
+                *notify_projection_incomplete = true;
+            }
         }
         let Some(constructor_range) = source_map.expr_range(expr_id) else { continue };
         let Some(aliases) = dynamic_notify_array_aliases(
@@ -1161,6 +1177,11 @@ fn extract_from_body(
         ) else {
             continue;
         };
+        if alias_resolver.as_ref().is_some_and(DynamicArrayResolver::exhausted) {
+            // The alias resolution stopped at its budget: the gap it recorded is a
+            // truncated read, so the whole result must report incompleteness.
+            *notify_projection_incomplete = true;
+        }
         dynamic_candidates.extend(aliases.into_iter().map(|alias| DynamicNotifyArrayCandidate {
             array_name: alias.array_name,
             array_start: alias.array_start,
@@ -1196,6 +1217,9 @@ fn extract_from_body(
                         array_name: Name::new(candidate.array_name.as_str()),
                     },
                 );
+                if alias_resolver.as_ref().is_some_and(DynamicArrayResolver::exhausted) {
+                    *notify_projection_incomplete = true;
+                }
             }
         }
     }
@@ -1484,6 +1508,7 @@ struct DynamicArrayResolver<'a> {
     uncertainty_cache: FxHashMap<DynamicNotifyArrayCandidate, DynamicArrayUncertainty>,
     remaining: usize,
     since_cancel: usize,
+    budget_exhausted: bool,
 }
 
 impl<'a> DynamicArrayResolver<'a> {
@@ -1512,6 +1537,7 @@ impl<'a> DynamicArrayResolver<'a> {
             uncertainty_cache: FxHashMap::default(),
             remaining: DYNAMIC_ARRAY_ALIAS_WORK_BUDGET,
             since_cancel: 0,
+            budget_exhausted: false,
         };
         for parameter in body.params() {
             if !this.spend(cancel) {
@@ -1723,7 +1749,29 @@ impl<'a> DynamicArrayResolver<'a> {
     }
 
     fn spend(&mut self, cancel: &mut dyn FnMut()) -> bool {
-        Self::spend_fields(&mut self.remaining, &mut self.since_cancel, cancel)
+        Self::spend_tracked(
+            &mut self.remaining,
+            &mut self.since_cancel,
+            &mut self.budget_exhausted,
+            cancel,
+        )
+    }
+
+    fn spend_tracked(
+        remaining: &mut usize,
+        since_cancel: &mut usize,
+        exhausted: &mut bool,
+        cancel: &mut dyn FnMut(),
+    ) -> bool {
+        let spent = Self::spend_fields(remaining, since_cancel, cancel);
+        *exhausted |= !spent;
+        spent
+    }
+
+    /// Reaching zero exactly is still a complete scan; exhaustion means a requested
+    /// unit of work could not be spent.
+    fn exhausted(&self) -> bool {
+        self.budget_exhausted
     }
 
     fn spend_fields(
@@ -1884,7 +1932,7 @@ impl<'a> DynamicArrayResolver<'a> {
             return Some(before);
         }
         for assignment in &assignments[first_after..before_end] {
-            if !Self::spend_fields(remaining, since_cancel, cancel) {
+            if !Self::spend_tracked(remaining, since_cancel, &mut self.budget_exhausted, cancel) {
                 return None;
             }
             if assignment.branch.is_none() {
@@ -1932,7 +1980,8 @@ impl<'a> DynamicArrayResolver<'a> {
                 all.partition_point(|assignment| assignment.range.start() < current_before);
             let assignments = &all[..before_end];
             for _ in assignments {
-                if !Self::spend_fields(remaining, since_cancel, cancel) {
+                if !Self::spend_tracked(remaining, since_cancel, &mut self.budget_exhausted, cancel)
+                {
                     return (Vec::new(), false, false);
                 }
             }
@@ -1961,7 +2010,12 @@ impl<'a> DynamicArrayResolver<'a> {
             while let Some(site) = branch_pending.pop() {
                 let Some(branch) = site.branch else { continue };
                 for assignment in assignments {
-                    if !Self::spend_fields(remaining, since_cancel, cancel) {
+                    if !Self::spend_tracked(
+                        remaining,
+                        since_cancel,
+                        &mut self.budget_exhausted,
+                        cancel,
+                    ) {
                         return (Vec::new(), false, false);
                     }
                     if branch.contains_range(assignment.range)
@@ -1973,7 +2027,12 @@ impl<'a> DynamicArrayResolver<'a> {
                 }
                 let mut previous = None;
                 for assignment in assignments {
-                    if !Self::spend_fields(remaining, since_cancel, cancel) {
+                    if !Self::spend_tracked(
+                        remaining,
+                        since_cancel,
+                        &mut self.budget_exhausted,
+                        cancel,
+                    ) {
                         return (Vec::new(), false, false);
                     }
                     if assignment.range.end() <= branch.start()
@@ -4062,6 +4121,64 @@ EndProcedure
             "budget exhaustion must not expose a partial handler list: {summary:#?}"
         );
         assert_eq!(summary.notify_dynamic_signature_analysis_incomplete.len(), 1);
+        // The stop must reach consumers as incompleteness: suppressed findings behind
+        // a budget stop may not be reported as a complete empty answer.
+        assert!(
+            summary.notify_projection_incomplete,
+            "the alias budget stop must set the projection incompleteness flag: {summary:#?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_array_budget_is_exhausted_only_after_a_failed_spend() {
+        let mut remaining = 1;
+        let mut since_cancel = 0;
+        let mut exhausted = false;
+        let mut cancel = || {};
+
+        assert!(DynamicArrayResolver::spend_tracked(
+            &mut remaining,
+            &mut since_cancel,
+            &mut exhausted,
+            &mut cancel,
+        ));
+        assert_eq!(remaining, 0);
+        assert!(!exhausted, "using the final available unit completes the analysis");
+
+        assert!(!DynamicArrayResolver::spend_tracked(
+            &mut remaining,
+            &mut since_cancel,
+            &mut exhausted,
+            &mut cancel,
+        ));
+        assert!(exhausted, "only an unsuccessful spend marks the analysis incomplete");
+    }
+
+    #[test]
+    fn named_unknown_array_stays_publishable_while_budget_stops_set_incompleteness() {
+        // A named unknown alternative is the intentional conservative boundary: the
+        // analysis finished reading, it just refused to guess. It must not set the
+        // incompleteness flag, so the projection stays publishable.
+        let code = r#"
+Процедура Тест(Вход, Флаг)
+    А = Вход;
+    А.Добавить("Обработчик");
+    А.Добавить(ЭтотОбъект);
+    Если Флаг Тогда
+        А = Новый Массив;
+    КонецЕсли;
+    О = Новый("CallbackDescription", А);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        assert!(
+            !summary.notify_dynamic_signature_analysis_incomplete.is_empty(),
+            "the named unknown alternative must keep its gap: {summary:#?}"
+        );
+        assert!(
+            !summary.notify_projection_incomplete,
+            "a named unknown alternative is not a budget stop: {summary:#?}"
+        );
     }
 
     #[test]

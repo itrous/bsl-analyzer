@@ -96,7 +96,10 @@ use crate::graph::input::{db_for_files, db_for_files_in_snapshot, GraphBatchSnap
 // unchanged, so they must be rebuilt before serving.
 // 27: the freshness token includes the served platform-help snapshot contents. A version-26 graph
 // can reflect a different corpus from the current process even when all workspace files match.
-pub(crate) const SCHEMA_VERSION: u32 = 27;
+// 28: a graph build refuses a semantic notify projection that stopped at its work budget.
+// Version-27 graphs can contain only a prefix of its `notify_ref` edges, and no fingerprint
+// component notices that omission, so they must be rebuilt before serving.
+pub(crate) const SCHEMA_VERSION: u32 = 28;
 
 /// One file's persisted identity in the `files` table: its complete content hash,
 /// a compact projection retained for the existing drift API, and (for `.bsl`) its
@@ -1212,7 +1215,7 @@ pub(crate) fn build_graph_database_inner(
     ticker.set_eta_total_intervals(if batches.is_empty() {
         0
     } else {
-        batches.len().saturating_mul(4).saturating_add(8)
+        batches.len().saturating_mul(5).saturating_add(8)
     });
     let _watchdog =
         spawn_build_watchdog(Arc::clone(&ticker), out_path.parent().map(Path::to_path_buf));

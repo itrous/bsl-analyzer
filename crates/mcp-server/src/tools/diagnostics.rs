@@ -22,8 +22,8 @@ use ide::diagnostics_baseline::{
     DiagnosticsBaselineRange, DiagnosticsBaselineSummary,
 };
 use ide::{
-    catalog_entry, diagnostic_catalog, DiagnosticCode, DocumentSymbol, Locale, SeverityBucket,
-    SymbolKind, TextRange,
+    catalog_entry, diagnostic_catalog, DiagnosticCode, DiagnosticsResult, DocumentSymbol, Locale,
+    SeverityBucket, SymbolKind, TextRange,
 };
 use rmcp::model::CallToolResult;
 use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
@@ -473,8 +473,35 @@ pub(crate) fn file_findings(
         resident.diagnostics_baseline(),
     );
     let config = crate::diagnostics_state::computation_config(resident.config(), late_scope);
-    let diagnostics = analysis.diagnostics(file_id, &config);
-    let (diagnostics, baseline) =
+    // Completeness travels with the findings: a bounded rule projection that hit its
+    // work limit yields a SUBSET of the file's findings, and every conclusion drawn
+    // from a subset — a baseline classification above all — would present the missing
+    // findings as resolved. The classification below is skipped for such a file.
+    let DiagnosticsResult { diagnostics, completeness: analysis_completeness } =
+        analysis.diagnostics_result(file_id, &config);
+    let analysis_incomplete = analysis_completeness.incomplete_reason().is_some();
+    let diagnostics = if analysis_incomplete {
+        // The scope's line gate is normally applied after the classification; with the
+        // classification skipped, the deferred cut is applied here instead.
+        match late_scope {
+            Some(scope) => {
+                let scope_path = resident.abs_path_for(path);
+                let index = line_index::LineIndex::new(&file_text);
+                diagnostics
+                    .into_iter()
+                    .filter(|diagnostic| {
+                        ide::diagnostic_in_scope(Some(scope), Some(&scope_path), &index, diagnostic)
+                    })
+                    .collect()
+            }
+            None => diagnostics,
+        }
+    } else {
+        diagnostics
+    };
+    let (diagnostics, baseline) = if analysis_incomplete {
+        (diagnostics, unclassified_baseline(resident))
+    } else {
         match classify_file_baseline(resident, path, &file_text, diagnostics, late_scope) {
             Ok(result) => result,
             Err(baseline) => {
@@ -500,7 +527,8 @@ pub(crate) fn file_findings(
                     ),
                 );
             }
-        };
+        }
+    };
 
     // Author filter before any histogram or shaping, so `counts` reflects what
     // the response can actually show. Blame failures keep everything (fail-open).
@@ -644,6 +672,12 @@ pub(crate) fn file_findings(
             "findings trimmed to fit max_output_tokens",
         )
         .when(count_capped, loc::ReasonCode::ResultCap, "findings capped by max_findings")
+        .when(
+            analysis_incomplete,
+            loc::ReasonCode::ModalityDegraded,
+            "the notify projection hit its work limit; some rules did not contribute, \
+             and the baseline was not classified",
+        )
         .when(
             !resident.path_in_scope(path),
             loc::ReasonCode::OutOfAnalysisScope,
@@ -1039,6 +1073,9 @@ pub(crate) fn workspace_findings(
     if sweep.files_unread > 0 {
         body["files_unread"] = json!(sweep.files_unread);
     }
+    if sweep.files_incomplete > 0 {
+        body["files_incomplete"] = json!(sweep.files_incomplete);
+    }
     if sweep.files_out_of_scope > 0 {
         body["files_out_of_scope"] = json!(sweep.files_out_of_scope);
         body["scope_hint"] =
@@ -1073,6 +1110,12 @@ pub(crate) fn workspace_findings(
             sweep.files_unread > 0,
             loc::ReasonCode::UnreadableFiles,
             "some workspace files could not be read and were not analyzed",
+        )
+        .when(
+            sweep.files_incomplete > 0,
+            loc::ReasonCode::ModalityDegraded,
+            "some files' analysis hit a rule's work limit and their findings are withheld; \
+             their baseline entries are not resolved",
         )
         .when(
             sweep.files_out_of_scope > 0,
@@ -1340,7 +1383,7 @@ impl Counts {
 
 fn schema_json() -> Value {
     json!({
-        "schema_version": "19",
+        "schema_version": "20",
         "actions": ["catalog", "schema", "status", "file", "snippet", "workspace"],
         "severities": ["error", "warning", "info", "hint"],
         "status_result": {
@@ -1460,8 +1503,9 @@ fn schema_json() -> Value {
             "findings_ignored_by_author": "usize — findings suppressed by [analysis].ignored_authors across the sweep; present only when > 0",
             "author_hint": "string — present with findings_ignored_by_author",
             "files_swept": "usize — files actually analyzed",
-            "files_total": "usize — ALL workspace files, including ones that could not be read; files_swept can trail it because of the file cap (truncated), the analysis scope (files_out_of_scope) AND/OR unreadable bytes (files_unread)",
+            "files_total": "usize — ALL workspace files, including ones that could not be read; files_swept can trail it because of the file cap (truncated), the analysis scope (files_out_of_scope), unreadable bytes (files_unread) AND/OR an incomplete analysis (files_incomplete)",
             "files_unread": "usize — files counted in files_total that could not be read and so were not swept; present only when > 0",
+            "files_incomplete": "usize — files whose analysis hit a rule's work limit and reported itself incomplete; their findings are withheld from aggregates and their baseline entries are never resolved; present only when > 0",
             "files_out_of_scope": "usize — files excluded by [analysis].diff_base (no changed lines); present only when > 0",
             "scope_hint": "string — present with files_out_of_scope",
             "truncated": "bool — the file cap was hit",
@@ -1516,7 +1560,7 @@ mod tests {
         let result = schema();
         assert_structured_mirrors_text(&result);
         let body = body_of(&result);
-        assert_eq!(body["schema_version"], "19");
+        assert_eq!(body["schema_version"], "20");
         let actions = body["actions"].as_array().unwrap();
         assert!(actions.iter().any(|a| a == "catalog"));
         assert!(actions.iter().any(|a| a == "status"));
@@ -1536,6 +1580,10 @@ mod tests {
         assert!(
             body["workspace_result"]["files_unread"].is_string(),
             "sweep coverage gap advertised"
+        );
+        assert!(
+            body["workspace_result"]["files_incomplete"].is_string(),
+            "incomplete-analysis coverage gap advertised"
         );
         assert!(
             body["envelope"]["stale"].as_str().unwrap().contains("could not be read"),
@@ -1632,7 +1680,7 @@ mod tests {
     #[test]
     fn diagnostics_selective_baseline_response_advertises_schema_15() {
         let body = schema_json();
-        assert_eq!(body["schema_version"], "19");
+        assert_eq!(body["schema_version"], "20");
         for field in ["selection", "partitions_enabled", "partitions_unsuppressed", "unsuppressed"]
         {
             assert!(body["baseline_result"][field].is_string());
@@ -1642,7 +1690,7 @@ mod tests {
     #[test]
     fn diagnostics_schema_json() {
         let body = schema_json();
-        assert_eq!(body["schema_version"], "19");
+        assert_eq!(body["schema_version"], "20");
         assert!(body["baseline_result"]["selection"].is_string());
         assert!(body["baseline_result"]["unsuppressed"].is_string());
     }
@@ -3048,6 +3096,7 @@ mod tests {
                 files_total: 1,
                 files_out_of_scope: 0,
                 files_unread: 0,
+                files_incomplete: 0,
                 findings_ignored_by_author: 0,
                 author_head: None,
                 truncated: false,
@@ -3125,6 +3174,7 @@ mod tests {
                 files_total: 3,
                 files_out_of_scope: 0,
                 files_unread: 0,
+                files_incomplete: 0,
                 findings_ignored_by_author: 0,
                 author_head: None,
                 truncated: false,
@@ -3168,6 +3218,212 @@ mod tests {
 
         fn sweep_opts(max_files: usize) -> SweepOptions {
             SweepOptions { min_severity: SeverityBucket::Hint, codes: Vec::new(), max_files }
+        }
+
+        /// The `file` action, with the completeness verdict the envelope will carry.
+        fn run_full(
+            state: &DiagnosticsState,
+            path: &Path,
+            filters: &FileFilters,
+        ) -> (Value, loc::Completeness) {
+            match state.read(|resident, generation| {
+                file_findings(resident, &resident.analysis(), None, path, filters, generation)
+            }) {
+                ResidentOutcome::Ready(outcome, _) => outcome,
+                _ => panic!("expected Ready outcome"),
+            }
+        }
+
+        /// End-to-end regressions over a module whose notification projection exhausts
+        /// its production work budget, so the analysis reports itself incomplete.
+        /// The counterexample exists to keep the three DB-backed diagnostics actions
+        /// honest about that report: an incomplete analysis yields a SUBSET of a
+        /// file's findings, and every conclusion drawn from the subset — a resolved
+        /// baseline entry above all — would be a lie.
+        mod notify_exhaustion {
+            use super::*;
+            use crate::diagnostics_state::test_support::{
+                notify_exhaustion_baseline_entries, notify_exhaustion_workspace,
+                NOTIFY_EXHAUSTION_MODULE_REL,
+            };
+            use crate::tools::diagnostics::snippet::{self, SnippetFilters, SnippetRequest};
+
+            fn exhausted_baseline() -> ide::diagnostics_baseline::DiagnosticsBaseline {
+                use ide::diagnostics_baseline::{
+                    DiagnosticsBaseline, DiagnosticsBaselineScope,
+                    DIAGNOSTICS_BASELINE_SCHEMA_VERSION,
+                };
+                DiagnosticsBaseline {
+                    schema_version: DIAGNOSTICS_BASELINE_SCHEMA_VERSION,
+                    scope: DiagnosticsBaselineScope { source_root: None, extensions: vec![] },
+                    diagnostics: notify_exhaustion_baseline_entries(),
+                }
+            }
+
+            fn has_degraded_reason(completeness: &loc::Completeness) -> bool {
+                completeness.to_value()["reasons"]
+                    .as_array()
+                    .expect("reasons")
+                    .iter()
+                    .any(|reason| reason["code"] == "modality_degraded")
+            }
+
+            /// The file action serves the partial findings but refuses to classify
+            /// them against the baseline: a classification of a subset would renumber
+            /// the file's occurrences and report the phantom entry — one the text
+            /// never produces — resolved.
+            #[test]
+            fn file_action_keeps_the_baseline_unclassified_and_flags_the_answer_partial() {
+                let dir = notify_exhaustion_workspace(Some(exhausted_baseline()));
+                let state = ready_state(dir.path());
+
+                let (body, completeness) = run_full(
+                    &state,
+                    &dir.path().join(NOTIFY_EXHAUSTION_MODULE_REL),
+                    &default_filters(),
+                );
+                let baseline = &body["baseline"];
+                assert_eq!(baseline["state"], "partial", "{baseline}");
+                assert_eq!(baseline["complete"], false, "{baseline}");
+                assert_eq!(
+                    baseline["resolved"], 0,
+                    "a phantom entry must not resolve from an incomplete analysis: {baseline}",
+                );
+                assert_eq!(baseline["known"], 0, "{baseline}");
+                assert_eq!(baseline["new"], 0, "{baseline}");
+                assert!(
+                    body["findings"]
+                        .as_array()
+                        .expect("findings")
+                        .iter()
+                        .any(|finding| finding["code"] == "CodeOutOfRegion"),
+                    "the partial findings stay served: {}",
+                    body["findings"],
+                );
+                assert!(
+                    has_degraded_reason(&completeness),
+                    "the envelope must name the incomplete analysis: {}",
+                    completeness.to_value(),
+                );
+                state.shutdown();
+            }
+
+            /// The sweep counts the exhausted file as a coverage gap: it is not swept
+            /// (its findings are withheld), its file never joins the covered set, and
+            /// the phantom entry recorded for it stays unresolved. The neighbour that
+            /// analyzed in full still classifies normally.
+            #[test]
+            fn workspace_action_withholds_the_exhausted_file_and_resolves_nothing_of_its() {
+                let dir = notify_exhaustion_workspace(Some(exhausted_baseline()));
+                let state = ready_state(dir.path());
+
+                let outcome = state.read_mut(|resident, generation| {
+                    let sweep = resident.workspace_aggregates(
+                        &resident.config().clone(),
+                        &sweep_opts(100),
+                        &RequestCancel::default(),
+                    );
+                    let (body, completeness) = workspace_findings(&sweep, generation, None);
+                    (sweep, body, completeness)
+                });
+                let ResidentOutcome::Ready((sweep, body, completeness), _) = outcome else {
+                    panic!("expected Ready outcome")
+                };
+                assert_eq!(sweep.files_total, 2);
+                assert_eq!(sweep.files_swept, 1, "only the neighbour is served");
+                assert_eq!(
+                    sweep.files_incomplete, 1,
+                    "the exhausted module is a coverage gap, not a swept file",
+                );
+                assert_eq!(body["files_incomplete"], 1, "the response names the gap: {body}",);
+                assert!(has_degraded_reason(&completeness), "{}", completeness.to_value());
+                assert!(!sweep.baseline.complete, "{}", serde_json::to_string(&body).unwrap());
+                assert_eq!(
+                    sweep.baseline.state,
+                    ide::diagnostics_baseline::DiagnosticsBaselineState::Partial,
+                );
+                assert_eq!(
+                    sweep.baseline.resolved,
+                    Some(0),
+                    "a phantom entry of the exhausted file must not resolve: {:?}",
+                    sweep.baseline.resolved,
+                );
+                assert_eq!(
+                    sweep.baseline.known,
+                    Some(1),
+                    "the neighbour's recorded finding still matches: {:?}",
+                    sweep.baseline.known,
+                );
+                assert_eq!(
+                    sweep.baseline.new,
+                    Some(1),
+                    "only the neighbour's unrecorded finding is new; the exhausted file's \
+                     findings are withheld, not new: {:?}",
+                    sweep.baseline.new,
+                );
+                let code_counts: Vec<(&str, usize)> = sweep
+                    .aggregates
+                    .iter()
+                    .map(|aggregate| (aggregate.code.as_str(), aggregate.count))
+                    .collect();
+                assert_eq!(
+                    code_counts,
+                    vec![("CommonModuleMissingAPI", 1)],
+                    "aggregates cover the swept files only: the exhausted module fires the \
+                     same rule and must not inflate the count: {code_counts:?}",
+                );
+                state.shutdown();
+            }
+
+            /// A snippet hosted in the exhausted module carries the same verdict: the
+            /// answer names the incomplete analysis instead of reading as a complete
+            /// verdict on the code.
+            #[test]
+            fn snippet_action_flags_an_exhausted_host() {
+                let dir = notify_exhaustion_workspace(None);
+                let state = ready_state(dir.path());
+
+                let request = SnippetRequest::new(
+                    "А = 1;".to_owned(),
+                    None,
+                    None,
+                    vec![],
+                    Some(NOTIFY_EXHAUSTION_MODULE_REL.to_owned()),
+                    None,
+                )
+                .expect("the request is valid");
+                let filters = SnippetFilters {
+                    min_severity: SeverityBucket::Hint,
+                    codes: Vec::new(),
+                    max_findings: DEFAULT_MAX_FINDINGS,
+                    max_output_tokens: None,
+                    detailed: false,
+                };
+                let outcome = state.read(|resident, _| {
+                    let analysis = resident.analysis();
+                    let (file_id, _text, prepared) =
+                        snippet::plan(resident, &analysis, &request, None)
+                            .expect("the host places the snippet");
+                    snippet::findings(
+                        resident,
+                        &analysis,
+                        file_id,
+                        prepared,
+                        &request.code,
+                        &filters,
+                    )
+                });
+                let ResidentOutcome::Ready((body, completeness), _) = outcome else {
+                    panic!("expected Ready outcome")
+                };
+                assert_eq!(body["kind"], "snippet");
+                assert!(
+                    has_degraded_reason(&completeness),
+                    "the envelope must name the incomplete analysis: {}",
+                    completeness.to_value(),
+                );
+                state.shutdown();
+            }
         }
 
         #[test]

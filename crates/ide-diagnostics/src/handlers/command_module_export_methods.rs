@@ -143,13 +143,18 @@ fn local_handler_exemptions(
                 registrations.push(registration);
             }
         }
-        // Syntax-only candidates and unresolved dynamic arrays are conservative; only a
-        // proven foreign receiver at this exact expression can rule them out. A resolved
-        // ThisObject registration must not fall back after its environment verdict was negative.
+        // Syntax-only candidates, unresolved dynamic arrays and local bindings of
+        // unknown value are conservative; only a proven foreign receiver at this exact
+        // expression can rule them out. A resolved ThisObject registration must not fall
+        // back after its environment verdict was negative.
         syntax_protected |= candidate.site_reachable
             && candidate.protects_local_method
             && (candidate.registration.is_none()
-                || candidate.receiver == hir::NotifyCandidateReceiver::Unknown);
+                || matches!(
+                    candidate.receiver,
+                    hir::NotifyCandidateReceiver::Unknown
+                        | hir::NotifyCandidateReceiver::LocalBinding
+                ));
     }
 
     LocalHandlerExemptions {
@@ -241,6 +246,55 @@ mod tests {
         let ctx = crate::DiagnosticsContext::new(&config, file_id, &provider);
 
         check(&ctx)
+    }
+
+    #[test]
+    fn local_binding_receiver_stays_uncertain_about_the_local_handler() {
+        use hir::NotifyCandidateReceiver;
+
+        let code = r#"&НаКлиенте
+Процедура ОбработкаКоманды(Команда, ПараметрыВыполнения) Экспорт
+    Р = ЭтотОбъект;
+    Оповещение = Новый ОписаниеОповещения("ПослеКоманды", Р);
+КонецПроцедуры
+
+Процедура ПослеКоманды(Параметр) Экспорт
+КонецПроцедуры
+"#;
+        let diagnostics = check_command_at_with(code, |ctx| {
+            let candidates = ctx.notify_candidates();
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate.callback_name.as_str() == "ПослеКоманды")
+                .expect("the callback candidate is exposed");
+            // The receiver is a local binding of unknown runtime value: uncertainty,
+            // not a proven absence of a local callback.
+            assert_eq!(candidate.receiver, NotifyCandidateReceiver::LocalBinding);
+            assert!(candidate.protects_local_method);
+            assert_ne!(
+                candidate.signature_protection(),
+                hir::NotifySignatureProtection::NotProtected,
+                "uncertainty must not become a proven-foreign verdict"
+            );
+            let mut diagnostics = super::check(ctx);
+            diagnostics.extend(crate::handlers::unused_parameters::check(ctx));
+            diagnostics
+        });
+        let handler_start = code.rfind("Процедура ПослеКоманды").unwrap();
+        let false_findings: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| usize::from(diagnostic.range.start()) >= handler_start)
+            .filter(|diagnostic| {
+                matches!(
+                    diagnostic.code,
+                    DiagnosticCode::UnusedParameters | DiagnosticCode::CommandModuleExportMethods
+                )
+            })
+            .collect();
+        assert!(
+            false_findings.is_empty(),
+            "`Р = ЭтотОбъект` must not produce false UnusedParameters or export findings for the callback: {false_findings:#?}"
+        );
     }
 
     const EXPORTED: &str = r#"&НаКлиенте

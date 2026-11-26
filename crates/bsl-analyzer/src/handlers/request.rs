@@ -686,7 +686,17 @@ pub fn handle_call_hierarchy_outgoing(
         ctx.position_encoding,
     )?;
 
-    let calls = ctx.analysis.call_hierarchy_outgoing(file_id, offset.into());
+    // `None` from the analysis means the anchor module's semantic notify projection
+    // stopped at its work budget: the answer is withheld rather than served as
+    // complete, mirroring the incoming handler's null-over-partial contract.
+    let Some(calls) = ctx.analysis.call_hierarchy_outgoing(file_id, offset.into()) else {
+        tracing::debug!(
+            uri = %item.uri,
+            null_reason = "notify_projection_incomplete",
+            "call hierarchy outgoing returned null"
+        );
+        return Ok(None);
+    };
     if calls.is_empty() {
         return Ok(None);
     }
