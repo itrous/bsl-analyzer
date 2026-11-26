@@ -182,6 +182,14 @@ impl<'a> NotifyWorkBudget<'a> {
         Self { remaining: limit, since_cancel: 0, cancel, exhausted: false }
     }
 
+    pub(crate) fn remaining(&self) -> usize {
+        if self.exhausted {
+            0
+        } else {
+            self.remaining
+        }
+    }
+
     pub(crate) fn spend(&mut self) -> bool {
         self.spend_by(1)
     }
@@ -391,7 +399,7 @@ impl<'a> ConditionalEnvIndex<'a> {
 /// receivers, and the file identity used for metadata and CFG lookups. Ordinary,
 /// effective (`&ИзменениеИКонтроль`) and weaving (`&Вместо`/`&Перед`/`&После`) modules
 /// differ only in how this view is assembled; the projection below is one algorithm.
-type NotifyInference<'a> = Box<dyn Fn(DefWithBodyId, &Body) -> InferOwnerResult + 'a>;
+type NotifyInference<'a> = Box<dyn Fn(DefWithBodyId, &Body, usize) -> InferOwnerResult + 'a>;
 type NotifyFlow<'a> = Box<dyn Fn(&dyn HirDatabase, DefWithBodyId, &Body) -> BodyFlow + 'a>;
 
 struct NotifyModuleProjection<'a> {
@@ -411,7 +419,9 @@ impl<'db> NotifyModuleProjection<'db> {
             bodies: db.module_bodies_ref(module_id).clone(),
             conditional_tree: db.conditional_tree_ref(file_id).clone(),
             current_common_module: common_module_name(db, module_id),
-            infer: Box::new(move |owner, body| infer_owner_for_notify(db, file_id, owner, body)),
+            infer: Box::new(move |owner, body, work_limit| {
+                infer_owner_for_notify(db, file_id, owner, body, work_limit)
+            }),
             flow: Box::new(move |db, owner, body| ordinary_flow(db, file_id, owner, body)),
         }
     }
@@ -427,8 +437,8 @@ impl<'db> NotifyModuleProjection<'db> {
                 &parse.syntax_node(),
             )),
             current_common_module: common_module_name(db, ModuleId::new(base_file)),
-            infer: Box::new(move |owner, body| {
-                infer_effective_owner_for_notify(db, eid, owner, body)
+            infer: Box::new(move |owner, body, work_limit| {
+                infer_effective_owner_for_notify(db, eid, owner, body, work_limit)
             }),
             // The effective bodies are a splice, not the memoised bodies under either
             // file, so their flow is their own; params seed a method exactly as in
@@ -450,8 +460,8 @@ impl<'db> NotifyModuleProjection<'db> {
             bodies: db.module_bodies_ref(module_id).clone(),
             conditional_tree: db.conditional_tree_ref(file_id).clone(),
             current_common_module: common_module_name(db, module_id),
-            infer: Box::new(move |owner, body| {
-                infer_weaving_owner_for_notify(db, wid, owner, body)
+            infer: Box::new(move |owner, body, work_limit| {
+                infer_weaving_owner_for_notify(db, wid, owner, body, work_limit)
             }),
             // Weaving has no splice: the extension keeps its own memoised bodies.
             flow: Box::new(move |db, owner, body| ordinary_flow(db, file_id, owner, body)),
@@ -1170,7 +1180,10 @@ fn normalize_owner_candidates(
     if !budget.spend() {
         return;
     }
-    let inference = (projection.infer)(owner, body);
+    let inference = (projection.infer)(owner, body, budget.remaining());
+    if !budget.spend_by(inference.reaching_defs_work_spent()) {
+        return;
+    }
     if inference.reaching_defs_incomplete() {
         budget.mark_incomplete();
         return;
@@ -1183,7 +1196,13 @@ fn normalize_owner_candidates(
         dead_stmts.insert(stmt);
     }
     let flow = (projection.flow)(db, owner, body);
-    let cfg = flow.cfg(db);
+    let cfg = {
+        let mut spend = |work: usize| budget.spend_by(work);
+        flow.cfg_with_work(db, &mut spend)
+    };
+    let Some(cfg) = cfg else {
+        return;
+    };
     let Some(reachable_stmts) = reachable_statements_with_budget(&cfg, budget) else {
         return;
     };

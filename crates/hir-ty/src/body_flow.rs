@@ -143,6 +143,50 @@ impl BodyFlow {
         }
     }
 
+    /// [`BodyFlow::reaching_defs`] with the solve's work charged to `spend`. The
+    /// database memo is not used, because its first build would run outside this
+    /// caller's budget; a refused solve is not cached, while a solution or a
+    /// solver failure is.
+    pub fn reaching_defs_with_work(
+        &self,
+        db: &dyn HirDatabase,
+        spend: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<Arc<ReachingDefsResult>> {
+        if let Some(cached) = self.reaching_defs.get() {
+            return cached.clone();
+        }
+
+        let mut refused = false;
+        let mut metered = |work: usize| {
+            if spend(work) {
+                true
+            } else {
+                refused = true;
+                false
+            }
+        };
+        let cfg = self.cfg_with_work(db, &mut metered);
+        let events = if cfg.is_some() { self.events_with_work(db, &mut metered) } else { None };
+        let solved = match (cfg, events) {
+            (Some(cfg), Some(events)) => {
+                dataflow::reaching_defs::solve_reaching_definitions_with_work(
+                    cfg,
+                    &self.body,
+                    events,
+                    self.seeds_params(),
+                    &mut metered,
+                )
+            }
+            _ => None,
+        };
+        if refused {
+            return solved;
+        }
+
+        let _ = self.reaching_defs.set(solved.clone());
+        solved
+    }
+
     /// Reaching definitions where nothing crosses an unexecutable edge. No
     /// memo holds this solution, so every flow solves it once.
     ///

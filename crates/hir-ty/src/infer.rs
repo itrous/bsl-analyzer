@@ -981,6 +981,9 @@ pub struct InferenceContext<'db> {
     /// depends on a solve this inference did not run.
     reaching_defs_deferred: bool,
     reaching_defs_skipped: Cell<bool>,
+    reaching_defs_work_remaining: Cell<usize>,
+    reaching_defs_work_spent: Cell<usize>,
+    reaching_defs_since_cancel: Cell<usize>,
 
     return_expr_ids: Vec<ExprId>,
 
@@ -1208,6 +1211,8 @@ pub struct BodyInferenceResult {
     /// True when inference needed reaching definitions it was forbidden to solve;
     /// consumers must treat its dependent facts as unknown, not as a proved absence.
     pub reaching_defs_incomplete: bool,
+    /// Work the deferred reaching-definitions solve actually used.
+    pub reaching_defs_work_spent: usize,
 
     pub(crate) return_expr_ids: Vec<ExprId>,
 }
@@ -1231,6 +1236,7 @@ impl BodyInferenceResult {
             query_facts: Default::default(),
             query_facts_incomplete: false,
             reaching_defs_incomplete: false,
+            reaching_defs_work_spent: 0,
             return_expr_ids: Vec::new(),
         }
     }
@@ -1260,6 +1266,8 @@ pub struct ModuleCodeInferenceResult {
     pub query_facts_incomplete: bool,
     /// See [`BodyInferenceResult::reaching_defs_incomplete`].
     pub reaching_defs_incomplete: bool,
+    /// See [`BodyInferenceResult::reaching_defs_work_spent`].
+    pub reaching_defs_work_spent: usize,
 }
 
 impl Default for ModuleCodeInferenceResult {
@@ -1281,6 +1289,7 @@ impl Default for ModuleCodeInferenceResult {
             query_facts: Default::default(),
             query_facts_incomplete: false,
             reaching_defs_incomplete: false,
+            reaching_defs_work_spent: 0,
         }
     }
 }
@@ -1308,6 +1317,7 @@ impl ModuleCodeInferenceResult {
             query_facts: body.query_facts,
             query_facts_incomplete: body.query_facts_incomplete,
             reaching_defs_incomplete: body.reaching_defs_incomplete,
+            reaching_defs_work_spent: body.reaching_defs_work_spent,
         }
     }
 }
@@ -1458,6 +1468,14 @@ impl InferOwnerResult {
             InferOwnerResult::ModuleCode(r) => r.reaching_defs_incomplete,
         }
     }
+
+    /// Work the deferred reaching-definitions solve actually used.
+    pub fn reaching_defs_work_spent(&self) -> usize {
+        match self {
+            InferOwnerResult::Method(r) => r.reaching_defs_work_spent,
+            InferOwnerResult::ModuleCode(r) => r.reaching_defs_work_spent,
+        }
+    }
 }
 
 pub fn infer_owner(
@@ -1485,6 +1503,7 @@ pub(crate) fn infer_owner_for_notify(
     file_id: FileId,
     owner: DefWithBodyId,
     body: &Body,
+    work_limit: usize,
 ) -> InferOwnerResult {
     let body = Arc::new(body.clone());
     let mut ctx = match owner {
@@ -1495,9 +1514,37 @@ pub(crate) fn infer_owner_for_notify(
         DefWithBodyId::ModuleCode => InferenceContext::new_for_module_code(db, file_id, &body),
     };
     ctx.defer_query_facts();
-    ctx.defer_reaching_definitions();
+    ctx.defer_reaching_definitions_with_limit(work_limit);
     ctx.infer_all();
     finish_owner_inference(owner, ctx.finish())
+}
+
+/// How often a deferred reaching-definitions solve checks for cancellation.
+const DEFERRED_REACHING_DEFS_CANCEL_INTERVAL: usize = 128;
+
+/// Charges one deferred-solve payment. A payment larger than the remaining
+/// allowance is refused without spending anything; accepted work reaches the
+/// cancellation check as soon as the interval is crossed, including a large
+/// prepayment for an index or suffix-table allocation.
+fn charge_deferred_reaching_defs(
+    remaining: &Cell<usize>,
+    spent: &Cell<usize>,
+    since_cancel: &Cell<usize>,
+    work: usize,
+    cancel: &mut dyn FnMut(),
+) -> bool {
+    let available = remaining.get();
+    if work > available {
+        return false;
+    }
+    remaining.set(available - work);
+    spent.set(spent.get().saturating_add(work));
+    let since = since_cancel.get().saturating_add(work);
+    since_cancel.set(since % DEFERRED_REACHING_DEFS_CANCEL_INTERVAL);
+    if since >= DEFERRED_REACHING_DEFS_CANCEL_INTERVAL {
+        cancel();
+    }
+    true
 }
 
 impl<'db> InferenceContext<'db> {
@@ -1613,6 +1660,9 @@ impl<'db> InferenceContext<'db> {
             query_facts_deferred: false,
             reaching_defs_deferred: false,
             reaching_defs_skipped: Cell::new(false),
+            reaching_defs_work_remaining: Cell::new(0),
+            reaching_defs_work_spent: Cell::new(0),
+            reaching_defs_since_cancel: Cell::new(0),
             var_types: FxHashMap::default(),
             reset_vars: rustc_hash::FxHashSet::default(),
             implicit_locals: FxHashMap::default(),
@@ -2755,6 +2805,7 @@ impl<'db> InferenceContext<'db> {
         let notify_receiver_indeterminate = self.finish_notify_receiver_indeterminate();
         let query_facts_incomplete = self.query_facts_deferred;
         let reaching_defs_incomplete = self.reaching_defs_skipped.get();
+        let reaching_defs_work_spent = self.reaching_defs_work_spent.get();
         let query_facts =
             if query_facts_incomplete { Default::default() } else { self.query_facts() };
         BodyInferenceResult {
@@ -2778,6 +2829,7 @@ impl<'db> InferenceContext<'db> {
             query_facts,
             query_facts_incomplete,
             reaching_defs_incomplete,
+            reaching_defs_work_spent,
             return_expr_ids: self.return_expr_ids,
         }
     }
@@ -2789,15 +2841,25 @@ impl<'db> InferenceContext<'db> {
         self.query_facts_deferred = true;
     }
 
-    /// Forbid inference from starting its own reaching-definitions solve. Every
-    /// read answers unknown and the finished result marks the dependency incomplete.
-    fn defer_reaching_definitions(&mut self) {
+    /// Forbid inference from starting an unbounded reaching-definitions solve.
+    /// A deferred read may still solve through `flow`, but only within this work
+    /// limit; the finished result records the work used and whether it stopped.
+    fn defer_reaching_definitions_with_limit(&mut self, work_limit: usize) {
         self.reaching_defs_deferred = true;
+        self.reaching_defs_work_remaining.set(work_limit);
     }
 
     /// Record that data this inference consumed depended on a deferred solve.
     fn mark_reaching_defs_incomplete(&mut self) {
         self.reaching_defs_skipped.set(true);
+    }
+
+    fn account_reaching_defs_work(&mut self, spent: usize, incomplete: bool) {
+        self.reaching_defs_work_spent
+            .set(self.reaching_defs_work_spent.get().saturating_add(spent));
+        if incomplete {
+            self.reaching_defs_skipped.set(true);
+        }
     }
 
     fn executable_reaching_defs(&self) -> Option<Arc<dataflow::reaching_defs::ReachingDefsResult>> {
@@ -2806,6 +2868,39 @@ impl<'db> InferenceContext<'db> {
             return None;
         }
         self.flow.executable_reaching_defs(self.db)
+    }
+
+    fn reaching_defs(&self) -> Option<Arc<dataflow::reaching_defs::ReachingDefsResult>> {
+        if !self.reaching_defs_deferred {
+            let module = hir_def::ModuleId::new(self.context_file_id);
+            return match self.owner {
+                DefWithBodyId::Method(local_id) => self.db.method_reaching_definitions(
+                    MethodIdInput::new(self.db, hir_def::MethodId { module, local_id }),
+                ),
+                DefWithBodyId::ModuleCode => {
+                    self.db.module_code_reaching_definitions(self.context_file_id)
+                }
+            };
+        }
+
+        let mut cancel = || self.db.unwind_if_revision_cancelled();
+        let result = self.flow.reaching_defs_with_work(self.db, &mut |work| {
+            let accepted = charge_deferred_reaching_defs(
+                &self.reaching_defs_work_remaining,
+                &self.reaching_defs_work_spent,
+                &self.reaching_defs_since_cancel,
+                work,
+                &mut cancel,
+            );
+            if !accepted {
+                self.reaching_defs_skipped.set(true);
+            }
+            accepted
+        });
+        if result.is_none() {
+            self.reaching_defs_skipped.set(true);
+        }
+        result
     }
 
     fn finish_notify_receiver_indeterminate(&self) -> FxHashSet<ExprId> {
@@ -4121,15 +4216,7 @@ impl<'db> InferenceContext<'db> {
         stmt_id: StmtId,
         var_key: &str,
     ) -> Option<Vec<dataflow::reaching_defs::Definition>> {
-        let module = hir_def::ModuleId::new(self.context_file_id);
-        let body_defs = match self.owner {
-            DefWithBodyId::Method(local_id) => self.db.method_reaching_definitions(
-                MethodIdInput::new(self.db, hir_def::MethodId { module, local_id }),
-            )?,
-            DefWithBodyId::ModuleCode => {
-                self.db.module_code_reaching_definitions(self.context_file_id)?
-            }
-        };
+        let body_defs = self.reaching_defs()?;
         body_defs.defs_for_var_at_stmt(var_key, stmt_id)
     }
 
@@ -7845,20 +7932,33 @@ pub fn effective_method_returns<'db>(
     db: &'db dyn HirDatabase,
     eid: EffectiveModuleId<'db>,
 ) -> Arc<FxHashMap<hir_def::MethodKey, TypeId>> {
-    effective_method_returns_with_query_facts(db, eid, false)
+    effective_method_returns_with_query_facts(db, eid, false, 0)
 }
 
 fn effective_method_returns_with_query_facts<'db>(
     db: &'db dyn HirDatabase,
     eid: EffectiveModuleId<'db>,
     defer_query_facts: bool,
+    work_limit: usize,
 ) -> Arc<FxHashMap<hir_def::MethodKey, TypeId>> {
+    effective_method_returns_and_incompleteness(db, eid, defer_query_facts, work_limit).0
+}
+
+fn effective_method_returns_and_incompleteness<'db>(
+    db: &'db dyn HirDatabase,
+    eid: EffectiveModuleId<'db>,
+    defer_query_facts: bool,
+    work_limit: usize,
+) -> (Arc<FxHashMap<hir_def::MethodKey, TypeId>>, bool, usize) {
     let base_file = eid.base_file(db);
     let ext_file = eid.ext_file(db);
     let bodies = hir_def::effective_module::module_bodies_effective(db, eid);
     let interface = hir_def::effective_module::module_interface_effective(db, eid);
     let changed = effective_changed_methods(db, eid);
     let mut returns = FxHashMap::default();
+    let mut incomplete = false;
+    let mut spent = 0usize;
+    let mut remaining = work_limit;
     for (local_id, body) in bodies.iter_bodies() {
         if !changed.contains(&local_id) {
             continue;
@@ -7873,15 +7973,19 @@ fn effective_method_returns_with_query_facts<'db>(
         );
         if defer_query_facts {
             ctx.defer_query_facts();
-            ctx.defer_reaching_definitions();
+            ctx.defer_reaching_definitions_with_limit(remaining);
         }
         ctx.infer_all();
-        let ret = body_return_type(db, &ctx.finish());
+        let result = ctx.finish();
+        incomplete |= result.reaching_defs_incomplete;
+        spent = spent.saturating_add(result.reaching_defs_work_spent);
+        remaining = remaining.saturating_sub(result.reaching_defs_work_spent);
+        let ret = body_return_type(db, &result);
         if ret != db.unknown() {
             returns.insert(local_id, ret);
         }
     }
-    Arc::new(returns)
+    (Arc::new(returns), incomplete, spent)
 }
 
 /// Inference for one effective body with the shared return threading applied. Projections
@@ -7893,7 +7997,7 @@ pub fn infer_effective_owner(
     owner: DefWithBodyId,
     body: &Body,
 ) -> InferOwnerResult {
-    infer_effective_owner_with_query_facts(db, eid, owner, body, false)
+    infer_effective_owner_with_query_facts(db, eid, owner, body, false, 0)
 }
 
 /// The effective body inference a notification projection needs. Query facts are
@@ -7904,8 +8008,9 @@ pub(crate) fn infer_effective_owner_for_notify(
     eid: EffectiveModuleId<'_>,
     owner: DefWithBodyId,
     body: &Body,
+    work_limit: usize,
 ) -> InferOwnerResult {
-    infer_effective_owner_with_query_facts(db, eid, owner, body, true)
+    infer_effective_owner_with_query_facts(db, eid, owner, body, true, work_limit)
 }
 
 fn infer_effective_owner_with_query_facts(
@@ -7914,6 +8019,7 @@ fn infer_effective_owner_with_query_facts(
     owner: DefWithBodyId,
     body: &Body,
     defer_query_facts: bool,
+    work_limit: usize,
 ) -> InferOwnerResult {
     let base_file = eid.base_file(db);
     let ext_file = eid.ext_file(db);
@@ -7931,15 +8037,14 @@ fn infer_effective_owner_with_query_facts(
         owner,
         &Arc::new(body.clone()),
     );
-    ctx.set_local_effective_returns(effective_method_returns_with_query_facts(
-        db,
-        eid,
-        defer_query_facts,
-    ));
+    let (returns, returns_incomplete, returns_spent) =
+        effective_method_returns_and_incompleteness(db, eid, defer_query_facts, work_limit);
+    ctx.set_local_effective_returns(returns);
     ctx.notify_body_env = Some(effective_notify_body_env(db, eid, owner));
     if defer_query_facts {
         ctx.defer_query_facts();
-        ctx.defer_reaching_definitions();
+        ctx.defer_reaching_definitions_with_limit(work_limit.saturating_sub(returns_spent));
+        ctx.account_reaching_defs_work(returns_spent, returns_incomplete);
     }
     ctx.infer_all();
     finish_owner_inference(owner, ctx.finish())
@@ -8034,6 +8139,10 @@ fn weaving_notify_body_env(
     (base_definite & ext_declaration.preproc_env, base_possible & ext_possible)
 }
 
+/// A bounded allowance for the base-return inference a notify projection needs;
+/// the same order as the notify budget, but for a single helper body.
+const DEFERRED_BASE_RETURN_WORK_LIMIT: usize = 524_288;
+
 /// The `ПродолжитьВызов` facts of a weaving extension module: the base method return and
 /// arity per interceptor, plus every recognized interception by the extension method's
 /// local id. Built in one pass over the module's methods and shared by [`infer_weaving`]
@@ -8099,7 +8208,11 @@ fn weaving_proceed_facts_impl<'db>(
 
         let base_input = hir_def::MethodIdInput::new(db, base_method.id);
         let (ret, incomplete) = if defer_inference {
-            method_return_type_with_deferred_inference(db, base_input)
+            method_return_type_with_deferred_inference(
+                db,
+                base_input,
+                DEFERRED_BASE_RETURN_WORK_LIMIT,
+            )
         } else {
             (crate::method_graph::method_return_type_query(db, base_input), false)
         };
@@ -8119,11 +8232,12 @@ fn weaving_proceed_facts_impl<'db>(
 fn method_return_type_with_deferred_inference(
     db: &dyn HirDatabase,
     method: MethodIdInput<'_>,
+    work_limit: usize,
 ) -> (TypeId, bool) {
     let body = db.method_body_ref(method);
     let mut ctx = InferenceContext::new_for_method(db, method, body);
     ctx.defer_query_facts();
-    ctx.defer_reaching_definitions();
+    ctx.defer_reaching_definitions_with_limit(work_limit);
     ctx.infer_all();
     let result = ctx.finish();
     let incomplete = result.reaching_defs_incomplete;
@@ -8139,7 +8253,7 @@ pub fn infer_weaving_owner(
     owner: DefWithBodyId,
     body: &Body,
 ) -> InferOwnerResult {
-    infer_weaving_owner_with_query_facts(db, wid, owner, body, false)
+    infer_weaving_owner_with_query_facts(db, wid, owner, body, false, 0)
 }
 
 /// The weaving body inference a notification projection needs. See
@@ -8149,8 +8263,9 @@ pub(crate) fn infer_weaving_owner_for_notify(
     wid: WeavingModuleId<'_>,
     owner: DefWithBodyId,
     body: &Body,
+    work_limit: usize,
 ) -> InferOwnerResult {
-    infer_weaving_owner_with_query_facts(db, wid, owner, body, true)
+    infer_weaving_owner_with_query_facts(db, wid, owner, body, true, work_limit)
 }
 
 fn infer_weaving_owner_with_query_facts(
@@ -8159,6 +8274,7 @@ fn infer_weaving_owner_with_query_facts(
     owner: DefWithBodyId,
     body: &Body,
     defer_query_facts: bool,
+    work_limit: usize,
 ) -> InferOwnerResult {
     let ext_file = wid.ext_file(db);
     let base_module = hir_def::ModuleId::new(wid.base_file(db));
@@ -8172,7 +8288,7 @@ fn infer_weaving_owner_with_query_facts(
     ctx.notify_body_env = Some(weaving_notify_body_env(db, wid, &facts, owner));
     if defer_query_facts {
         ctx.defer_query_facts();
-        ctx.defer_reaching_definitions();
+        ctx.defer_reaching_definitions_with_limit(work_limit);
         if facts.returns_incomplete {
             ctx.mark_reaching_defs_incomplete();
         }
@@ -8355,6 +8471,45 @@ pub fn type_of_expr_query(
 mod tests {
     use super::*;
     use bsl_types::testing::InMemoryDb;
+
+    #[test]
+    fn deferred_reaching_defs_work_cancels_every_interval() {
+        let remaining = std::cell::Cell::new(1_000usize);
+        let spent = std::cell::Cell::new(0usize);
+        let since_cancel = std::cell::Cell::new(0usize);
+        let cancellations = std::cell::Cell::new(0usize);
+        let mut cancel = || cancellations.set(cancellations.get() + 1);
+
+        for _ in 0..127 {
+            assert!(charge_deferred_reaching_defs(
+                &remaining,
+                &spent,
+                &since_cancel,
+                1,
+                &mut cancel
+            ));
+        }
+        assert_eq!(cancellations.get(), 0, "below one interval there is no check");
+        assert!(charge_deferred_reaching_defs(&remaining, &spent, &since_cancel, 1, &mut cancel));
+        assert_eq!(cancellations.get(), 1, "the interval crossing checks cancellation");
+
+        // A large prepayment (index or suffix allocation) also reaches the check.
+        assert!(charge_deferred_reaching_defs(&remaining, &spent, &since_cancel, 300, &mut cancel));
+        assert_eq!(cancellations.get(), 2, "prepayment cancels immediately, not after the loop");
+        assert_eq!(since_cancel.get(), 300 % DEFERRED_REACHING_DEFS_CANCEL_INTERVAL);
+
+        let before_spent = spent.get();
+        let before_cancellations = cancellations.get();
+        assert!(!charge_deferred_reaching_defs(
+            &remaining,
+            &spent,
+            &since_cancel,
+            remaining.get() + 1,
+            &mut cancel
+        ));
+        assert_eq!(spent.get(), before_spent, "a refused payment spends nothing");
+        assert_eq!(cancellations.get(), before_cancellations, "a refused payment does no work");
+    }
 
     #[test]
     fn served_help_covers_only_a_target_it_is_known_not_to_predate() {

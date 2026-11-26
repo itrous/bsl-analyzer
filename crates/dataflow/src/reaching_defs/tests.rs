@@ -1375,8 +1375,10 @@ fn hidden_write_scan_is_linear_and_budgeted() {
     assert!(statements >= STATEMENTS, "the fixture declares the body: {statements}");
 
     let mut charges = 0usize;
-    let hidden = writes_hidden_on_exception_with_work(&body, &mut |_| {
+    let mut spent = 0usize;
+    let hidden = writes_hidden_on_exception_with_work(&body, &mut |work| {
         charges += 1;
+        spent += work;
         true
     })
     .expect("an unlimited budget scans the body");
@@ -1384,6 +1386,10 @@ fn hidden_write_scan_is_linear_and_budgeted() {
     assert!(
         charges <= 4 * statements,
         "the scan visits each statement a constant number of times: {charges} charges for {statements} statements"
+    );
+    assert!(
+        (3 * statements..=4 * statements).contains(&spent),
+        "the suffix allocation is paid before it exists and each statement costs a constant amount: {spent} work for {statements} statements"
     );
 
     let mut remaining = statements / 2;
@@ -1397,6 +1403,46 @@ fn hidden_write_scan_is_linear_and_budgeted() {
     assert!(
         stopped.is_none(),
         "a budget below the linear scan must stop it instead of running to completion"
+    );
+}
+
+/// The full reaching-definitions solve used by a deferred notify inference charges
+/// its index, entry state and visits, so a small budget stops it instead of running
+/// the whole ordinary solve outside the projection.
+#[test]
+fn full_reaching_definitions_solve_is_budgeted() {
+    let f = fixture(&nested_loops(4, 8));
+    let mut spent = 0usize;
+    let solved = solve_reaching_definitions_with_work(
+        f.cfg.clone(),
+        &f.body,
+        f.events.clone(),
+        true,
+        &mut |work| {
+            spent += work;
+            true
+        },
+    );
+    assert!(solved.is_some(), "an unlimited budget solves the body");
+    assert!(spent > 0, "the full solve reports its work");
+
+    let mut remaining = spent / 2;
+    let stopped = solve_reaching_definitions_with_work(
+        f.cfg.clone(),
+        &f.body,
+        f.events.clone(),
+        true,
+        &mut |work| {
+            if work > remaining {
+                return false;
+            }
+            remaining -= work;
+            true
+        },
+    );
+    assert!(
+        stopped.is_none(),
+        "a budget below the full solve must stop it instead of publishing a partial result"
     );
 }
 

@@ -492,12 +492,43 @@ pub fn solve_reaching_definitions(
     events: Arc<BodyEvents>,
     seed_params: bool,
 ) -> Option<Arc<ReachingDefsResult>> {
+    solve_reaching_definitions_with_work(cfg, body_arc, events, seed_params, &mut |_| true)
+}
+
+/// [`solve_reaching_definitions`] that reports the index, entry state and every
+/// solver visit to `spend`, and returns `None` when it refuses more. A deferred
+/// reader can therefore bound the full reaching-definitions solve instead of
+/// either running it unbounded or treating every body as incomplete.
+pub fn solve_reaching_definitions_with_work(
+    cfg: Arc<cfg::ControlFlowGraph>,
+    body_arc: &Arc<Body>,
+    events: Arc<BodyEvents>,
+    seed_params: bool,
+    spend: &mut dyn FnMut(usize) -> bool,
+) -> Option<Arc<ReachingDefsResult>> {
     let body: &Body = body_arc;
+    let mut refused = false;
+    let mut metered = |work: usize| {
+        if spend(work) {
+            true
+        } else {
+            refused = true;
+            false
+        }
+    };
     let params = params_of(body, seed_params);
-    let def_index = DefinitionIndex::from_body_with_params(body, &events, params.iter().cloned());
+    let def_index = DefinitionIndex::from_body_with_params_with_work(
+        body,
+        &events,
+        params.iter().cloned(),
+        &mut metered,
+    )?;
 
     let mut initial_defs = ReachingDefs::new(def_index.clone());
     for (name, binding_id) in &params {
+        if !metered(1) {
+            return None;
+        }
         initial_defs.insert(&Definition::parameter(name, *binding_id));
     }
 
@@ -506,7 +537,11 @@ pub fn solve_reaching_definitions(
     solver.set_bottom_factory(|| ReachingDefs::new(def_index.clone()));
     solver.set_initial_state(initial_defs);
 
-    solver.solve().map(|dataflow_result| {
+    let solved = solver.solve_with_work(&mut metered);
+    if refused {
+        return None;
+    }
+    solved.map(|dataflow_result| {
         Arc::new(ReachingDefsResult::new(dataflow_result, Arc::clone(body_arc), events))
     })
 }
@@ -1222,6 +1257,11 @@ fn hide_writes_after_safe_tail(
 ) -> Option<()> {
     // A suffix table makes every "is the rest non-raising?" question O(1), so a flat
     // body is scanned linearly instead of rescanning its tail for every statement.
+    // The allocation and initialisation are proportional to the region, so they are
+    // paid before the vector exists.
+    if !spend(stmts.len().saturating_add(1)) {
+        return None;
+    }
     let mut safe_suffix = vec![true; stmts.len() + 1];
     for position in (0..stmts.len()).rev() {
         if !spend(1) {

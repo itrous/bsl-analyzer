@@ -5,7 +5,8 @@
 
 use hir::{
     semantic_notify_candidates_query, semantic_notify_candidates_weaving_query,
-    semantic_notify_facts_effective_query, EffectiveModuleId, WeavingModuleId,
+    semantic_notify_facts_effective_query, semantic_notify_facts_with_work_limit,
+    EffectiveModuleId, NotifySignatureProtection, WeavingModuleId,
 };
 use ide_db::base_db::{FileIdInput, SourceDatabase, SourceRoot, SourceRootId};
 use ide_db::RootDatabaseImpl;
@@ -166,5 +167,108 @@ fn weaving_notify_projection_does_not_solve_query_facts_or_base_returns() {
     assert_eq!(
         solves, 0,
         "weaving notify inference and its base return must not solve reaching definitions"
+    );
+}
+
+#[test]
+fn ordinary_local_read_keeps_a_complete_projection_with_enough_budget() {
+    install_bundled_facts();
+    let mut db = RootDatabaseImpl::new();
+    let file_id = FileId(0);
+    let mut files = FileSet::new();
+    files.insert(file_id, VfsPath::new("/src/CommonModules/М/Ext/Module.bsl"));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(files));
+    db.set_file_source_root(file_id, SourceRootId(0));
+    db.set_file_text(
+        file_id,
+        "Процедура Регистрация()\n\
+         \tПерем Локальная;\n\
+         \tЛокальная = \"Обработчик\";\n\
+         \tДругая = Локальная;\n\
+         \tОписание = Новый ОписаниеОповещения(\"Обработчик\", ЭтотОбъект);\n\
+         КонецПроцедуры\n\
+         \n\
+         Процедура Обработчик(Параметр)\n\
+         КонецПроцедуры\n",
+    );
+
+    let (facts, solves) = dataflow::reaching_defs::with_executable_solve_count(|| {
+        semantic_notify_facts_with_work_limit(&db, FileIdInput::new(&db, file_id), 2_000_000)
+    });
+    assert_eq!(solves, 0, "an ordinary local read must not run the executable solve");
+    assert!(
+        !facts.summary.notify_projection_incomplete,
+        "a sufficient budget must keep the ordinary projection complete"
+    );
+    let callback = facts
+        .notify_candidates
+        .iter()
+        .find(|candidate| candidate.callback_name.as_str() == "Обработчик")
+        .expect("the literal callback is projected");
+    assert_eq!(
+        callback.signature_protection(),
+        NotifySignatureProtection::Protected,
+        "the local read must not turn a ThisObject callback into a foreign one"
+    );
+}
+
+#[test]
+fn effective_local_read_keeps_a_complete_projection_with_enough_budget() {
+    install_bundled_facts();
+    let temp = tempfile::tempdir().unwrap();
+    let main_root = temp.path().join("src/cf");
+    let ext_root = temp.path().join("src/cfe/X");
+    std::fs::create_dir_all(&main_root).unwrap();
+    std::fs::create_dir_all(&ext_root).unwrap();
+
+    let mut db = RootDatabaseImpl::new();
+    db.set_all_config_paths(
+        vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
+
+    let main_file = FileId(0);
+    let ext_file = FileId(1);
+    let mut file_set = FileSet::new();
+    let main_path = main_root.join("CommonModules/М/Ext/Module.bsl");
+    let ext_path = ext_root.join("CommonModules/М/Ext/Module.bsl");
+    file_set.insert(main_file, VfsPath::new(main_path.to_string_lossy().as_ref()));
+    file_set.insert(ext_file, VfsPath::new(ext_path.to_string_lossy().as_ref()));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    db.set_file_source_root(main_file, SourceRootId(0));
+    db.set_file_source_root(ext_file, SourceRootId(0));
+
+    db.set_file_text(main_file, "Процедура Цель() Экспорт\nКонецПроцедуры\n");
+    db.set_file_text(
+        ext_file,
+        "&ИзменениеИКонтроль(\"Цель\")\n\
+         Процедура Расш_Цель()\n\
+         #Вставка\n\
+         \tПерем Локальная;\n\
+         \tЛокальная = \"Обработчик\";\n\
+         \tДругая = Локальная;\n\
+         \tОписание = Новый ОписаниеОповещения(\"Обработчик\", ЭтотОбъект);\n\
+         #КонецВставки\n\
+         КонецПроцедуры\n\
+         \n\
+         Процедура Обработчик(Параметр)\n\
+         КонецПроцедуры\n",
+    );
+
+    let eid = EffectiveModuleId::new(&db, main_file, ext_file);
+    let facts = semantic_notify_facts_effective_query(&db, eid);
+    assert!(
+        !facts.summary.notify_projection_incomplete,
+        "the effective local read must not turn a complete projection incomplete"
+    );
+    let callback = facts
+        .notify_candidates
+        .iter()
+        .find(|candidate| candidate.callback_name.as_str() == "Обработчик")
+        .expect("the literal callback is projected");
+    assert_eq!(
+        callback.signature_protection(),
+        NotifySignatureProtection::Protected,
+        "the effective local read must not turn a ThisObject callback into a foreign one"
     );
 }
