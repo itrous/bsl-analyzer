@@ -194,12 +194,34 @@ impl AnalysisProvider for SalsaProvider<'_> {
     }
 
     fn notify_handler_methods(&self, file_id: FileId, name: &Name) -> Vec<MethodId> {
+        // The routed symbol tree is the spliced base for an effective module: methods the
+        // extension adds outside `&ИзменениеИКонтроль` are not part of that text, yet the
+        // platform still resolves a callback string against the combined object. Add them
+        // from the extension's own tree, skipping interceptors — their name belongs to the
+        // extension wrapper, not to a callable exported method.
         let mut methods = self
             .symbol_tree(ModuleId::new(file_id))
             .find_methods(name)
             .into_iter()
             .map(|method| method.id)
             .collect::<Vec<_>>();
+        if self.effective_for(file_id).is_some() {
+            methods.extend(
+                self.db
+                    .symbol_tree(ModuleId::new(file_id))
+                    .find_methods(name)
+                    .into_iter()
+                    .filter(|method| {
+                        self.db.interface_method(method.id).is_none_or(|declaration| {
+                            !declaration
+                                .directives
+                                .iter()
+                                .any(|directive| directive.is_interception())
+                        })
+                    })
+                    .map(|method| method.id),
+            );
+        }
         if let Some(route) = self.weaving_for(file_id) {
             methods.extend(
                 self.db
@@ -209,6 +231,10 @@ impl AnalysisProvider for SalsaProvider<'_> {
                     .map(|method| method.id),
             );
         }
+        // Effective and weaving routes can both contribute the base declaration; the
+        // registration verdict evaluates each declaration's environment once.
+        let mut seen = rustc_hash::FxHashSet::default();
+        methods.retain(|method| seen.insert(*method));
         methods
     }
 

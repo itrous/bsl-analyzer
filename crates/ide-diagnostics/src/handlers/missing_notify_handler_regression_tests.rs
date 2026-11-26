@@ -649,6 +649,133 @@ fn effective_cav_extension_this_object_callback_uses_base_handler() {
 }
 
 #[test]
+fn effective_cav_extension_this_object_callback_uses_extension_handler() {
+    const CALLER: &str = "Documents/Заказ/Ext/ObjectModule.bsl";
+    const EXTENSION: &str = r#"&ИзменениеИКонтроль("Проверить")
+&НаКлиенте
+Процедура Расш_Проверить()
+#Вставка
+    О = Новый ОписаниеОповещения("Обработчик", ЭтотОбъект);
+#КонецВставки
+КонецПроцедуры
+
+{handler}"#;
+    const BASE_DOCUMENT_XML: &str =
+        include_str!("../../../bsl-metadata/fixtures/extension_metadata/base/Documents/Заказ.xml");
+    const EXTENSION_DOCUMENT_XML: &str = include_str!(
+        "../../../bsl-metadata/fixtures/extension_metadata/extension/Documents/Заказ.xml"
+    );
+    const BASE_CONFIGURATION: &str =
+        include_str!("../../../bsl-metadata/fixtures/extension_metadata/base/Configuration.xml");
+    const EXTENSION_CONFIGURATION: &str = include_str!(
+        "../../../bsl-metadata/fixtures/extension_metadata/extension/Configuration.xml"
+    );
+    const BASE_METHOD: &str = "&НаКлиенте\nПроцедура Проверить()\nКонецПроцедуры\n";
+    const BASE_EXPORT: &str = r#"&НаКлиенте
+Процедура Обработчик() Экспорт
+КонецПроцедуры
+"#;
+    const BASE_NON_EXPORT: &str = r#"&НаКлиенте
+Процедура Обработчик()
+КонецПроцедуры
+"#;
+    const EXT_EXPORT: &str = r#"&НаКлиенте
+Процедура Обработчик() Экспорт
+КонецПроцедуры
+"#;
+    const EXT_NON_EXPORT: &str = r#"&НаКлиенте
+Процедура Обработчик()
+КонецПроцедуры
+"#;
+    const EXT_INTERCEPTOR: &str = r#"&Вместо("Проверить")
+&НаКлиенте
+Процедура Обработчик() Экспорт
+КонецПроцедуры
+"#;
+
+    let cases = [
+        ("", EXT_EXPORT, None),
+        (BASE_NON_EXPORT, EXT_EXPORT, None),
+        (BASE_EXPORT, EXT_NON_EXPORT, None),
+        ("", EXT_NON_EXPORT, Some("Добавьте")),
+        (BASE_NON_EXPORT, EXT_NON_EXPORT, Some("Добавьте")),
+        ("", "", Some("Создайте")),
+        ("", EXT_INTERCEPTOR, Some("Создайте")),
+    ];
+
+    for (base_handler, extension_handler, expected_message) in cases {
+        let source = EXTENSION.replace("{handler}", extension_handler);
+        let mut builder = CfeFixtureBuilder::new(BASE_CONFIGURATION);
+        builder.add_extension("Расш", EXTENSION_CONFIGURATION);
+        let diagnostics = crate::test_utils::check_cfe_at_with_db(
+            CALLER,
+            &source,
+            builder.build(),
+            &[],
+            DiagnosticsConfig::all_enabled(),
+            |fixture| {
+                let base = fixture.root().join("Documents/Заказ");
+                std::fs::create_dir_all(base.join("Ext")).unwrap();
+                std::fs::write(fixture.root().join("Documents/Заказ.xml"), BASE_DOCUMENT_XML)
+                    .unwrap();
+                std::fs::write(
+                    base.join("Ext/ObjectModule.bsl"),
+                    format!("{BASE_METHOD}{base_handler}"),
+                )
+                .unwrap();
+
+                let extension_root = &fixture.extensions()[0].root();
+                std::fs::create_dir_all(extension_root.join("Documents")).unwrap();
+                std::fs::write(extension_root.join("Documents/Заказ.xml"), EXTENSION_DOCUMENT_XML)
+                    .unwrap();
+            },
+            |db, ctx| {
+                let effective = ide_db::effective_target(db, ctx.file_id)
+                    .expect("a change-and-validate extension must route through a splice");
+                let provider =
+                    ide_db::SalsaProvider::new(db, None).with_effective(effective, ctx.file_id);
+                let routed = crate::DiagnosticsContext::new(ctx.config, ctx.file_id, &provider);
+                let methods = routed.notify_handler_methods(&hir::Name::new("Обработчик"));
+                let unique = methods.iter().copied().collect::<std::collections::HashSet<_>>();
+                assert_eq!(
+                    unique.len(),
+                    methods.len(),
+                    "route-aware declarations must not duplicate a method: {methods:#?}"
+                );
+                crate::file_diagnostics(db, ctx.file_id, ctx.config)
+            },
+        );
+        let missing = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == crate::DiagnosticCode::MissingNotifyHandler)
+            .collect::<Vec<_>>();
+        match expected_message {
+            Some(expected_message) => {
+                assert_eq!(
+                    missing.len(),
+                    1,
+                    "base_handler={base_handler:?}, extension_handler={extension_handler:?}: {diagnostics:#?}"
+                );
+                assert!(
+                    missing[0].message.starts_with(expected_message),
+                    "base_handler={base_handler:?}, extension_handler={extension_handler:?}: {missing:#?}"
+                );
+                let range = missing[0].range;
+                let source_slice = &source[usize::from(range.start())..usize::from(range.end())];
+                assert!(
+                    source_slice.contains("Новый ОписаниеОповещения"),
+                    "effective diagnostic range must remap to the inserted extension source: {source_slice:?}"
+                );
+            }
+            None => assert!(
+                missing.is_empty(),
+                "base_handler={base_handler:?}, extension_handler={extension_handler:?}: {diagnostics:#?}"
+            ),
+        }
+    }
+}
+
+#[test]
 fn weaving_extension_object_module_preserves_self_and_shadowed_receiver_verdicts() {
     const CALLER: &str = "Documents/Заказ/Ext/ObjectModule.bsl";
     const BASE_METHOD: &str = "&НаКлиенте\nПроцедура Проверить()\nКонецПроцедуры\n";
