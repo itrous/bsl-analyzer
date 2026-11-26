@@ -1215,7 +1215,7 @@ pub(crate) fn build_graph_database_inner(
     ticker.set_eta_total_intervals(if batches.is_empty() {
         0
     } else {
-        batches.len().saturating_mul(5).saturating_add(8)
+        batches.len().saturating_mul(4).saturating_add(8)
     });
     let _watchdog =
         spawn_build_watchdog(Arc::clone(&ticker), out_path.parent().map(Path::to_path_buf));

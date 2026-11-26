@@ -1161,17 +1161,9 @@ pub fn build_workspace_graph_rows(
     for (i, &batch) in batches.iter().enumerate() {
         note("index", i, batch);
         let db = open_batch(batch);
-        index.add_batch(&pool, &db, batch);
-        dropper.send(db)?;
-        clear_node_caches(&pool);
-    }
-
-    // A partial semantic notify projection is indistinguishable from a complete
-    // projection after it has been resolved to edges. Screen the complete workspace
-    // before the first sink write so a failed build cannot expose or persist a prefix.
-    for (i, &batch) in batches.iter().enumerate() {
-        note("notify_projection_gate", i, batch);
-        let db = open_batch(batch);
+        // Screen before any sink write: a partial projection cannot establish that
+        // absent notify edges are really absent. Reuse the index pass's database so
+        // this safety check does not require another workspace-wide load.
         if let Some(module) = batch
             .iter()
             .copied()
@@ -1183,6 +1175,7 @@ pub fn build_workspace_graph_rows(
                 format!("notify projection incomplete for module {module:?}; refusing persistent graph build"),
             )));
         }
+        index.add_batch(&pool, &db, batch);
         dropper.send(db)?;
         clear_node_caches(&pool);
     }
@@ -1531,22 +1524,6 @@ pub fn reproject_changed_modules(
     // same root — otherwise a link in the declared spelling would leave the build minting
     // basenames while everything served here minted the real rel.
     let strip_root = workspace_root.map(StripRoot::resolve);
-    // Check changed modules before constructing any replacement rows. The caller
-    // applies these rows transactionally, so an incomplete semantic projection must
-    // fail before it can open a persistence transaction or update freshness metadata.
-    let changed_db = open_batch(changed);
-    if let Some(module) = changed
-        .iter()
-        .copied()
-        .find(|module| changed_db.module_call_summary(*module).notify_projection_incomplete)
-    {
-        return Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("notify projection incomplete for module {module:?}; refusing persistent graph update"),
-        )));
-    }
-    drop(changed_db);
-
     let encoder = GraphRowEncoder::new(
         &index,
         paths,
@@ -3465,6 +3442,63 @@ mod tests {
         }
         code.push_str("О = Новый(\"CallbackDescription\", А);\nКонецПроцедуры\n");
         workspace(&[("/src/CommonModules/Тест/Ext/Module.bsl", &code)])
+    }
+
+    #[test]
+    fn notify_gate_reuses_existing_batch_opens() {
+        let analysis = workspace(&[(
+            "/src/CommonModules/Тест/Ext/Module.bsl",
+            "Процедура Тест()\nКонецПроцедуры\n",
+        )]);
+        let module = ModuleId::new(FileId(0));
+        let modules = [module];
+        let batches = [modules.as_slice()];
+        let paths = FxHashMap::from_iter([(
+            module.file_id,
+            "CommonModules/Тест/Ext/Module.bsl".to_owned(),
+        )]);
+        let mdo_files = hir::graph_index::MdoFiles::default();
+        let mut opens = 0;
+        let mut open_batch = |_: &[ModuleId]| {
+            opens += 1;
+            analysis.database().clone()
+        };
+        let mut sink = |_: &[NodeRow], _: &[EdgeRow]| Ok(());
+
+        build_workspace_graph_rows(
+            &modules,
+            &paths,
+            None,
+            &mdo_files,
+            &batches,
+            &mut open_batch,
+            &mut sink,
+            None,
+            None,
+        )
+        .expect("complete projection builds");
+        assert_eq!(
+            opens, 9,
+            "notify screening reuses the index pass instead of reopening the batch"
+        );
+
+        opens = 0;
+        let mut open_batch = |_: &[ModuleId]| {
+            opens += 1;
+            analysis.database().clone()
+        };
+        reproject_changed_modules(
+            &modules,
+            &modules,
+            &paths,
+            None,
+            &mdo_files,
+            &batches,
+            &mut open_batch,
+            None,
+        )
+        .expect("complete projection updates");
+        assert_eq!(opens, 2, "index and changed-module projection each open the batch once");
     }
 
     #[test]
