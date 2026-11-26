@@ -213,8 +213,16 @@ pub fn diagnostics_completeness(
     file_id: vfs::FileId,
     config: &DiagnosticsConfig,
 ) -> DiagnosticsCompleteness {
-    let input = base_db::FileIdInput::new(db, file_id);
     crate::result::notify_projection_completeness(config, || {
+        if let Some(eid) = ide_db::effective_target(db, file_id) {
+            return hir::semantic_module_call_summary_effective_query(db, eid)
+                .notify_projection_incomplete;
+        }
+        if let Some(wid) = ide_db::weaving_target(db, file_id) {
+            return hir::semantic_module_call_summary_weaving_query(db, wid)
+                .notify_projection_incomplete;
+        }
+        let input = base_db::FileIdInput::new(db, file_id);
         hir::semantic_module_call_summary_query(db, input).notify_projection_incomplete
     })
 }
@@ -407,6 +415,7 @@ fn finalize_diagnostics(
 /// or the merge would strip a finding no base-aware pass republishes.
 fn collect_base_sensitive(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     let mut result = collect_inference_diagnostics(ctx);
+    result.extend(handlers::missing_notify_handler::check(ctx));
     result.extend(handlers::unused_local_variable::check(ctx));
     result.extend(handlers::create_query_in_cycle::check(ctx));
     result

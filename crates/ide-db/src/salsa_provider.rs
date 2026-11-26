@@ -193,6 +193,25 @@ impl AnalysisProvider for SalsaProvider<'_> {
         )
     }
 
+    fn notify_handler_methods(&self, file_id: FileId, name: &Name) -> Vec<MethodId> {
+        let mut methods = self
+            .symbol_tree(ModuleId::new(file_id))
+            .find_methods(name)
+            .into_iter()
+            .map(|method| method.id)
+            .collect::<Vec<_>>();
+        if let Some(route) = self.weaving_for(file_id) {
+            methods.extend(
+                self.db
+                    .symbol_tree(ModuleId::new(route.base_file(self.db)))
+                    .find_methods(name)
+                    .into_iter()
+                    .map(|method| method.id),
+            );
+        }
+        methods
+    }
+
     fn notify_handler_availability_in_registration(
         &self,
         _file_id: FileId,
@@ -540,10 +559,23 @@ impl AnalysisProvider for SalsaProvider<'_> {
     }
 
     fn call_summary(&self, module_id: ModuleId) -> Arc<hir::ModuleCallSummary> {
+        let file_id = module_id.file_id;
+        if let Some(eid) = self.effective_for(file_id) {
+            return hir::semantic_module_call_summary_effective_query(self.db, eid);
+        }
+        if let Some(wid) = self.weaving_for(file_id) {
+            return hir::semantic_module_call_summary_weaving_query(self.db, wid);
+        }
         self.db.module_call_summary(module_id)
     }
 
     fn notify_candidates(&self, file_id: FileId) -> Arc<Vec<hir::NotifyCandidate>> {
+        if let Some(eid) = self.effective_for(file_id) {
+            return hir::semantic_notify_candidates_effective_query(self.db, eid);
+        }
+        if let Some(wid) = self.weaving_for(file_id) {
+            return hir::semantic_notify_candidates_weaving_query(self.db, wid);
+        }
         let input = FileIdInput::new(self.db, file_id);
         hir::semantic_notify_candidates_query(self.db, input)
     }

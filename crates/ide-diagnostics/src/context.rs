@@ -72,6 +72,10 @@ impl<'a> DiagnosticsContext<'a> {
         self.query(|p| p.notify_candidates(self.file_id))
     }
 
+    pub(crate) fn notify_handler_methods(&self, name: &hir::Name) -> Vec<hir::MethodId> {
+        self.query(|p| p.notify_handler_methods(self.file_id, name))
+    }
+
     /// Propagate cancellation while traversing facts already returned by a semantic query.
     pub fn check_cancellation(&self) {
         self.query(|p| p.check_cancellation())

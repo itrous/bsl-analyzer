@@ -1235,6 +1235,7 @@ impl GraphDb {
             nodes,
             edges,
             top_by_centrality,
+            incomplete: false,
             edge_provenance,
             client_to_server_edges,
         })
@@ -1480,6 +1481,7 @@ impl GraphDb {
             root: self.node_ref(&root, params.detail, roots),
             nodes,
             edges,
+            incomplete: false,
             total,
             returned,
             dropped_count: total - returned,

@@ -1246,6 +1246,7 @@ pub fn workspace_call_graph_query(
     // is unknown (form/command modules).
     for &module in &modules {
         let summary = db.module_call_summary(module);
+        graph.incomplete |= summary.notify_projection_incomplete;
         let module_dispatch = db
             .module_metadata(module)
             .execution_context

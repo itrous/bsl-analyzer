@@ -338,6 +338,240 @@ mod tests {
         }
     }
 
+    fn check_command_with_unreadable_global(
+        code: &str,
+        run: impl FnOnce(&DiagnosticsContext<'_>) -> Vec<Diagnostic>,
+    ) -> Vec<Diagnostic> {
+        const GLOBAL: &str = "НедоступныйГлобальный";
+        let mut builder = test_fixture::CfeFixtureBuilder::new("");
+        builder.add_base_module_global(GLOBAL, "Процедура Чужая() Экспорт КонецПроцедуры");
+        let fixture = builder.build();
+        let unreadable = format!("CommonModules/{GLOBAL}/Ext/Module.bsl");
+        crate::test_utils::check_cfe_at_with_db(
+            COMMON_COMMAND,
+            code,
+            fixture,
+            &[unreadable.as_str()],
+            DiagnosticsConfig::default(),
+            |fixture| {
+                let command_dir = fixture.root().join("CommonCommands/ОбновитьОстатки");
+                std::fs::create_dir_all(command_dir.join("Ext")).unwrap();
+                std::fs::write(command_dir.join("Ext/CommandModule.bsl"), code).unwrap();
+                std::fs::write(
+                    fixture.root().join("CommonCommands/ОбновитьОстатки.xml"),
+                    r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <CommonCommand uuid="00000000-0000-0000-0000-000000000001">
+        <Properties><Name>ОбновитьОстатки</Name></Properties>
+    </CommonCommand>
+</MetaDataObject>"#,
+                )
+                .unwrap();
+            },
+            |_, ctx| {
+                assert_eq!(
+                    ctx.module_metadata().module_type,
+                    bsl_metadata::ModuleType::CommandModule
+                );
+                run(ctx)
+            },
+        )
+    }
+
+    #[test]
+    fn function_receiver_stays_uncertain_about_the_local_handler() {
+        let code = r#"&НаКлиенте
+Процедура Регистрация()
+    Оповещение = Новый ОписаниеОповещения("Обработчик", ВернутьПриёмник());
+КонецПроцедуры
+
+Функция ВернутьПриёмник()
+    Возврат ЭтотОбъект;
+КонецФункции
+
+Процедура Обработчик(Параметр) Экспорт
+    Сообщить(1);
+КонецПроцедуры
+"#;
+        let diagnostics = check_command_at_with(code, |ctx| {
+            let candidates = ctx.notify_candidates();
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate.callback_name.as_str() == "Обработчик")
+                .expect("the callback candidate is exposed");
+            assert_eq!(
+                candidate.receiver,
+                hir::NotifyCandidateReceiver::LocalBinding,
+                "{candidate:#?}"
+            );
+            assert!(candidate.protects_local_method, "{candidate:#?}");
+            assert_eq!(
+                candidate.signature_protection(),
+                hir::NotifySignatureProtection::Protected,
+                "{candidate:#?}"
+            );
+            let registration = candidate.registration.as_ref().expect("registration");
+            assert_eq!(
+                registration.target,
+                hir::call_graph::NotifyTarget::LocalBinding,
+                "an uncertain receiver must not become a callback edge"
+            );
+            assert!(
+                crate::handlers::missing_notify_handler::check(ctx).is_empty(),
+                "an uncertain receiver must not become a MissingNotifyHandler finding"
+            );
+            let mut diagnostics = super::check(ctx);
+            diagnostics.extend(crate::handlers::unused_parameters::check(ctx));
+            diagnostics
+        });
+        let handler_start = code.rfind("Процедура Обработчик").unwrap();
+        let false_findings: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| usize::from(diagnostic.range.start()) >= handler_start)
+            .filter(|diagnostic| {
+                matches!(
+                    diagnostic.code,
+                    DiagnosticCode::UnusedParameters | DiagnosticCode::CommandModuleExportMethods
+                )
+            })
+            .collect();
+        assert!(
+            false_findings.is_empty(),
+            "a call receiver must not prove the callback foreign: {false_findings:#?}"
+        );
+    }
+
+    #[test]
+    fn indeterminate_bare_receiver_stays_uncertain_about_the_local_handler() {
+        let code = r#"&НаКлиенте
+Процедура Регистрация()
+    Оповещение = Новый ОписаниеОповещения("Обработчик", Приёмник);
+КонецПроцедуры
+
+Процедура Обработчик(Параметр) Экспорт
+    Сообщить(1);
+КонецПроцедуры
+"#;
+        let diagnostics = check_command_with_unreadable_global(code, |ctx| {
+            let candidates = ctx.notify_candidates();
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate.callback_name.as_str() == "Обработчик")
+                .expect("the callback candidate is exposed");
+            // The unreadable global body leaves the bare receiver's miss indeterminate,
+            // so the local callback is not proven foreign.
+            assert_eq!(
+                candidate.receiver,
+                hir::NotifyCandidateReceiver::LocalBinding,
+                "{candidate:#?}"
+            );
+            assert_eq!(
+                candidate.signature_protection(),
+                hir::NotifySignatureProtection::Protected,
+                "{candidate:#?}"
+            );
+            let registration = candidate.registration.as_ref().expect("registration");
+            assert_eq!(
+                registration.target,
+                hir::call_graph::NotifyTarget::LocalBinding,
+                "an indeterminate receiver must not become a callback edge"
+            );
+            assert!(
+                crate::handlers::missing_notify_handler::check(ctx).is_empty(),
+                "an indeterminate receiver must not become a MissingNotifyHandler finding"
+            );
+            let mut diagnostics = super::check(ctx);
+            diagnostics.extend(crate::handlers::unused_parameters::check(ctx));
+            diagnostics
+        });
+        let handler_start = code.rfind("Процедура Обработчик").unwrap();
+        let false_findings: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| usize::from(diagnostic.range.start()) >= handler_start)
+            .filter(|diagnostic| {
+                matches!(
+                    diagnostic.code,
+                    DiagnosticCode::UnusedParameters | DiagnosticCode::CommandModuleExportMethods
+                )
+            })
+            .collect();
+        assert!(
+            false_findings.is_empty(),
+            "an indeterminate receiver must not prove the callback foreign: {false_findings:#?}"
+        );
+    }
+
+    #[test]
+    fn call_returning_a_known_value_does_not_protect_a_command_handler() {
+        let code = r#"&НаКлиенте
+Процедура Регистрация()
+    Оповещение = Новый ОписаниеОповещения("Обработчик", ПолучитьМассив());
+КонецПроцедуры
+
+Функция ПолучитьМассив()
+    Возврат Новый Массив;
+КонецФункции
+
+Процедура Обработчик(Параметр) Экспорт
+    Сообщить(1);
+КонецПроцедуры
+"#;
+        let diagnostics = check_command_at_with(code, |ctx| {
+            let candidates = ctx.notify_candidates();
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate.callback_name.as_str() == "Обработчик")
+                .expect("the callback candidate is exposed");
+            // A call whose result is concrete data cannot be the current module object.
+            assert_eq!(candidate.receiver, hir::NotifyCandidateReceiver::Unknown, "{candidate:#?}");
+            assert!(!candidate.protects_local_method, "{candidate:#?}");
+            super::check(ctx)
+        });
+        let handler_start = code.rfind("Процедура Обработчик").unwrap();
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == DiagnosticCode::CommandModuleExportMethods
+                    && usize::from(diagnostic.range.start()) >= handler_start
+            }),
+            "a concrete call result proves the callback foreign: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn absent_bare_receiver_does_not_protect_a_command_handler() {
+        let code = r#"&НаКлиенте
+Процедура Регистрация()
+    Оповещение = Новый ОписаниеОповещения("Обработчик", ОтсутствующийМодуль);
+КонецПроцедуры
+
+Процедура Обработчик(Параметр) Экспорт
+    Сообщить(1);
+КонецПроцедуры
+"#;
+        let diagnostics = check_command_at_with(code, |ctx| {
+            let candidates = ctx.notify_candidates();
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate.callback_name.as_str() == "Обработчик")
+                .expect("the callback candidate is exposed");
+            // A complete surface makes the missing name a proven absence, not uncertainty.
+            assert_eq!(candidate.receiver, hir::NotifyCandidateReceiver::Unknown, "{candidate:#?}");
+            assert!(!candidate.protects_local_method, "{candidate:#?}");
+            let mut diagnostics = super::check(ctx);
+            diagnostics.extend(crate::handlers::unused_parameters::check(ctx));
+            diagnostics
+        });
+        let handler_start = code.rfind("Процедура Обработчик").unwrap();
+        for code in [DiagnosticCode::UnusedParameters, DiagnosticCode::CommandModuleExportMethods] {
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == code
+                        && usize::from(diagnostic.range.start()) >= handler_start
+                }),
+                "{code:?} must report the unrelated handler: {diagnostics:#?}"
+            );
+        }
+    }
+
     const EXPORTED: &str = r#"&НаКлиенте
 Процедура ОбработкаКоманды(Накладная, ПараметрыВыполнения) Экспорт
 	НапечататьЭтикетки(Накладная);

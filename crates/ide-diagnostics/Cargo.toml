@@ -36,6 +36,7 @@ spellbook.workspace = true
 text-size.workspace = true
 
 [dev-dependencies]
+dataflow = { workspace = true, features = ["test-seams"] }
 tempfile.workspace = true
 expect-test.workspace = true
 test-fixture.workspace = true

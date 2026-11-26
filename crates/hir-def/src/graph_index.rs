@@ -814,6 +814,7 @@ pub fn workspace_call_graph_via_index(
 
     // Pass 2: resolved call/manager edges via the index.
     for &module in modules {
+        graph.incomplete |= db.module_call_summary(module).notify_projection_incomplete;
         let summary = resolve_module_summary_via_index(db, module, index);
         let edges = {
             let dispatch = |node: &GraphNode| graph.dispatch(node);

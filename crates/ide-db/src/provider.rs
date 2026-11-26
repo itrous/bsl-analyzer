@@ -149,6 +149,16 @@ pub trait AnalysisProvider {
         rustc_hash::FxHashSet::default()
     }
 
+    /// Local declarations that may satisfy a callback on the current module object.
+    /// Base-aware providers include paired base declarations for extension routes.
+    fn notify_handler_methods(&self, file_id: FileId, name: &hir::Name) -> Vec<MethodId> {
+        self.symbol_tree(ModuleId::new(file_id))
+            .find_methods(name)
+            .into_iter()
+            .map(|method| method.id)
+            .collect()
+    }
+
     /// Whether same-named local methods provide an exported callback in each
     /// proven execution environment of a registration.
     fn notify_handler_availability_in_registration(

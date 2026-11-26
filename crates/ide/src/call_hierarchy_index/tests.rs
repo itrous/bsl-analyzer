@@ -211,10 +211,12 @@ fn named_unknown_array_gaps_publish_while_only_budget_truncation_rejects() {
     }];
     let db = batch_database(&files);
     let module = ModuleId::new(FileId(0));
-    let summary = db.module_call_summary(module).method_pair_subset();
+    let source_summary = db.module_call_summary(module);
+    assert!(!source_summary.notify_dynamic_signature_analysis_incomplete.is_empty());
+    let summary = source_summary.method_pair_subset();
 
     assert!(!summary.notify_projection_incomplete);
-    assert!(!summary.notify_dynamic_signature_analysis_incomplete.is_empty());
+    assert!(summary.notify_dynamic_signature_analysis_incomplete.is_empty());
 
     // When/Then: the conservative boundary publishes; the budget marker is the
     // only rejection trigger.

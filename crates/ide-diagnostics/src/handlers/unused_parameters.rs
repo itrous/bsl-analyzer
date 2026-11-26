@@ -1092,6 +1092,79 @@ EndProcedure
     }
 
     #[test]
+    fn function_receiver_keeps_the_callback_signature() {
+        let code = r#"Процедура Регистрация()
+    Оповещение = Новый ОписаниеОповещения("Обработчик", ВернутьПриёмник());
+КонецПроцедуры
+
+Функция ВернутьПриёмник()
+    Возврат ЭтотОбъект;
+КонецФункции
+
+Процедура Обработчик(Параметр)
+    Сообщить("callback");
+КонецПроцедуры
+"#;
+
+        let diagnostics = crate::test_utils::check_ast_diagnostic(code, |ctx| {
+            let candidates = ctx.notify_candidates();
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate.callback_name.as_str() == "Обработчик")
+                .expect("the registration is a notification candidate");
+            // A call result cannot be proven to be a foreign value here, so it must not
+            // become a proven-foreign verdict; the local callback keeps its signature.
+            assert_eq!(
+                candidate.receiver,
+                hir::NotifyCandidateReceiver::LocalBinding,
+                "{candidate:#?}"
+            );
+            assert!(candidate.protects_local_method, "{candidate:#?}");
+            assert_eq!(
+                candidate.signature_protection(),
+                hir::NotifySignatureProtection::Protected,
+                "{candidate:#?}"
+            );
+            super::check(ctx)
+        });
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn indeterminate_bare_receiver_keeps_the_callback_signature() {
+        let code = r#"Процедура Регистрация()
+    Оповещение = Новый ОписаниеОповещения("Обработчик", Приёмник);
+КонецПроцедуры
+
+Процедура Обработчик(Параметр)
+    Сообщить("callback");
+КонецПроцедуры
+"#;
+
+        let diagnostics = crate::test_utils::check_ast_diagnostic(code, |ctx| {
+            let candidates = ctx.notify_candidates();
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate.callback_name.as_str() == "Обработчик")
+                .expect("the registration is a notification candidate");
+            // This database has no configuration root, so the bare receiver's miss is
+            // indeterminate rather than proven foreign.
+            assert_eq!(
+                candidate.receiver,
+                hir::NotifyCandidateReceiver::LocalBinding,
+                "{candidate:#?}"
+            );
+            assert_eq!(
+                candidate.signature_protection(),
+                hir::NotifySignatureProtection::Protected,
+                "{candidate:#?}"
+            );
+            super::check(ctx)
+        });
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
     fn greek_sigma_handler_name_uses_bsl_identifier_equivalence() {
         let code = r#"Процедура СоздатьОповещение()
     Описание = Новый ОписаниеОповещения("οσ", ЭтотОбъект);
@@ -1111,6 +1184,7 @@ EndProcedure
 Процедура СоздатьОповещения()
 #Если МобильныйКлиент Тогда
     Описание = Новый ОписаниеОповещения("SelfHandler", ЭтотОбъект);
+    ДругойМодуль = Новый Массив;
     Описание = Новый ОписаниеОповещения("ForeignHandler", ДругойМодуль);
 #КонецЕсли
 КонецПроцедуры
@@ -1130,7 +1204,7 @@ EndProcedure
             code,
             DiagnosticCode::UnusedParameters,
             expect![[r#"
-                UnusedParameters @ 15:26..15:39
+                UnusedParameters @ 16:26..16:39
                   message: Уберите неиспользуемый параметр "ЧужойПараметр"
                   severity: Warning"#]],
         );

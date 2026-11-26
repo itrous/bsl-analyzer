@@ -194,8 +194,8 @@ pub use bsl_config::VisibleConfig;
 pub use bsl_types::facet::{FormBindingFacet, FormBindingTargetFacet, MdoRefFacet};
 pub use hir_def::effective_module::{
     effective_module_text, item_tree_effective, module_bodies_effective,
-    module_interface_effective, parse_effective, symbol_tree_effective, EffectiveModule,
-    EffectiveModuleId,
+    module_call_summary_effective, module_interface_effective, parse_effective,
+    symbol_tree_effective, EffectiveModule, EffectiveModuleId,
 };
 pub use hir_def::extension_merge::{
     extract_change_and_validate, pair_base_module_path, unquote_bsl_string, Origin, Segment,
@@ -235,7 +235,10 @@ pub use hir_ty::narrow::{
     NarrowState,
 };
 pub use hir_ty::notify_targets::{
-    semantic_module_call_summary_query, semantic_notify_candidates_query,
+    semantic_module_call_summary_effective_query, semantic_module_call_summary_query,
+    semantic_module_call_summary_weaving_query, semantic_notify_candidates_effective_query,
+    semantic_notify_candidates_query, semantic_notify_candidates_weaving_query,
+    semantic_notify_facts_effective_query, semantic_notify_facts_weaving_query,
     semantic_notify_facts_with_work_limit, NotifyCallbackSlot, NotifyCandidate,
     NotifyCandidateKind, NotifyCandidateReceiver, NotifySignatureProtection,
 };

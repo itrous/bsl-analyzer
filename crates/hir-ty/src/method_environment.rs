@@ -5,6 +5,19 @@ use rustc_hash::FxHashSet;
 
 use crate::db::HirDatabase;
 
+/// Runtime models considered by notify projection, independent of which build a project editor
+/// currently selects. A registration is checked against source-supported environments; narrower
+/// constructor and preprocessor facts still restrict each site.
+pub(crate) fn notify_env_options() -> EnvOptions {
+    EnvOptions {
+        client_environments: EnvFlags::ALL_CLIENTS | EnvFlags::MOBILE_CLIENT,
+        ordinary_app_support: true,
+        checked_environments: EnvFlags::ALL,
+        ordinary_forms_in_managed_app: None,
+        managed_run_mode: true,
+    }
+}
+
 /// Environments a method body runs in: its module's, narrowed by its own
 /// directive and by the module-level `#Если` regions around it. Read off the
 /// position-free interface so a per-method query stays valid across edits.
@@ -79,7 +92,7 @@ pub fn notify_method_is_exported_in_registration(
 ) -> bool {
     methods.contains(&method)
         && db.interface_method(method).is_some_and(|declaration| declaration.is_export)
-        && possible_method_env(db, method, &db.env_options())
+        && possible_method_env(db, method, &notify_env_options())
             .is_some_and(|environment| environment.intersects(registration.environments.possible))
 }
 
@@ -99,7 +112,7 @@ pub fn notify_methods_exported_in_registrations(
         }
         environments = environments.union(registration.environments.possible);
     }
-    let options = db.env_options();
+    let options = notify_env_options();
     let mut exported = FxHashSet::default();
     for (index, &method) in methods.iter().enumerate() {
         if index & 0xff == 0 {
@@ -138,7 +151,7 @@ pub fn notify_handler_availability_for_method_bodies_in_registration(
         return Availability::NotFound;
     }
 
-    let options = db.env_options();
+    let options = notify_env_options();
 
     let mut body_environments = Vec::with_capacity(method_bodies.len());
     for methods in method_bodies {

@@ -1556,6 +1556,21 @@ pub(crate) fn check_cfe_at_with_db_setup(
         }
     }
 
+    // A paired extension object module needs its base body in the source database for
+    // effective/weaving inference. Register that one counterpart when the fixture writes it;
+    // ordinary CFE fixtures remain unchanged when no such file exists.
+    let paired_base_path = fixture.root().join(caller_relative);
+    let paired_base_spelling = relative_to_root(&paired_base_path);
+    if paired_base_path.is_file()
+        && !module_files.iter().any(|(_, _, spelling)| spelling == &paired_base_spelling)
+    {
+        let fid = FileId((module_files.len() + 1) as u32);
+        let body = std::fs::read_to_string(&paired_base_path)
+            .expect("read paired base object-module fixture");
+        file_set.insert(fid, VfsPath::new(paired_base_path.to_string_lossy().into_owned()));
+        module_files.push((fid, body, paired_base_spelling));
+    }
+
     let source_root = SourceRoot::new_local(file_set);
     db.set_source_root(SourceRootId(0), source_root);
     db.set_file_source_root(caller_file_id, SourceRootId(0));

@@ -467,9 +467,12 @@ pub fn solve_reaching_definitions(
 /// it. On entry a parameter holds its `Parameter` definition and every other
 /// name of the body `Unknown`.
 ///
-/// `None` when the solver stopped before converging, and for a body whose
-/// lowering may have dropped statements or a jump target ([`hir_suppressed`])
-/// unless `recovered` asks to solve it anyway.
+/// `None` when no complete solution was published: the solver ran out of visits
+/// before converging, or `recovered` refused a body whose lowering may have dropped
+/// statements or a jump target ([`hir_suppressed`]). `None` never stands for an empty
+/// body or a graph no executable path enters: those solve to a complete result whose
+/// states are simply unreached. A reader must therefore read `None` as "the write set
+/// is unknown", never as "there are no writes".
 pub fn solve_executable_reaching_definitions(
     cfg: Arc<cfg::ControlFlowGraph>,
     body_arc: &Arc<Body>,
@@ -497,8 +500,50 @@ pub fn solve_executable_reaching_definitions(
 /// for every body would cut it off and leave it without any proof. The bound keeps a guard
 /// against a transfer that never settles.
 fn visit_budget(cfg: &cfg::ControlFlowGraph) -> usize {
+    #[cfg(feature = "test-seams")]
+    if let Some(visits) = visit_budget_seam::overridden() {
+        return visits;
+    }
     const VISITS_PER_BLOCK: usize = 64;
     DEFAULT_MAX_ITERATIONS.max(cfg.vertex_count().saturating_mul(VISITS_PER_BLOCK))
+}
+
+/// A bound a test can install for [`visit_budget`] without changing the graph.
+///
+/// Only the bound shrinks; the solve itself is the production one. Available with the
+/// `test-seams` feature, which a dependent crate enables from its dev-dependencies.
+#[cfg(feature = "test-seams")]
+pub fn with_visit_budget<R>(visits: usize, run: impl FnOnce() -> R) -> R {
+    let _restore = visit_budget_seam::install(visits);
+    run()
+}
+
+#[cfg(feature = "test-seams")]
+mod visit_budget_seam {
+    use std::cell::Cell;
+
+    thread_local! {
+        static OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn overridden() -> Option<usize> {
+        OVERRIDE.with(Cell::get)
+    }
+
+    /// Puts the thread's bound back when the test ends, so a panic cannot leak it into
+    /// the next test of the same thread.
+    pub(super) struct Restore(Option<usize>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0;
+            OVERRIDE.with(|bound| bound.set(previous));
+        }
+    }
+
+    pub(super) fn install(visits: usize) -> Restore {
+        Restore(OVERRIDE.with(|bound| bound.replace(Some(visits))))
+    }
 }
 
 /// What [`solve_executable_reaching_definitions`] does with a body whose

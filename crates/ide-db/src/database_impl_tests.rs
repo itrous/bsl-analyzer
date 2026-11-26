@@ -4346,6 +4346,7 @@ fn full_build_publishes_no_notify_edges_from_a_partially_read_projection() {
     // call must, and the sibling module's intact projection publishes exactly
     // its own reference — proving the absence above is not vacuous.
     let folded = db.workspace_call_graph(SourceRootId(0));
+    assert!(folded.incomplete, "the fold must carry the truncated projection state");
     assert_eq!(
         notify_edges(&folded),
         1,
@@ -4356,6 +4357,7 @@ fn full_build_publishes_no_notify_edges_from_a_partially_read_projection() {
     // Full build, batched index projection: byte-identical contract.
     let index = GraphIndex::build(&db, &modules);
     let batched = workspace_call_graph_via_index(&db, &modules, &index);
+    assert!(batched.incomplete, "the index projection must carry the truncated state");
     assert_eq!(
         notify_edges(&batched),
         1,
@@ -9840,4 +9842,113 @@ fn effective_body_has_its_own_flow() {
     let changed = effective.body(target.local_id).expect("effective body").stmt_count();
     let base_target = hir::MethodIdInput::new(&db, target);
     assert_ne!(changed, db.method_body_events(base_target).stmts().len());
+}
+
+/// The effective and weaving notification projections must resolve a receiver through
+/// the base module the same way their inference does: a call to a base sibling returns
+/// concrete data there, so the projection can prove the callback foreign, while the
+/// standalone extension query cannot and keeps it conservatively local.
+#[test]
+fn effective_and_weaving_notify_projections_resolve_base_siblings_for_receivers() {
+    use base_db::FileIdInput;
+    use hir::{
+        semantic_notify_candidates_effective_query, semantic_notify_candidates_query,
+        semantic_notify_candidates_weaving_query, NotifyCandidateReceiver,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let main_root = temp.path().join("src/cf");
+    let ext_root = temp.path().join("src/cfe/X");
+    for root in [&main_root, &ext_root] {
+        std::fs::create_dir_all(root.join("CommonModules/М/Ext")).unwrap();
+        std::fs::create_dir_all(root.join("CommonModules/В/Ext")).unwrap();
+    }
+
+    let mut db = RootDatabaseImpl::new();
+    db.set_all_config_paths(
+        vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
+
+    const BASE: &str =
+        "Функция ПолучитьМассив() Экспорт\n    Возврат Новый Массив;\nКонецФункции\n\n\
+                        Процедура Цель() Экспорт\nКонецПроцедуры\n";
+    const CAV_EXT: &str = "&ИзменениеИКонтроль(\"Цель\")\nПроцедура Расш_Цель()\n#Вставка\n    \
+                           О = Новый ОписаниеОповещения(\"Обработчик\", ПолучитьМассив());\n\
+                           #КонецВставки\nКонецПроцедуры\n";
+    const WEAVING_EXT: &str = "&Вместо(\"Цель\")\nПроцедура Расш_Цель()\n    \
+                               О = Новый ОписаниеОповещения(\"Обработчик\", ПолучитьМассив());\n\
+                               КонецПроцедуры\n";
+
+    let base_cav = FileId(0);
+    let cav_ext = FileId(1);
+    let base_weaving = FileId(2);
+    let weaving_ext = FileId(3);
+    let mut file_set = FileSet::new();
+    for (id, root, module, text) in [
+        (base_cav, &main_root, "М", BASE),
+        (cav_ext, &ext_root, "М", CAV_EXT),
+        (base_weaving, &main_root, "В", BASE),
+        (weaving_ext, &ext_root, "В", WEAVING_EXT),
+    ] {
+        let path = root.join(format!("CommonModules/{module}/Ext/Module.bsl"));
+        file_set.insert(id, VfsPath::new(path.to_string_lossy().into_owned()));
+        db.set_file_text(id, text);
+    }
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    for id in [base_cav, cav_ext, base_weaving, weaving_ext] {
+        db.set_file_source_root(id, SourceRootId(0));
+    }
+
+    fn callback(candidates: &[hir::NotifyCandidate]) -> &hir::NotifyCandidate {
+        candidates
+            .iter()
+            .find(|candidate| candidate.callback_name.as_str() == "Обработчик")
+            .unwrap_or_else(|| panic!("the registration must be projected: {candidates:#?}"))
+    }
+
+    // A standalone extension has no projection for its `#Вставка` text at all: the
+    // registration exists only in the effective module.
+    let cav_raw = semantic_notify_candidates_query(&db, FileIdInput::new(&db, cav_ext));
+    assert!(
+        cav_raw.iter().all(|candidate| candidate.callback_name.as_str() != "Обработчик"),
+        "the extension-only projection must not invent the insertion: {cav_raw:#?}"
+    );
+
+    let eid = hir::EffectiveModuleId::new(&db, base_cav, cav_ext);
+    let effective_facts = hir::semantic_notify_facts_effective_query(&db, eid);
+    assert!(
+        !effective_facts.summary.notify_projection_incomplete,
+        "the effective projection reports its own completeness"
+    );
+    let cav_effective = semantic_notify_candidates_effective_query(&db, eid);
+    let effective_candidate = callback(&cav_effective);
+    assert_eq!(
+        effective_candidate.receiver,
+        NotifyCandidateReceiver::Unknown,
+        "the base sibling returns concrete data in the effective module: {effective_candidate:#?}"
+    );
+    assert!(!effective_candidate.protects_local_method);
+    let registration = effective_candidate.registration.as_ref().expect("registration");
+    assert!(
+        !registration.range.is_empty(),
+        "the effective projection keeps the constructor's source range"
+    );
+
+    let weaving_raw = semantic_notify_candidates_query(&db, FileIdInput::new(&db, weaving_ext));
+    assert_eq!(callback(&weaving_raw).receiver, NotifyCandidateReceiver::LocalBinding);
+
+    let wid = hir::WeavingModuleId::new(&db, weaving_ext, base_weaving);
+    let weaving = semantic_notify_candidates_weaving_query(&db, wid);
+    let weaving_candidate = callback(&weaving);
+    assert_eq!(
+        weaving_candidate.receiver,
+        NotifyCandidateReceiver::Unknown,
+        "the base sibling resolves under weaving: {weaving_candidate:#?}"
+    );
+    assert!(!weaving_candidate.protects_local_method);
+    assert!(
+        !weaving_candidate.registration.as_ref().expect("registration").range.is_empty(),
+        "the weaving projection keeps the constructor's source range"
+    );
 }

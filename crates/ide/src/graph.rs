@@ -229,6 +229,10 @@ pub struct GraphOverview {
     pub nodes: usize,
     pub edges: usize,
     pub top_by_centrality: Vec<NodeRef>,
+    /// At least one module's semantic call projection was truncated. Counts and edges
+    /// describe only the known projection in that case.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub incomplete: bool,
     pub edge_provenance: BTreeMap<&'static str, usize>,
     pub client_to_server_edges: usize,
 }
@@ -245,6 +249,10 @@ pub struct NeighborsResult {
     pub root: NodeRef,
     pub nodes: Vec<NodeRef>,
     pub edges: Vec<EdgeRef>,
+    /// The backing in-memory graph has a truncated semantic call projection. No
+    /// edges are inferred to fill the missing portion.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub incomplete: bool,
     /// Total distinct neighbours discovered (excluding the root), before the
     /// `max_nodes` cap. Lets an agent see the true fan-out even when only the
     /// top-centrality slice is returned in `nodes`.
@@ -2520,6 +2528,7 @@ impl<'a> GraphCtx<'a> {
             nodes: node_count,
             edges: self.graph.edge_count(),
             top_by_centrality,
+            incomplete: self.graph.incomplete,
             edge_provenance,
             client_to_server_edges,
         }
@@ -2672,6 +2681,7 @@ impl<'a> GraphCtx<'a> {
             root: self.node_ref(root, params.detail),
             nodes,
             edges,
+            incomplete: self.graph.incomplete,
             total,
             returned,
             dropped_count: total - returned,
@@ -3514,6 +3524,60 @@ mod tests {
             project_batch_call_edges(&pool, analysis.database(), &modules, &index, &mut state);
 
         assert_eq!(projection.notify_projection_incomplete, vec![module]);
+    }
+
+    #[test]
+    fn public_in_memory_graph_queries_mark_truncated_projection_without_inventing_edges() {
+        let analysis = exhausted_notify_projection_workspace();
+
+        let overview = analysis.graph_overview(ROOT, None, 10);
+        assert!(overview.incomplete, "overview must disclose the truncated projection");
+        assert_eq!(overview.edges, 0, "missing callback edges are not synthesized");
+        assert_eq!(serde_json::to_value(&overview).unwrap()["incomplete"], serde_json::json!(true));
+
+        let params = NeighborsParams {
+            id: "method/common/Тест/Тест",
+            dir: Direction::Both,
+            depth: 1,
+            max_nodes: 10,
+            detail: GraphDetail::Names,
+            provenance_filter: Vec::new(),
+            edge_kind_filter: Vec::new(),
+            call_sites: false,
+            max_call_sites: 0,
+        };
+        let neighbors = analysis.graph_neighbors(ROOT, None, &params).expect("method resolves");
+        assert!(neighbors.incomplete, "neighbors must disclose the truncated projection");
+        assert!(neighbors.edges.is_empty(), "unknown callbacks must not become graph edges");
+        assert_eq!(
+            serde_json::to_value(&neighbors).unwrap()["incomplete"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn complete_in_memory_graph_omits_incomplete_marker() {
+        let analysis = workspace(&[(
+            "/src/CommonModules/Тест/Ext/Module.bsl",
+            "Процедура Тест()\nКонецПроцедуры\n",
+        )]);
+        let overview = analysis.graph_overview(ROOT, None, 10);
+        assert!(!overview.incomplete);
+        assert!(serde_json::to_value(overview).unwrap().get("incomplete").is_none());
+        let params = NeighborsParams {
+            id: "method/common/Тест/Тест",
+            dir: Direction::Both,
+            depth: 1,
+            max_nodes: 10,
+            detail: GraphDetail::Names,
+            provenance_filter: Vec::new(),
+            edge_kind_filter: Vec::new(),
+            call_sites: false,
+            max_call_sites: 0,
+        };
+        let neighbors = analysis.graph_neighbors(ROOT, None, &params).expect("method resolves");
+        assert!(!neighbors.incomplete);
+        assert!(serde_json::to_value(neighbors).unwrap().get("incomplete").is_none());
     }
 
     #[test]

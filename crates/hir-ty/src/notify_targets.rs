@@ -10,10 +10,12 @@ use hir_def::call_graph::{
     NotifyReceiverSyntax, NotifyReg, NotifyTarget,
 };
 use hir_def::conditional_tree::{ConditionalIdx, ConditionalTree};
+use hir_def::effective_module::EffectiveModuleId;
 use hir_def::hir::{Expr, ExprIdx, Literal, Stmt};
+use hir_def::weaving::WeavingModuleId;
 use hir_def::{
     call_graph::NotifyRegistrationEnvironments, execution_env::EnvFlags, DefWithBodyId, ExprId,
-    IdConversion, MethodKey, ModuleId, Name, StmtId,
+    IdConversion, MethodKey, ModuleBodies, ModuleId, Name, StmtId,
 };
 use intern::NormName;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -22,7 +24,10 @@ use vfs::FileId;
 
 use crate::body_flow::BodyFlow;
 use crate::db::HirDatabase;
-use crate::infer::{infer_owner, BareNameOrigin, CallArgBinding, InferOwnerResult};
+use crate::infer::{
+    infer_effective_owner, infer_owner, infer_weaving_owner, BareNameOrigin, CallArgBinding,
+    InferOwnerResult,
+};
 use crate::notify_array::{callback_arguments_for_binding_with_budget, NotifyArrayRegistration};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +205,15 @@ impl<'a> NotifyWorkBudget<'a> {
     pub(crate) fn exhausted(&self) -> bool {
         self.exhausted
     }
+
+    /// Records that the pass cannot produce a complete result although it has not
+    /// spent its remaining work: an input it must prove against is unavailable.
+    /// Callers read the flag as the projection's completeness, so a stopped input
+    /// must set it instead of leaving an empty answer that looks complete.
+    pub(crate) fn mark_incomplete(&mut self) {
+        self.remaining = 0;
+        self.exhausted = true;
+    }
 }
 
 /// Every body contributes at least one item, even when it has no expressions, statements,
@@ -373,6 +387,103 @@ impl<'a> ConditionalEnvIndex<'a> {
     }
 }
 
+/// One module's inputs to the notification projection: the bodies to walk, the
+/// conditional tree their ranges index, the inference that resolves each caller's
+/// receivers, and the file identity used for metadata and CFG lookups. Ordinary,
+/// effective (`&ИзменениеИКонтроль`) and weaving (`&Вместо`/`&Перед`/`&После`) modules
+/// differ only in how this view is assembled; the projection below is one algorithm.
+type NotifyInference<'a> = Box<dyn Fn(DefWithBodyId, &Body) -> InferOwnerResult + 'a>;
+type NotifyFlow<'a> = Box<dyn Fn(&dyn HirDatabase, DefWithBodyId, &Body) -> BodyFlow + 'a>;
+
+struct NotifyModuleProjection<'a> {
+    file_id: FileId,
+    bodies: Arc<ModuleBodies>,
+    conditional_tree: Arc<ConditionalTree>,
+    current_common_module: Option<Name>,
+    infer: NotifyInference<'a>,
+    flow: NotifyFlow<'a>,
+}
+
+impl<'db> NotifyModuleProjection<'db> {
+    fn for_file(db: &'db dyn HirDatabase, file_id: FileId) -> Self {
+        let module_id = ModuleId::new(file_id);
+        Self {
+            file_id,
+            bodies: db.module_bodies_ref(module_id).clone(),
+            conditional_tree: db.conditional_tree_ref(file_id).clone(),
+            current_common_module: common_module_name(db, module_id),
+            infer: Box::new(move |owner, _body| infer_owner(db, file_id, owner)),
+            flow: Box::new(move |db, owner, body| ordinary_flow(db, file_id, owner, body)),
+        }
+    }
+
+    fn for_effective(db: &'db dyn HirDatabase, eid: EffectiveModuleId<'db>) -> Self {
+        let base_file = eid.base_file(db);
+        let bodies = hir_def::effective_module::module_bodies_effective(db, eid);
+        let parse = hir_def::effective_module::parse_effective(db, eid);
+        Self {
+            file_id: base_file,
+            bodies,
+            conditional_tree: Arc::new(hir_def::conditional_tree::lower_conditionals(
+                &parse.syntax_node(),
+            )),
+            current_common_module: common_module_name(db, ModuleId::new(base_file)),
+            infer: Box::new(move |owner, body| infer_effective_owner(db, eid, owner, body)),
+            // The effective bodies are a splice, not the memoised bodies under either
+            // file, so their flow is their own; params seed a method exactly as in
+            // `InferenceContext::new_effective`.
+            flow: Box::new(|_db, owner, body| {
+                BodyFlow::detached(
+                    Arc::new(body.clone()),
+                    matches!(owner, DefWithBodyId::Method(_)),
+                )
+            }),
+        }
+    }
+
+    fn for_weaving(db: &'db dyn HirDatabase, wid: WeavingModuleId<'db>) -> Self {
+        let file_id = wid.ext_file(db);
+        let module_id = ModuleId::new(file_id);
+        Self {
+            file_id,
+            bodies: db.module_bodies_ref(module_id).clone(),
+            conditional_tree: db.conditional_tree_ref(file_id).clone(),
+            current_common_module: common_module_name(db, module_id),
+            infer: Box::new(move |owner, body| infer_weaving_owner(db, wid, owner, body)),
+            // Weaving has no splice: the extension keeps its own memoised bodies.
+            flow: Box::new(move |db, owner, body| ordinary_flow(db, file_id, owner, body)),
+        }
+    }
+}
+
+/// The flow of a file's own memoised body. Both ordinary and weaving routes use it; an
+/// effective splice supplies its own flow because its text is neither file's memo.
+fn ordinary_flow(
+    db: &dyn HirDatabase,
+    file_id: FileId,
+    owner: DefWithBodyId,
+    body: &Body,
+) -> BodyFlow {
+    match owner {
+        DefWithBodyId::Method(local_id) => {
+            let method = hir_def::MethodId { module: ModuleId::new(file_id), local_id };
+            let input = hir_def::MethodIdInput::new(db, method);
+            BodyFlow::for_method(db, input, db.method_body_ref(input))
+        }
+        DefWithBodyId::ModuleCode => {
+            let bodies = db.module_bodies_ref(ModuleId::new(file_id));
+            bodies.module_code_arc().map_or_else(
+                || BodyFlow::detached(Arc::new(body.clone()), false),
+                |body| BodyFlow::for_module_code(db, file_id, body),
+            )
+        }
+    }
+}
+
+fn common_module_name(db: &dyn HirDatabase, module_id: ModuleId) -> Option<Name> {
+    db.module_metadata(module_id).common_module.as_ref().map(|module| Name::new(module.name()))
+}
+
 #[salsa::tracked(
     lru = 256,
     heap_size = semantic_notify_facts_heap,
@@ -386,10 +497,87 @@ pub fn semantic_notify_facts_query<'db>(
     if raw.notify_candidates.is_empty() {
         return empty_notify_facts(&raw);
     }
+    let projection = NotifyModuleProjection::for_file(db, file_id_input.file_id(db));
     let mut cancel = || db.unwind_if_revision_cancelled();
-    let module_id = ModuleId::new(file_id_input.file_id(db));
-    let mut budget = NotifyWorkBudget::for_module(&mut cancel, db.module_bodies_ref(module_id));
-    semantic_notify_facts_with_budget(db, file_id_input, &raw, &mut budget)
+    let mut budget = NotifyWorkBudget::for_module(&mut cancel, &projection.bodies);
+    semantic_notify_facts_with_budget(db, &projection, &raw, &mut budget)
+}
+
+/// The effective `&ИзменениеИКонтроль` module's notification projection: the merged
+/// source supplies constructors, ranges and callers, while inference runs through the
+/// effective context so a receiver like `ЭтотОбъект` resolves against the base module's
+/// metadata. Ranges stay in effective-text coordinates; the diagnostics merge remaps
+/// `#Вставка` findings to the extension source.
+#[salsa::tracked(
+    lru = 256,
+    heap_size = semantic_notify_facts_heap,
+    returns(clone)
+)]
+pub fn semantic_notify_facts_effective_query<'db>(
+    db: &'db dyn HirDatabase,
+    eid: EffectiveModuleId<'db>,
+) -> Arc<SemanticNotifyFacts> {
+    let raw = hir_def::effective_module::module_call_summary_effective(db, eid);
+    if raw.notify_candidates.is_empty() {
+        return empty_notify_facts(&raw);
+    }
+    let projection = NotifyModuleProjection::for_effective(db, eid);
+    let mut cancel = || db.unwind_if_revision_cancelled();
+    let mut budget = NotifyWorkBudget::for_module(&mut cancel, &projection.bodies);
+    semantic_notify_facts_with_budget(db, &projection, &raw, &mut budget)
+}
+
+/// The weaving extension module's notification projection: its own bodies and ranges,
+/// with inference routed through the base module as a same-module sibling fallback.
+#[salsa::tracked(
+    lru = 256,
+    heap_size = semantic_notify_facts_heap,
+    returns(clone)
+)]
+pub fn semantic_notify_facts_weaving_query<'db>(
+    db: &'db dyn HirDatabase,
+    wid: WeavingModuleId<'db>,
+) -> Arc<SemanticNotifyFacts> {
+    let file_id = wid.ext_file(db);
+    let raw = hir_def::queries::module_call_summary_query(db, FileIdInput::new(db, file_id));
+    if raw.notify_candidates.is_empty() {
+        return empty_notify_facts(&raw);
+    }
+    let projection = NotifyModuleProjection::for_weaving(db, wid);
+    let mut cancel = || db.unwind_if_revision_cancelled();
+    let mut budget = NotifyWorkBudget::for_module(&mut cancel, &projection.bodies);
+    semantic_notify_facts_with_budget(db, &projection, &raw, &mut budget)
+}
+
+pub fn semantic_notify_candidates_effective_query<'db>(
+    db: &'db dyn HirDatabase,
+    eid: EffectiveModuleId<'db>,
+) -> Arc<Vec<NotifyCandidate>> {
+    semantic_notify_facts_effective_query(db, eid).notify_candidates.clone()
+}
+
+pub fn semantic_notify_candidates_weaving_query<'db>(
+    db: &'db dyn HirDatabase,
+    wid: WeavingModuleId<'db>,
+) -> Arc<Vec<NotifyCandidate>> {
+    semantic_notify_facts_weaving_query(db, wid).notify_candidates.clone()
+}
+
+/// The semantic summary of the effective module: registrations and the projection's
+/// completeness verdict, exactly as the plain per-file query answers for its own module.
+pub fn semantic_module_call_summary_effective_query<'db>(
+    db: &'db dyn HirDatabase,
+    eid: EffectiveModuleId<'db>,
+) -> Arc<ModuleCallSummary> {
+    semantic_notify_facts_effective_query(db, eid).summary.clone()
+}
+
+/// The semantic summary of the weaving extension module, with its own ranges.
+pub fn semantic_module_call_summary_weaving_query<'db>(
+    db: &'db dyn HirDatabase,
+    wid: WeavingModuleId<'db>,
+) -> Arc<ModuleCallSummary> {
+    semantic_notify_facts_weaving_query(db, wid).summary.clone()
 }
 
 /// Test hook: the same projection with an explicit work limit, so callers can
@@ -404,9 +592,10 @@ pub fn semantic_notify_facts_with_work_limit<'db>(
     if raw.notify_candidates.is_empty() {
         return empty_notify_facts(&raw);
     }
+    let projection = NotifyModuleProjection::for_file(db, file_id_input.file_id(db));
     let mut cancel = || db.unwind_if_revision_cancelled();
     let mut budget = NotifyWorkBudget::with_limit(&mut cancel, work_limit);
-    semantic_notify_facts_with_budget(db, file_id_input, &raw, &mut budget)
+    semantic_notify_facts_with_budget(db, &projection, &raw, &mut budget)
 }
 
 fn empty_notify_facts(raw: &ModuleCallSummary) -> Arc<SemanticNotifyFacts> {
@@ -422,18 +611,16 @@ fn empty_notify_facts(raw: &ModuleCallSummary) -> Arc<SemanticNotifyFacts> {
 
 fn semantic_notify_facts_with_budget<'db>(
     db: &'db dyn HirDatabase,
-    file_id_input: FileIdInput<'db>,
+    projection: &NotifyModuleProjection<'db>,
     raw: &ModuleCallSummary,
     budget: &mut NotifyWorkBudget<'_>,
 ) -> Arc<SemanticNotifyFacts> {
-    let file_id = file_id_input.file_id(db);
-    let module_id = ModuleId::new(file_id);
     let mut summary = raw.clone();
     let mut candidates = Vec::new();
     let mut notify_candidates = Vec::new();
     let mut reachable_dynamic_constructors: FxHashSet<(CallerId, ExprId)> = FxHashSet::default();
 
-    let bodies = db.module_bodies_ref(module_id);
+    let bodies = &*projection.bodies;
     let platform = PlatformDataInner::instance();
     let use_syntax_fallback = !bsl_platform::has_callback_description_constructor_facts(platform);
     let mut bodies_by_caller: FxHashMap<CallerId, &Body> = FxHashMap::default();
@@ -484,11 +671,9 @@ fn semantic_notify_facts_with_budget<'db>(
         });
     }
 
-    let metadata = db.module_metadata(module_id);
-    let current_common_module =
-        metadata.common_module.as_ref().map(|module| Name::new(module.name()));
-    let conditional_tree = db.conditional_tree_ref(file_id);
-    let Some(mut conditional_envs) = ConditionalEnvIndex::new(conditional_tree, budget) else {
+    let current_common_module = projection.current_common_module.clone();
+    let Some(mut conditional_envs) = ConditionalEnvIndex::new(&projection.conditional_tree, budget)
+    else {
         return finish_incomplete_facts(summary, notify_candidates, CallerId::ModuleCode);
     };
 
@@ -510,7 +695,7 @@ fn semantic_notify_facts_with_budget<'db>(
         };
         normalize_owner_candidates(
             db,
-            file_id,
+            projection,
             owner,
             body,
             &indices,
@@ -963,7 +1148,7 @@ fn semantic_notify_facts_heap(facts: &Arc<SemanticNotifyFacts>) -> usize {
 )]
 fn normalize_owner_candidates(
     db: &dyn HirDatabase,
-    file_id: FileId,
+    projection: &NotifyModuleProjection<'_>,
     owner: DefWithBodyId,
     body: &Body,
     candidate_indices: &[usize],
@@ -979,7 +1164,7 @@ fn normalize_owner_candidates(
     if !budget.spend() {
         return;
     }
-    let inference = infer_owner(db, file_id, owner);
+    let inference = (projection.infer)(owner, body);
     let mut dead_stmts: FxHashSet<StmtId> = FxHashSet::default();
     for &stmt in inference.dead_stmts() {
         if !budget.spend() {
@@ -987,20 +1172,7 @@ fn normalize_owner_candidates(
         }
         dead_stmts.insert(stmt);
     }
-    let flow = match owner {
-        DefWithBodyId::Method(local_id) => {
-            let method = hir_def::MethodId { module: ModuleId::new(file_id), local_id };
-            let input = hir_def::MethodIdInput::new(db, method);
-            BodyFlow::for_method(db, input, db.method_body_ref(input))
-        }
-        DefWithBodyId::ModuleCode => {
-            let bodies = db.module_bodies_ref(ModuleId::new(file_id));
-            bodies.module_code_arc().map_or_else(
-                || BodyFlow::detached(std::sync::Arc::new(body.clone()), false),
-                |body| BodyFlow::for_module_code(db, file_id, body),
-            )
-        }
-    };
+    let flow = (projection.flow)(db, owner, body);
     let cfg = flow.cfg(db);
     let Some(reachable_stmts) = reachable_statements_with_budget(&cfg, budget) else {
         return;
@@ -1008,7 +1180,7 @@ fn normalize_owner_candidates(
     if !budget.spend() {
         return;
     }
-    let owner_possible_env = owner_possible_in_any_build(db, file_id, owner);
+    let owner_possible_env = owner_possible_in_any_build(db, projection.file_id, owner);
     let reaching_defs = flow.executable_reaching_defs(db);
     let mut has_dynamic_array_candidate = false;
     for &index in candidate_indices {
@@ -1285,9 +1457,14 @@ fn build_notify_registration(
     let target = if not_compiled {
         NotifyTarget::NotCompiled { callback_expr, receiver_syntax }
     } else {
-        receiver.map_or(NotifyTarget::Unsupported, |receiver| {
-            normalize_receiver(db, inference, receiver)
-        })
+        match receiver {
+            Some(receiver) => normalize_receiver(db, inference, receiver).unwrap_or_else(|| {
+                unresolved_receiver_target(db, inference, receiver, receiver_syntax)
+            }),
+            // An omitted receiver argument names no value at all, so it cannot be
+            // promoted to the uncertainty of an unresolved expression.
+            None => NotifyTarget::Unsupported,
+        }
     };
     let callback_name = Name::new(callback_name);
     NotifyReg {
@@ -1500,13 +1677,7 @@ fn owner_possible_in_any_build(
     file_id: FileId,
     owner: DefWithBodyId,
 ) -> EnvFlags {
-    let options = hir_def::execution_env::EnvOptions {
-        client_environments: EnvFlags::ALL_CLIENTS | EnvFlags::MOBILE_CLIENT,
-        ordinary_app_support: true,
-        checked_environments: EnvFlags::ALL,
-        ordinary_forms_in_managed_app: None,
-        managed_run_mode: true,
-    };
+    let options = crate::method_environment::notify_env_options();
     match owner {
         DefWithBodyId::Method(local_id) => {
             let method = hir_def::MethodId { module: ModuleId::new(file_id), local_id };
@@ -1580,12 +1751,35 @@ fn normalize_receiver(
     db: &dyn HirDatabase,
     inference: &InferOwnerResult,
     receiver: ExprId,
-) -> NotifyTarget {
+) -> Option<NotifyTarget> {
     inference
         .notify_receiver_resolution(receiver)
-        .map_or(NotifyTarget::Unsupported, |(origin, ty)| {
-            normalize_resolved_receiver(origin, db, ty)
-        })
+        .map(|(origin, ty)| normalize_resolved_receiver(origin, db, ty))
+}
+
+/// A receiver inference could not attribute to a bare name is not proven foreign: a
+/// non-bare expression whose type is not concrete data may still hold `ЭтотОбъект`, and
+/// an indeterminate bare read stopped on an incomplete surface. Both stay uncertain, so
+/// they keep the local callback's signature without creating an edge or a finding.
+fn unresolved_receiver_target(
+    db: &dyn HirDatabase,
+    inference: &InferOwnerResult,
+    receiver: ExprId,
+    receiver_syntax: NotifyReceiverSyntax,
+) -> NotifyTarget {
+    let may_be_local = match receiver_syntax {
+        NotifyReceiverSyntax::SelfName | NotifyReceiverSyntax::BareName => {
+            inference.notify_receiver_is_indeterminate(receiver)
+        }
+        NotifyReceiverSyntax::Other => inference
+            .type_id_of_expr(receiver)
+            .is_none_or(|ty| !is_known_data_value(db, db.lookup_type(ty))),
+    };
+    if may_be_local {
+        NotifyTarget::LocalBinding
+    } else {
+        NotifyTarget::Unsupported
+    }
 }
 
 fn normalize_resolved_receiver(
@@ -1784,8 +1978,10 @@ mod tests {
 
     #[test]
     fn signature_verdict_protects_a_local_binding_that_may_be_this_object() {
-        // A local binding of unknown runtime value may hold `ЭтотОбъект`, so a static
-        // constructor stays protected without asserting a local callback reference.
+        // A local binding of unknown runtime value may hold `ЭтотОбъект`; so does an
+        // unresolved non-bare or indeterminate receiver, which classifies the same way.
+        // A static constructor therefore stays protected without asserting a local
+        // callback reference or an edge to it.
         for kind in [NotifyCandidateKind::Static, NotifyCandidateKind::DynamicArray] {
             assert_eq!(
                 candidate(
@@ -1939,16 +2135,16 @@ mod tests {
             "an object of the same metadata type can execute this module's handler"
         );
 
-        let unresolved = candidate(
+        let foreign = candidate(
             NotifyReceiverSyntax::BareName,
             NotifyCandidateReceiver::Unknown,
             NotifyCandidateKind::Static,
             false,
         );
         assert_eq!(
-            unresolved.signature_protection(),
+            foreign.signature_protection(),
             NotifySignatureProtection::NotProtected,
-            "an absent/unresolved bare name is not promoted to an object-shaped value"
+            "a proven-foreign receiver is not promoted to an object-shaped value"
         );
 
         let unknown_array = candidate(

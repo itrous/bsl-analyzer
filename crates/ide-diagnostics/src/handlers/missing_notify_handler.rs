@@ -158,12 +158,7 @@ fn local_verdict(
     name: &Name,
     registration: &hir::call_graph::NotifyReg,
 ) -> Option<Verdict> {
-    let methods = ctx
-        .symbol_tree()
-        .find_methods(name)
-        .into_iter()
-        .map(|method| method.id)
-        .collect::<Vec<_>>();
+    let methods = ctx.notify_handler_methods(name);
 
     match ctx.notify_handler_availability_in_registration(registration, &methods) {
         hir::NotifyHandlerAvailability::Exported | hir::NotifyHandlerAvailability::Unknown => None,

@@ -404,8 +404,9 @@ fn adopted_cav_module_callback_uses_base_and_extension_declarations() {
     let extension_source = |handler: &str| {
         format!(
             "&ИзменениеИКонтроль(\"Проверить\")\nПроцедура Расш1_Проверить()\n\
-             #Вставка\n    Значение = 1;\n#КонецВставки\n\
-             О = Новый ОписаниеОповещения(\"{handler}\", ОбщийМодуль);\nКонецПроцедуры\n"
+             #Вставка\n    Значение = 1;\n\
+             О = Новый ОписаниеОповещения(\"{handler}\", ОбщийМодуль);\n#КонецВставки\n\
+             КонецПроцедуры\n"
         )
     };
 
@@ -438,16 +439,29 @@ fn adopted_cav_module_callback_uses_base_and_extension_declarations() {
             |db, ctx| {
                 assert!(ide_db::effective_target(db, ctx.file_id).is_some());
                 assert!(ide_db::weaving_target(db, ctx.file_id).is_some());
-                let candidates = ctx.notify_candidates();
+                let effective = ide_db::effective_target(db, ctx.file_id).unwrap();
+                let provider =
+                    ide_db::SalsaProvider::new(db, None).with_effective(effective, ctx.file_id);
+                let routed = crate::DiagnosticsContext::new(ctx.config, ctx.file_id, &provider);
+                let candidates = routed.notify_candidates();
+                let summary = routed.call_summary(ModuleId::new(ctx.file_id));
                 let candidate = candidates
                     .iter()
                     .find(|candidate| candidate.callback_name.as_str() == handler)
                     .unwrap_or_else(|| {
                         panic!(
-                            "CAV insertion must preserve its notify candidate; candidates={candidates:#?}; summary={:#?}",
-                            db.module_call_summary(ModuleId::new(ctx.file_id))
+                            "CAV insertion must preserve its notify candidate; candidates={candidates:#?}; summary={summary:#?}"
                         )
                     });
+                assert_eq!(
+                    summary
+                        .notify_regs
+                        .iter()
+                        .filter(|reg| reg.callback_name == candidate.callback_name)
+                        .count(),
+                    1,
+                    "{summary:#?}"
+                );
                 assert_eq!(candidate.receiver, hir::NotifyCandidateReceiver::ThisObject);
                 assert!(matches!(
                     candidate.registration.as_ref().map(|reg| &reg.target),
@@ -465,6 +479,271 @@ fn adopted_cav_module_callback_uses_base_and_extension_declarations() {
         if expected == 1 {
             assert!(missing[0].message.contains("Callbak"), "{missing:#?}");
         }
+    }
+}
+
+#[test]
+fn effective_cav_extension_this_object_callback_uses_base_handler() {
+    const CALLER: &str = "Documents/Заказ/Ext/ObjectModule.bsl";
+    const EXTENSION: &str = r#"&ИзменениеИКонтроль("Проверить")
+&НаКлиенте
+Процедура Расш_Проверить()
+#Вставка
+    О = Новый ОписаниеОповещения("Обработчик", ЭтотОбъект);
+#КонецВставки
+КонецПроцедуры
+"#;
+    const BASE_DOCUMENT_XML: &str =
+        include_str!("../../../bsl-metadata/fixtures/extension_metadata/base/Documents/Заказ.xml");
+    const EXTENSION_DOCUMENT_XML: &str = include_str!(
+        "../../../bsl-metadata/fixtures/extension_metadata/extension/Documents/Заказ.xml"
+    );
+    const BASE_CONFIGURATION: &str =
+        include_str!("../../../bsl-metadata/fixtures/extension_metadata/base/Configuration.xml");
+    const EXTENSION_CONFIGURATION: &str = include_str!(
+        "../../../bsl-metadata/fixtures/extension_metadata/extension/Configuration.xml"
+    );
+    const BASE_METHOD: &str = "&НаКлиенте\nПроцедура Проверить()\nКонецПроцедуры\n";
+    const BASE_EXPORT: &str = r#"&НаКлиенте
+Процедура Обработчик() Экспорт
+КонецПроцедуры
+"#;
+    const BASE_NON_EXPORT: &str = r#"&НаКлиенте
+Процедура Обработчик()
+КонецПроцедуры
+"#;
+
+    for (base_handler, expected_message) in
+        [(BASE_EXPORT, None), (BASE_NON_EXPORT, Some("Добавьте")), ("", Some("Создайте"))]
+    {
+        let mut builder = CfeFixtureBuilder::new(BASE_CONFIGURATION);
+        builder.add_extension("Расш", EXTENSION_CONFIGURATION);
+        let diagnostics = crate::test_utils::check_cfe_at_with_db(
+            CALLER,
+            EXTENSION,
+            builder.build(),
+            &[],
+            DiagnosticsConfig::all_enabled(),
+            |fixture| {
+                let base = fixture.root().join("Documents/Заказ");
+                std::fs::create_dir_all(base.join("Ext")).unwrap();
+                std::fs::write(fixture.root().join("Documents/Заказ.xml"), BASE_DOCUMENT_XML)
+                    .unwrap();
+                std::fs::write(
+                    base.join("Ext/ObjectModule.bsl"),
+                    format!("{BASE_METHOD}{base_handler}"),
+                )
+                .unwrap();
+
+                let extension_root = &fixture.extensions()[0].root();
+                std::fs::create_dir_all(extension_root.join("Documents")).unwrap();
+                std::fs::write(extension_root.join("Documents/Заказ.xml"), EXTENSION_DOCUMENT_XML)
+                    .unwrap();
+            },
+            |db, ctx| {
+                assert_eq!(
+                    ctx.module_metadata().module_type,
+                    bsl_metadata::ModuleType::ObjectModule
+                );
+                assert!(ide_db::effective_target(db, ctx.file_id).is_some());
+                assert!(ide_db::weaving_target(db, ctx.file_id).is_some());
+                let effective = ide_db::effective_target(db, ctx.file_id).unwrap();
+                let base_file = effective.base_file(db);
+                let base_config = ide_db::RootDatabase::get_configuration(db, base_file)
+                    .expect("base config loaded");
+                assert!(
+                    base_config
+                        .find_metadata_object(bsl_metadata::MdoType::Document, "Заказ")
+                        .is_some(),
+                    "base configuration objects: {:?}",
+                    base_config
+                        .metadata_objects()
+                        .iter()
+                        .map(|object| object.name.as_str())
+                        .collect::<Vec<_>>()
+                );
+                let base_metadata = db.module_metadata(ModuleId::new(base_file));
+                assert_eq!(
+                    base_metadata.module_type,
+                    bsl_metadata::ModuleType::ObjectModule,
+                    "paired base metadata: {base_metadata:#?}"
+                );
+                assert!(base_metadata.mdo.is_some(), "paired base MDO: {base_metadata:#?}");
+                let provider =
+                    ide_db::SalsaProvider::new(db, None).with_effective(effective, ctx.file_id);
+                let routed = crate::DiagnosticsContext::new(ctx.config, ctx.file_id, &provider);
+                let candidates = routed.notify_candidates();
+                let summary = routed.call_summary(ModuleId::new(ctx.file_id));
+                let callback_candidates = candidates
+                    .iter()
+                    .filter(|candidate| candidate.callback_name.as_str() == "Обработчик")
+                    .collect::<Vec<_>>();
+                assert_eq!(callback_candidates.len(), 1, "{candidates:#?}");
+                let candidate = callback_candidates[0];
+                assert_eq!(
+                    summary
+                        .notify_regs
+                        .iter()
+                        .filter(|reg| reg.callback_name == candidate.callback_name)
+                        .count(),
+                    1,
+                    "{summary:#?}"
+                );
+                let expected_completeness = if summary.notify_projection_incomplete {
+                    crate::DiagnosticsCompleteness::Incomplete {
+                        reason: crate::DiagnosticsIncompleteReason::NotifyProjection,
+                    }
+                } else {
+                    crate::DiagnosticsCompleteness::Complete
+                };
+                assert_eq!(
+                    crate::diagnostics_completeness(db, ctx.file_id, ctx.config),
+                    expected_completeness
+                );
+                assert_eq!(
+                    candidate.receiver,
+                    hir::NotifyCandidateReceiver::ThisObject,
+                    "effective candidate: {candidate:#?}"
+                );
+                assert!(matches!(
+                    candidate.registration.as_ref().map(|registration| &registration.target),
+                    Some(hir::call_graph::NotifyTarget::ThisObject)
+                ));
+                let methods = routed.notify_handler_methods(&hir::Name::new("Обработчик"));
+                let registration = candidate.registration.as_ref().unwrap();
+                let availability =
+                    routed.notify_handler_availability_in_registration(registration, &methods);
+                let expected_availability = match expected_message {
+                    None => hir::NotifyHandlerAvailability::Exported,
+                    Some("Добавьте") => hir::NotifyHandlerAvailability::NotExported,
+                    Some("Создайте") => hir::NotifyHandlerAvailability::NotFound,
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    availability, expected_availability,
+                    "methods={methods:#?}; registration={registration:#?}"
+                );
+                crate::file_diagnostics(db, ctx.file_id, ctx.config)
+            },
+        );
+        let missing = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == crate::DiagnosticCode::MissingNotifyHandler)
+            .collect::<Vec<_>>();
+        if let Some(expected_message) = expected_message {
+            assert_eq!(missing.len(), 1, "base_handler={base_handler:?}: {diagnostics:#?}");
+            assert!(
+                missing[0].message.starts_with(expected_message),
+                "base_handler={base_handler:?}: {missing:#?}"
+            );
+            let range = missing[0].range;
+            let source_slice = &EXTENSION[usize::from(range.start())..usize::from(range.end())];
+            assert!(
+                source_slice.contains("Новый ОписаниеОповещения"),
+                "effective diagnostic range must remap to the inserted extension source: {source_slice:?}"
+            );
+        } else {
+            assert!(missing.is_empty(), "base_handler={base_handler:?}: {diagnostics:#?}");
+        }
+    }
+}
+
+#[test]
+fn weaving_extension_object_module_preserves_self_and_shadowed_receiver_verdicts() {
+    const CALLER: &str = "Documents/Заказ/Ext/ObjectModule.bsl";
+    const BASE_METHOD: &str = "&НаКлиенте\nПроцедура Проверить()\nКонецПроцедуры\n";
+    const BASE_DOCUMENT_XML: &str =
+        include_str!("../../../bsl-metadata/fixtures/extension_metadata/base/Documents/Заказ.xml");
+    const EXTENSION_DOCUMENT_XML: &str = include_str!(
+        "../../../bsl-metadata/fixtures/extension_metadata/extension/Documents/Заказ.xml"
+    );
+    const BASE_CONFIGURATION: &str =
+        include_str!("../../../bsl-metadata/fixtures/extension_metadata/base/Configuration.xml");
+    const EXTENSION_CONFIGURATION: &str = include_str!(
+        "../../../bsl-metadata/fixtures/extension_metadata/extension/Configuration.xml"
+    );
+    let cases = [
+        (
+            "&НаКлиенте\nПроцедура ПроверитьВызов(ЭтотОбъект)\n    О = Новый ОписаниеОповещения(\"Missing\", ЭтотОбъект);\nКонецПроцедуры\n",
+            hir::NotifyCandidateReceiver::LocalBinding,
+            hir::call_graph::NotifyTarget::LocalBinding,
+            false,
+        ),
+        (
+            "&Перед(\"Проверить\")\n&НаКлиенте\nПроцедура Расш_Проверить()\n    О = Новый ОписаниеОповещения(\"Missing\", ЭтотОбъект);\nКонецПроцедуры\n",
+            hir::NotifyCandidateReceiver::ThisObject,
+            hir::call_graph::NotifyTarget::ThisObject,
+            true,
+        ),
+    ];
+
+    for (source, expected_receiver, expected_target, expect_missing) in cases {
+        let mut builder = CfeFixtureBuilder::new(BASE_CONFIGURATION);
+        builder.add_extension("Расш", EXTENSION_CONFIGURATION);
+        let diagnostics = crate::test_utils::check_cfe_at_with_db(
+            CALLER,
+            source,
+            builder.build(),
+            &[],
+            DiagnosticsConfig::all_enabled(),
+            |fixture| {
+                let base = fixture.root().join("Documents/Заказ");
+                std::fs::create_dir_all(base.join("Ext")).unwrap();
+                std::fs::write(fixture.root().join("Documents/Заказ.xml"), BASE_DOCUMENT_XML)
+                    .unwrap();
+                std::fs::write(base.join("Ext/ObjectModule.bsl"), BASE_METHOD).unwrap();
+                let extension_root = &fixture.extensions()[0].root();
+                std::fs::create_dir_all(extension_root.join("Documents")).unwrap();
+                std::fs::write(extension_root.join("Documents/Заказ.xml"), EXTENSION_DOCUMENT_XML)
+                    .unwrap();
+            },
+            |db, ctx| {
+                assert!(ide_db::effective_target(db, ctx.file_id).is_none());
+                let weaving = ide_db::weaving_target(db, ctx.file_id).unwrap();
+                let provider =
+                    ide_db::SalsaProvider::new(db, None).with_weaving(weaving, ctx.file_id);
+                let routed = crate::DiagnosticsContext::new(ctx.config, ctx.file_id, &provider);
+                let candidates = routed.notify_candidates();
+                let summary = routed.call_summary(ModuleId::new(ctx.file_id));
+                let candidate = candidates
+                    .iter()
+                    .find(|candidate| candidate.callback_name.as_str() == "Missing")
+                    .cloned()
+                    .expect("weaving route must preserve the notify candidate");
+                assert_eq!(
+                    summary
+                        .notify_regs
+                        .iter()
+                        .filter(|reg| reg.callback_name == candidate.callback_name)
+                        .count(),
+                    1,
+                    "{summary:#?}"
+                );
+                let expected_completeness = if summary.notify_projection_incomplete {
+                    crate::DiagnosticsCompleteness::Incomplete {
+                        reason: crate::DiagnosticsIncompleteReason::NotifyProjection,
+                    }
+                } else {
+                    crate::DiagnosticsCompleteness::Complete
+                };
+                assert_eq!(
+                    crate::diagnostics_completeness(db, ctx.file_id, ctx.config),
+                    expected_completeness
+                );
+                assert_eq!(candidate.receiver, expected_receiver, "{candidate:#?}");
+                assert_eq!(
+                    candidate.registration.as_ref().map(|reg| &reg.target),
+                    Some(&expected_target),
+                    "{candidate:#?}"
+                );
+                crate::file_diagnostics(db, ctx.file_id, ctx.config)
+            },
+        );
+        let missing = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == crate::DiagnosticCode::MissingNotifyHandler)
+            .collect::<Vec<_>>();
+        assert_eq!(missing.len(), usize::from(expect_missing), "{diagnostics:#?}");
     }
 }
 
@@ -1365,7 +1644,10 @@ fn impossible_notify_regs_do_not_protect_signatures_but_other_builds_do() {
                 target_for("DeadHandler"),
                 NotifyTarget::NotCompiled { receiver_syntax: NotifyReceiverSyntax::Other, .. }
             ));
-            assert_eq!(target_for("LiveHandler"), &NotifyTarget::Unsupported);
+            // A live call receiver is not proven foreign: its result may hold the current
+            // object, so the candidate stays an uncertain local binding rather than an
+            // unsupported one.
+            assert_eq!(target_for("LiveHandler"), &NotifyTarget::LocalBinding);
             assert!(matches!(
                 target_for("mObIlEhAnDlEr"),
                 NotifyTarget::NotCompiled { receiver_syntax: NotifyReceiverSyntax::SelfName, .. }

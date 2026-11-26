@@ -2495,6 +2495,7 @@ dependencies = [
  "bsl-conventions",
  "bsl-metadata",
  "bsl-platform",
+ "dataflow",
  "expect-test",
  "fixedbitset",
  "hir",

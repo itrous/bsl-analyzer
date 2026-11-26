@@ -973,11 +973,23 @@ mod tests {
     Сообщить("unused");
 КонецПроцедуры
 "#;
-        let unused = check_hir_diagnostic(code)
-            .into_iter()
-            .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedLocalMethod)
-            .map(|diagnostic| diagnostic.message)
-            .collect::<Vec<_>>();
+        let mut builder = test_fixture::CfeFixtureBuilder::new("");
+        builder.add_base_module("Caller", "");
+        // A real configuration root makes both unresolved receivers absent rather than
+        // merely indeterminate: a common module has no `ЭтотОбъект` to resolve to.
+        let unused = crate::test_utils::check_cfe_at_with_db(
+            "CommonModules/Caller/Ext/Module.bsl",
+            code,
+            builder.build(),
+            &[],
+            crate::DiagnosticsConfig::all_enabled(),
+            |_| {},
+            |_db, ctx| super::check(ctx),
+        )
+        .into_iter()
+        .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedLocalMethod)
+        .map(|diagnostic| diagnostic.message)
+        .collect::<Vec<_>>();
 
         assert!(
             unused
@@ -1209,6 +1221,7 @@ mod tests {
         let code = r#"
 &НаКлиенте
 Процедура Зарегистрировать()
+    ВнешнийМодуль = Новый Структура;
     О = Новый ОписаниеОповещения("ВнешнийОбработчик", ВнешнийМодуль);
     О = Новый ОписаниеОповещения("ЛокальныйОбработчик", ЭтотОбъект);
     П = Новый Структура("Имя", "СвязанныйСтрокой");

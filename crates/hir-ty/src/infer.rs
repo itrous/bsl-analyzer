@@ -13,6 +13,7 @@ use hir_def::effective_module::EffectiveModuleId;
 use hir_def::hir::{BinaryOp, Expr, ExprIdx, Literal, Stmt, StmtIdx, UnaryOp};
 use hir_def::module_interface::ModuleInterface;
 use hir_def::resolver::Resolver;
+use hir_def::weaving::WeavingModuleId;
 use hir_def::{DefWithBodyId, ExprId, MethodIdInput, Name, StmtId};
 use intern::NormName;
 use once_cell::sync::Lazy;
@@ -143,6 +144,7 @@ pub(crate) mod heap_estimate {
             + map_table_bytes::<ExprId, (BareNameOrigin, TypeId)>(
                 r.notify_receiver_resolutions.len(),
             )
+            + map_table_bytes::<ExprId, ()>(r.notify_receiver_indeterminate.len())
             + query_facts_heap(&r.query_facts)
     }
 
@@ -163,6 +165,7 @@ pub(crate) mod heap_estimate {
             + map_table_bytes::<ExprId, (BareNameOrigin, TypeId)>(
                 r.notify_receiver_resolutions.len(),
             )
+            + map_table_bytes::<ExprId, ()>(r.notify_receiver_indeterminate.len())
             + query_facts_heap(&r.query_facts)
     }
 }
@@ -999,6 +1002,10 @@ pub struct InferenceContext<'db> {
     /// Sparse environment facts for notify-description constructors.
     notify_constructor_environments: FxHashMap<ExprId, NotifyConstructorEnvironment>,
 
+    /// Effective/weaving bodies use source declarations whose runtime environment
+    /// differs from the inference context's deliberately disabled availability checks.
+    notify_body_env: Option<(hir_def::execution_env::EnvFlags, hir_def::execution_env::EnvFlags)>,
+
     diagnostics: Vec<InferenceDiagnostic>,
 
     loop_depth: u32,
@@ -1023,6 +1030,9 @@ pub struct InferenceContext<'db> {
 
     /// Bare path answers are recorded once for all consumers that receive an ExprId.
     bare_name_resolutions: FxHashMap<ExprId, (BareNameOrigin, TypeId)>,
+    /// Bare reads whose resolution stopped on an incomplete surface. A consumer that
+    /// would otherwise report a proven-foreign verdict must read this uncertainty.
+    indeterminate_bare_reads: FxHashSet<ExprId>,
     /// Semantic ownership verdicts for assignment targets, including surface gaps.
     assignment_target_resolutions: FxHashMap<ExprId, BareNameResolution>,
 
@@ -1164,6 +1174,9 @@ pub struct BodyInferenceResult {
     /// Bare-path read answers keyed by `ExprId`, so later consumers can project the same
     /// inference result onto any selected notification receiver.
     pub(crate) notify_receiver_resolutions: FxHashMap<ExprId, (BareNameOrigin, TypeId)>,
+    /// Bare reads keyed by `ExprId` that stopped on an incomplete surface; the same
+    /// consumers must not read such a receiver as proven foreign.
+    pub(crate) notify_receiver_indeterminate: FxHashSet<ExprId>,
     pub assignment_target_resolutions: FxHashMap<ExprId, BareNameResolution>,
     pub diagnostics: Vec<InferenceDiagnostic>,
     pub call_arg_bindings: Vec<CallArgBinding>,
@@ -1191,6 +1204,7 @@ impl BodyInferenceResult {
             expr_types: FxHashMap::default(),
             notify_constructor_environments: FxHashMap::default(),
             notify_receiver_resolutions: FxHashMap::default(),
+            notify_receiver_indeterminate: FxHashSet::default(),
             assignment_target_resolutions: FxHashMap::default(),
             diagnostics: Vec::new(),
             call_arg_bindings: Vec::new(),
@@ -1212,6 +1226,8 @@ pub struct ModuleCodeInferenceResult {
     pub(crate) notify_constructor_environments: FxHashMap<ExprId, NotifyConstructorEnvironment>,
     /// Bare-path read answers keyed by `ExprId`, shared with the method-body projection.
     pub(crate) notify_receiver_resolutions: FxHashMap<ExprId, (BareNameOrigin, TypeId)>,
+    /// See [`BodyInferenceResult::notify_receiver_indeterminate`].
+    pub(crate) notify_receiver_indeterminate: FxHashSet<ExprId>,
     pub assignment_target_resolutions: FxHashMap<ExprId, BareNameResolution>,
     pub diagnostics: Vec<InferenceDiagnostic>,
     pub call_arg_bindings: Vec<CallArgBinding>,
@@ -1232,6 +1248,7 @@ impl Default for ModuleCodeInferenceResult {
             expr_types: FxHashMap::default(),
             notify_constructor_environments: FxHashMap::default(),
             notify_receiver_resolutions: FxHashMap::default(),
+            notify_receiver_indeterminate: FxHashSet::default(),
             assignment_target_resolutions: FxHashMap::default(),
             diagnostics: Vec::new(),
             call_arg_bindings: Vec::new(),
@@ -1256,6 +1273,7 @@ impl ModuleCodeInferenceResult {
             expr_types: body.expr_types,
             notify_constructor_environments: body.notify_constructor_environments,
             notify_receiver_resolutions: body.notify_receiver_resolutions,
+            notify_receiver_indeterminate: body.notify_receiver_indeterminate,
             assignment_target_resolutions: body.assignment_target_resolutions,
             diagnostics: body.diagnostics,
             call_arg_bindings: body.call_arg_bindings,
@@ -1301,6 +1319,15 @@ impl InferOwnerResult {
         match self {
             InferOwnerResult::Method(r) => r.notify_receiver_resolutions.get(&expr).copied(),
             InferOwnerResult::ModuleCode(r) => r.notify_receiver_resolutions.get(&expr).copied(),
+        }
+    }
+
+    /// `true` when the bare read stopped on an incomplete surface instead of being
+    /// absent: a consumer must not read it as a proven non-local value.
+    pub(crate) fn notify_receiver_is_indeterminate(&self, expr: ExprId) -> bool {
+        match self {
+            InferOwnerResult::Method(r) => r.notify_receiver_indeterminate.contains(&expr),
+            InferOwnerResult::ModuleCode(r) => r.notify_receiver_indeterminate.contains(&expr),
         }
     }
 
@@ -1523,6 +1550,7 @@ impl<'db> InferenceContext<'db> {
             binding_types: FxHashMap::default(),
             expr_types: FxHashMap::default(),
             notify_constructor_environments: FxHashMap::default(),
+            notify_body_env: None,
             diagnostics: Vec::new(),
             loop_depth: 0,
             implicit_database_reads: rustc_hash::FxHashSet::default(),
@@ -1534,6 +1562,7 @@ impl<'db> InferenceContext<'db> {
             body_stmt_scopes,
             impossible_body_stmts,
             bare_name_resolutions: FxHashMap::default(),
+            indeterminate_bare_reads: FxHashSet::default(),
             assignment_target_resolutions: FxHashMap::default(),
             local_reads: FxHashSet::default(),
             calls_with_unread_target: rustc_hash::FxHashSet::default(),
@@ -2444,8 +2473,10 @@ impl<'db> InferenceContext<'db> {
         if bsl_platform::PlatformDataInner::instance().is_notify_description_type_name(name) {
             self.notify_constructor_environments.entry(expr).or_insert(
                 NotifyConstructorEnvironment {
-                    definite: self.body_env,
-                    possible: self.possible_env,
+                    definite: self.notify_body_env.map_or(self.body_env, |(definite, _)| definite),
+                    possible: self
+                        .notify_body_env
+                        .map_or(self.possible_env, |(_, possible)| possible),
                     available,
                 },
             );
@@ -2649,6 +2680,7 @@ impl<'db> InferenceContext<'db> {
 
     pub fn finish(self) -> BodyInferenceResult {
         let notify_receiver_resolutions = self.finish_notify_receiver_resolutions();
+        let notify_receiver_indeterminate = self.finish_notify_receiver_indeterminate();
         let query_facts = self.query_facts();
         BodyInferenceResult {
             owner: self.owner,
@@ -2662,6 +2694,7 @@ impl<'db> InferenceContext<'db> {
             expr_types: self.expr_types,
             notify_constructor_environments: self.notify_constructor_environments,
             notify_receiver_resolutions,
+            notify_receiver_indeterminate,
             assignment_target_resolutions: self.assignment_target_resolutions,
             diagnostics: self.diagnostics,
             call_arg_bindings: self.call_arg_bindings,
@@ -2670,6 +2703,10 @@ impl<'db> InferenceContext<'db> {
             query_facts,
             return_expr_ids: self.return_expr_ids,
         }
+    }
+
+    fn finish_notify_receiver_indeterminate(&self) -> FxHashSet<ExprId> {
+        self.indeterminate_bare_reads.clone()
     }
 
     fn finish_notify_receiver_resolutions(&self) -> FxHashMap<ExprId, (BareNameOrigin, TypeId)> {
@@ -4968,8 +5005,14 @@ impl<'db> InferenceContext<'db> {
             self.assignment_target_resolutions.insert(expr_id, ownership);
         }
         if usage == BareNameUse::ReadValue {
-            if let BareNameResolution::Resolved { ty, origin, .. } = &resolution {
-                self.bare_name_resolutions.insert(expr_id, (*origin, *ty));
+            match &resolution {
+                BareNameResolution::Resolved { ty, origin, .. } => {
+                    self.bare_name_resolutions.insert(expr_id, (*origin, *ty));
+                }
+                BareNameResolution::Indeterminate { .. } => {
+                    self.indeterminate_bare_reads.insert(expr_id);
+                }
+                BareNameResolution::Absent => {}
             }
         }
         if usage == BareNameUse::ReadValue
@@ -7602,52 +7645,14 @@ pub fn infer_effective<'db>(
     // facts to the changed methods is therefore output-identical. The query facts are the one
     // exception: a loop in `#Вставка` reaches a query through a copied body too, in the same
     // logical module.
-    let changed_ids: rustc_hash::FxHashSet<hir_def::MethodKey> = {
-        let ext_parse = db.parse(ext_file);
-        let changed_targets: rustc_hash::FxHashSet<String> = ext_parse
-            .syntax_node()
-            .children()
-            .filter(|n| {
-                matches!(
-                    n.kind(),
-                    syntax::SyntaxKind::PROCEDURE_DEF | syntax::SyntaxKind::FUNCTION_DEF
-                )
-            })
-            .filter_map(|m| hir_def::extension_merge::extract_change_and_validate(&m))
-            .map(|cc| cc.target.fold_lower())
-            .collect();
-        interface
-            .methods()
-            .filter(|m| changed_targets.contains(&m.name.as_str().fold_lower()))
-            .map(|m| m.id.local_id)
-            .collect()
-    };
+    let changed_ids = effective_changed_methods(db, eid);
 
     // Pass 1: infer each CHANGED method body once to capture its EFFECTIVE return type. A bare
     // same-module call to a `&ИзменениеИКонтроль` target must see its changed body's
     // return, not the base body's. Module code has no return, so only methods contribute.
     // This resolves one level of method→method return dependency; deeper chains keep the
     // base inference's same pragmatic bound (no panic, no infinite loop).
-    let mut effective_returns: FxHashMap<hir_def::MethodKey, TypeId> = FxHashMap::default();
-    for (local_id, body) in module_bodies.iter_bodies() {
-        if !changed_ids.contains(&local_id) {
-            continue;
-        }
-        let mut ctx = InferenceContext::new_effective(
-            db,
-            base_file,
-            Some(ext_file),
-            interface.clone(),
-            DefWithBodyId::Method(local_id),
-            &Arc::new(body.clone()),
-        );
-        ctx.infer_all();
-        let ret = body_return_type(db, &ctx.finish());
-        if ret != db.unknown() {
-            effective_returns.insert(local_id, ret);
-        }
-    }
-    let effective_returns = Arc::new(effective_returns);
+    let effective_returns = effective_method_returns(db, eid);
 
     // Pass 2: re-infer every body with the effective returns threaded in; these results are
     // authoritative (a changed method's call-expr types and diagnostics are now correct).
@@ -7700,6 +7705,267 @@ pub fn infer_effective<'db>(
     }
 
     Arc::new(result)
+}
+
+/// The `&ИзменениеИКонтроль` methods the effective module actually changes. Extracted so
+/// effective inference and the effective notification projection agree on which bodies
+/// run in the extension's context.
+#[salsa::tracked(returns(clone))]
+pub fn effective_changed_methods<'db>(
+    db: &'db dyn HirDatabase,
+    eid: EffectiveModuleId<'db>,
+) -> Arc<FxHashSet<hir_def::MethodKey>> {
+    let ext_parse = db.parse(eid.ext_file(db));
+    let changed_targets: FxHashSet<String> = ext_parse
+        .syntax_node()
+        .children()
+        .filter(|n| {
+            matches!(n.kind(), syntax::SyntaxKind::PROCEDURE_DEF | syntax::SyntaxKind::FUNCTION_DEF)
+        })
+        .filter_map(|m| hir_def::extension_merge::extract_change_and_validate(&m))
+        .map(|cc| cc.target.fold_lower())
+        .collect();
+    let interface = hir_def::effective_module::module_interface_effective(db, eid);
+    Arc::new(
+        interface
+            .methods()
+            .filter(|m| changed_targets.contains(&m.name.as_str().fold_lower()))
+            .map(|m| m.id.local_id)
+            .collect(),
+    )
+}
+
+/// The changed methods' effective return types. Shared by [`infer_effective`] and the
+/// effective notification projection so the first pass is reasoned about once.
+#[salsa::tracked(returns(clone))]
+pub fn effective_method_returns<'db>(
+    db: &'db dyn HirDatabase,
+    eid: EffectiveModuleId<'db>,
+) -> Arc<FxHashMap<hir_def::MethodKey, TypeId>> {
+    let base_file = eid.base_file(db);
+    let ext_file = eid.ext_file(db);
+    let bodies = hir_def::effective_module::module_bodies_effective(db, eid);
+    let interface = hir_def::effective_module::module_interface_effective(db, eid);
+    let changed = effective_changed_methods(db, eid);
+    let mut returns = FxHashMap::default();
+    for (local_id, body) in bodies.iter_bodies() {
+        if !changed.contains(&local_id) {
+            continue;
+        }
+        let mut ctx = InferenceContext::new_effective(
+            db,
+            base_file,
+            Some(ext_file),
+            interface.clone(),
+            DefWithBodyId::Method(local_id),
+            &Arc::new(body.clone()),
+        );
+        ctx.infer_all();
+        let ret = body_return_type(db, &ctx.finish());
+        if ret != db.unknown() {
+            returns.insert(local_id, ret);
+        }
+    }
+    Arc::new(returns)
+}
+
+/// Inference for one effective body with the shared return threading applied. Projections
+/// that need per-body facts [`infer_effective`] folds away read it, so no consumer
+/// re-derives the effective context.
+pub(crate) fn infer_effective_owner(
+    db: &dyn HirDatabase,
+    eid: EffectiveModuleId<'_>,
+    owner: DefWithBodyId,
+    body: &Body,
+) -> InferOwnerResult {
+    let base_file = eid.base_file(db);
+    let ext_file = eid.ext_file(db);
+    let changed = effective_changed_methods(db, eid);
+    let ext = match owner {
+        DefWithBodyId::Method(local_id) if changed.contains(&local_id) => Some(ext_file),
+        _ => None,
+    };
+    let interface = hir_def::effective_module::module_interface_effective(db, eid);
+    let mut ctx = InferenceContext::new_effective(
+        db,
+        base_file,
+        ext,
+        interface,
+        owner,
+        &Arc::new(body.clone()),
+    );
+    ctx.set_local_effective_returns(effective_method_returns(db, eid));
+    ctx.notify_body_env = Some(effective_notify_body_env(db, eid, owner));
+    ctx.infer_all();
+    finish_owner_inference(owner, ctx.finish())
+}
+
+fn finish_owner_inference(owner: DefWithBodyId, result: BodyInferenceResult) -> InferOwnerResult {
+    match owner {
+        DefWithBodyId::Method(_) => InferOwnerResult::Method(Arc::new(result)),
+        DefWithBodyId::ModuleCode => {
+            InferOwnerResult::ModuleCode(Arc::new(ModuleCodeInferenceResult::from_body(result)))
+        }
+    }
+}
+
+/// The notification execution environment of one body projected from its real declarations.
+/// `new_effective`/`new_weaving` intentionally disable ordinary inference availability checks,
+/// but notification registrations still need the source declaration's proven environment.
+fn effective_notify_body_env(
+    db: &dyn HirDatabase,
+    eid: EffectiveModuleId<'_>,
+    owner: DefWithBodyId,
+) -> (hir_def::execution_env::EnvFlags, hir_def::execution_env::EnvFlags) {
+    use hir_def::execution_env::{self, EnvFlags};
+
+    let base_file = eid.base_file(db);
+    let module = hir_def::ModuleId::new(base_file);
+    let options = crate::method_environment::notify_env_options();
+    match owner {
+        DefWithBodyId::Method(local_id) => {
+            let method = hir_def::MethodId { module, local_id };
+            let interface = hir_def::effective_module::module_interface_effective(db, eid);
+            let Some(declaration) = interface.find_method_by_id(method) else {
+                return (EnvFlags::EMPTY, EnvFlags::ALL);
+            };
+            declared_notify_method_env(&db.module_metadata(module), declaration, &options)
+        }
+        DefWithBodyId::ModuleCode => {
+            let env = execution_env::module_code_env(&db.module_metadata(module), &options);
+            (env, env)
+        }
+    }
+}
+
+fn declared_notify_method_env(
+    metadata: &hir_def::ModuleMetadata,
+    declaration: &hir_def::module_interface::MethodDecl,
+    options: &hir_def::execution_env::EnvOptions,
+) -> (hir_def::execution_env::EnvFlags, hir_def::execution_env::EnvFlags) {
+    use hir_def::execution_env;
+
+    let env = execution_env::body_env(metadata, &declaration.directives, options);
+    (env & declaration.preproc_env, env & (declaration.preproc_env | declaration.preproc_undecided))
+}
+
+fn weaving_notify_body_env(
+    db: &dyn HirDatabase,
+    wid: WeavingModuleId<'_>,
+    owner: DefWithBodyId,
+) -> (hir_def::execution_env::EnvFlags, hir_def::execution_env::EnvFlags) {
+    use hir_def::execution_env::{self, EnvFlags};
+
+    let ext_file = wid.ext_file(db);
+    let base_file = wid.base_file(db);
+    let base_module = hir_def::ModuleId::new(base_file);
+    let ext_module = hir_def::ModuleId::new(ext_file);
+    let options = crate::method_environment::notify_env_options();
+    let DefWithBodyId::Method(local_id) = owner else {
+        let env = execution_env::module_code_env(&db.module_metadata(ext_module), &options);
+        return (env, env);
+    };
+
+    let ext_method = hir_def::MethodId { module: ext_module, local_id };
+    let Some(ext_declaration) = db.interface_method(ext_method) else {
+        return (EnvFlags::EMPTY, EnvFlags::ALL);
+    };
+    let ext_possible = ext_declaration.preproc_env | ext_declaration.preproc_undecided;
+
+    let symbols = db.symbol_tree_ref(ext_module);
+    let parse = db.parse(ext_file);
+    let interception = symbols
+        .methods()
+        .find(|method| method.id.local_id == local_id)
+        .and_then(|method| method.syntax_node(&parse))
+        .and_then(|node| hir_def::weaving::interceptor_target(&node));
+    let Some(interception) = interception else {
+        return (EnvFlags::EMPTY, EnvFlags::ALL);
+    };
+    let base_declaration =
+        db.module_interface_ref(base_module).find_method(&Name::new(&interception.target));
+    let Some(base_declaration) = base_declaration else {
+        return (EnvFlags::EMPTY, EnvFlags::ALL);
+    };
+    let (base_definite, base_possible) =
+        declared_notify_method_env(&db.module_metadata(base_module), base_declaration, &options);
+    (base_definite & ext_declaration.preproc_env, base_possible & ext_possible)
+}
+
+/// The `ПродолжитьВызов` facts of a weaving extension module: the base method return and
+/// arity per interceptor. Shared by [`infer_weaving`] and the weaving notification
+/// projection.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct WeavingProceedFacts {
+    pub(crate) returns: FxHashMap<hir_def::MethodKey, TypeId>,
+    pub(crate) arities: FxHashMap<hir_def::MethodKey, (usize, usize)>,
+}
+
+#[salsa::tracked(returns(clone))]
+pub(crate) fn weaving_proceed_facts<'db>(
+    db: &'db dyn HirDatabase,
+    wid: WeavingModuleId<'db>,
+) -> Arc<WeavingProceedFacts> {
+    let ext_file = wid.ext_file(db);
+    let base_module = hir_def::ModuleId::new(wid.base_file(db));
+    let ext_module = hir_def::ModuleId::new(ext_file);
+    let ext_symbols = db.symbol_tree_ref(ext_module);
+    let base_symbols = db.symbol_tree_ref(base_module);
+    let ext_parse = db.parse(ext_file);
+    let mut facts = WeavingProceedFacts::default();
+    for method in ext_symbols.methods() {
+        let Some(node) = method.syntax_node(&ext_parse) else {
+            continue;
+        };
+        let Some(interception) = hir_def::weaving::interceptor_target(&node) else {
+            continue;
+        };
+        if interception.kind != hir_def::weaving::InterceptionKind::Around {
+            continue;
+        }
+        let Some(base_method) = base_symbols.find_method(&Name::new(&interception.target)) else {
+            continue;
+        };
+        // `required` mirrors `FunctionSignature::required_count`: one past the last
+        // non-defaulted parameter (defaults are trailing in well-formed BSL).
+        let total = base_method.params.len();
+        let required = base_method.params.iter().rposition(|p| !p.has_default).map_or(0, |i| i + 1);
+        facts.arities.insert(method.id.local_id, (required, total));
+
+        let base_input = hir_def::MethodIdInput::new(db, base_method.id);
+        let ret = crate::method_graph::method_return_type_query(db, base_input);
+        if ret != db.unknown() && ret != db.undefined() {
+            facts.returns.insert(method.id.local_id, ret);
+        }
+    }
+    Arc::new(facts)
+}
+
+/// Inference for one extension body under weaving, with the shared `ПродолжитьВызов`
+/// facts applied. Read by projections that need the per-body facts `infer_weaving` folds
+/// away.
+pub(crate) fn infer_weaving_owner(
+    db: &dyn HirDatabase,
+    wid: WeavingModuleId<'_>,
+    owner: DefWithBodyId,
+    body: &Body,
+) -> InferOwnerResult {
+    let ext_file = wid.ext_file(db);
+    let base_module = hir_def::ModuleId::new(wid.base_file(db));
+    let facts = weaving_proceed_facts(db, wid);
+    let mut ctx =
+        InferenceContext::new_weaving(db, ext_file, base_module, owner, &Arc::new(body.clone()));
+    ctx.notify_body_env = Some(weaving_notify_body_env(db, wid, owner));
+    if let DefWithBodyId::Method(local_id) = owner {
+        if let Some(ret) = facts.returns.get(&local_id) {
+            ctx.set_proceed_return(*ret);
+        }
+        if let Some(&(required, total)) = facts.arities.get(&local_id) {
+            ctx.set_proceed_arity(required, total);
+        }
+    }
+    ctx.infer_all();
+    finish_owner_inference(owner, ctx.finish())
 }
 
 /// Whether a bare call name is the platform `ПродолжитьВызов` / `ProceedWithCall` global, the
@@ -7764,42 +8030,11 @@ pub fn infer_weaving<'db>(
     let module_bodies = db.module_bodies_ref(ext_module);
 
     // A `&Вместо("M")` interceptor's body may call `ПродолжитьВызов(...)` to re-enter the
-    // original base method `M`. Pre-compute, per ext method `local_id`: (a) `M`'s return type so
-    // the call types as `M`'s result, and (b) `M`'s arity `(required, total)` so the call is
-    // validated as a call to `M`. `&Перед`/`&После` carry no `ПродолжитьВызов`, so they are
-    // skipped. The return is dropped when uninformative (Unknown/Undefined) to preserve the
-    // platform default, but the arity is kept whenever `M` resolves — a procedure base has no
-    // informative return yet its arguments still need checking.
-    let ext_symbols = db.symbol_tree_ref(ext_module);
-    let base_symbols = db.symbol_tree_ref(base_module);
-    let ext_parse = db.parse(ext_file);
-    let mut proceed_returns: FxHashMap<hir_def::MethodKey, TypeId> = FxHashMap::default();
-    let mut proceed_arities: FxHashMap<hir_def::MethodKey, (usize, usize)> = FxHashMap::default();
-    for method in ext_symbols.methods() {
-        let Some(node) = method.syntax_node(&ext_parse) else {
-            continue;
-        };
-        let Some(interception) = hir_def::weaving::interceptor_target(&node) else {
-            continue;
-        };
-        if interception.kind != hir_def::weaving::InterceptionKind::Around {
-            continue;
-        }
-        let Some(base_method) = base_symbols.find_method(&Name::new(&interception.target)) else {
-            continue;
-        };
-        // `required` mirrors `FunctionSignature::required_count`: one past the last
-        // non-defaulted parameter (defaults are trailing in well-formed BSL).
-        let total = base_method.params.len();
-        let required = base_method.params.iter().rposition(|p| !p.has_default).map_or(0, |i| i + 1);
-        proceed_arities.insert(method.id.local_id, (required, total));
-
-        let base_input = hir_def::MethodIdInput::new(db, base_method.id);
-        let ret = crate::method_graph::method_return_type_query(db, base_input);
-        if ret != db.unknown() && ret != db.undefined() {
-            proceed_returns.insert(method.id.local_id, ret);
-        }
-    }
+    // original base method `M`. The shared facts carry, per ext method `local_id`: (a) `M`'s
+    // return type so the call types as `M`'s result, and (b) `M`'s arity `(required, total)` so
+    // the call is validated as a call to `M`. `&Перед`/`&После` carry no `ПродолжитьВызов`, so
+    // they are skipped. See [`weaving_proceed_facts`].
+    let proceed = weaving_proceed_facts(db, wid);
 
     let mut result = InferenceResult::default();
 
@@ -7834,10 +8069,10 @@ pub fn infer_weaving<'db>(
             DefWithBodyId::Method(local_id),
             &Arc::new(body.clone()),
         );
-        if let Some(ret) = proceed_returns.get(&local_id) {
+        if let Some(ret) = proceed.returns.get(&local_id) {
             ctx.set_proceed_return(*ret);
         }
-        if let Some(&(required, total)) = proceed_arities.get(&local_id) {
+        if let Some(&(required, total)) = proceed.arities.get(&local_id) {
             ctx.set_proceed_arity(required, total);
         }
         ctx.infer_all();

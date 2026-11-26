@@ -120,7 +120,9 @@ pub(crate) fn collect_notify_array_registrations(
 /// vector holds only the registrations proven before it and can therefore be partial. It is a
 /// final answer solely while `NotifyWorkBudget::exhausted` is false; a caller that observes
 /// exhaustion must treat the owner's notification facts as incomplete instead of publishing
-/// these registrations as complete.
+/// these registrations as complete. A missing reaching-definitions solution is such a stop: the
+/// solver published nothing, so the possible writes are unknown and the pass marks the budget
+/// incomplete rather than answering with the registrations it happens to keep.
 pub(crate) fn collect_notify_array_registrations_with_budget(
     db: &dyn TypeKernelDb,
     body: &Body,
@@ -134,6 +136,10 @@ pub(crate) fn collect_notify_array_registrations_with_budget(
         return Vec::new();
     }
     let Some(reaching_defs) = reaching_defs else {
+        // The solver stopped before publishing a complete solution, so a write the body
+        // makes may rebind any tracked array invisibly. Without those writes no array
+        // stays proven, and an empty answer here must not pass for a complete projection.
+        budget.mark_incomplete();
         return Vec::new();
     };
 

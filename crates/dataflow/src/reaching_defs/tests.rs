@@ -1126,6 +1126,29 @@ fn dataflow_writes_i05_i11_argument_events_and_names() {
 }
 
 #[test]
+fn no_executable_path_still_solves_to_a_complete_result() {
+    // `None` is the stop of the iteration, not an empty graph: a body without any
+    // executable path publishes a complete result whose states are simply unreached.
+    for source in [
+        "Процедура Т()\nКонецПроцедуры\n",
+        "Процедура Т()\n    Возврат;\n    x = \"A\";\n    Если x = \"м1\" Тогда КонецЕсли;\nКонецПроцедуры\n",
+    ] {
+        let f = fixture(source);
+        assert!(
+            solve_executable_reaching_definitions(
+                f.cfg.clone(),
+                &f.body,
+                f.events.clone(),
+                true,
+                RecoveredBody::Solve,
+            )
+            .is_some(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
 fn dataflow_writes_i12_unavailable_is_not_proof() {
     let source = "Процедура Т(Усл)\n    x = \"A\";\n    Пока Усл Цикл\n        Если x = \"м1\" Тогда КонецЕсли;\n        W(x);\n    КонецЦикла;\n    Возврат;\n    Если x = \"м2\" Тогда КонецЕсли;\nКонецПроцедуры\n";
     let f = fixture(source);

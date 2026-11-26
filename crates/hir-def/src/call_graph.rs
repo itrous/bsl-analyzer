@@ -182,9 +182,7 @@ impl ModuleCallSummary {
             notify_additional_signature_handlers: Vec::new(),
             notify_dynamic_signature_handlers: Vec::new(),
             notify_dynamic_signature_handler_sites: Vec::new(),
-            notify_dynamic_signature_analysis_incomplete: self
-                .notify_dynamic_signature_analysis_incomplete
-                .clone(),
+            notify_dynamic_signature_analysis_incomplete: Vec::new(),
             notify_projection_incomplete: self.notify_projection_incomplete,
             notify_regs,
             idle_handler_regs,
@@ -462,7 +460,9 @@ impl NotifyReceiverSyntax {
 
 /// Where a `Новый ОписаниеОповещения` callback's handler lives. `hir-ty` resolves
 /// bare receivers using the same inference and name-resolution rules as other semantic
-/// consumers; unresolved or unsupported receivers are represented by `Unsupported`.
+/// consumers; a receiver proven to be neither the current object nor a common module is
+/// `Unsupported`, while one whose runtime identity, including an unresolved or
+/// indeterminate one, stays unknown is `LocalBinding`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NotifyTarget {
     /// The registration lies only in an unavailable or unreachable compilation branch.
@@ -471,8 +471,10 @@ pub enum NotifyTarget {
     ThisObject,
     /// The receiver resolves to a common module.
     Module(Name),
-    /// The resolved bare receiver has unknown runtime identity — it may be the current
-    /// module object — but is not proven to reference any particular local callback.
+    /// The receiver has unknown runtime identity — it may be the current module
+    /// object — but is not proven to reference any particular local callback: a
+    /// resolved bare value of non-concrete type, an indeterminate bare read, or a
+    /// non-bare expression whose inferred type is not concrete data.
     LocalBinding,
     /// The receiver cannot be resolved as a current object or common module.
     Unsupported,
@@ -712,6 +714,9 @@ pub struct WorkspaceCallGraph {
     forward: FxHashMap<GraphNode, Vec<WorkspaceCallEdge>>,
     reverse: FxHashMap<GraphNode, Vec<WorkspaceCallEdge>>,
     node_dispatch: FxHashMap<GraphNode, MethodDispatch>,
+    /// At least one module's semantic callback projection was truncated. The known
+    /// edges remain usable, but the graph must not be mistaken for a full projection.
+    pub incomplete: bool,
 }
 
 impl WorkspaceCallGraph {
@@ -3106,8 +3111,8 @@ mod tests {
         assert!(subset.name_literal_ref_sites.is_empty());
         assert!(subset.form_entries.is_empty());
 
-        // Named alias uncertainty is not the semantic-budget exhaustion marker:
-        // keep known callback registrations while preserving the uncertainty data.
+        // Named alias uncertainty is not a budget stop; the compact index needs
+        // neither its per-constructor details nor suppression of known registrations.
         let mut uncertain_array = summary.clone();
         uncertain_array.notify_dynamic_signature_analysis_incomplete.push(
             DynamicNotifySignatureAnalysisGap {
@@ -3119,7 +3124,7 @@ mod tests {
         );
         let subset = uncertain_array.method_pair_subset();
         assert_eq!(subset.notify_regs.len(), 2);
-        assert_eq!(subset.notify_dynamic_signature_analysis_incomplete.len(), 1);
+        assert!(subset.notify_dynamic_signature_analysis_incomplete.is_empty());
 
         // Budget exhaustion gets an explicit marker: do not publish its partial
         // callback-registration prefix as a complete incoming-call projection.
@@ -3127,7 +3132,7 @@ mod tests {
         let subset = uncertain_array.method_pair_subset();
         assert!(subset.notify_regs.is_empty());
         assert!(subset.notify_projection_incomplete);
-        assert_eq!(subset.notify_dynamic_signature_analysis_incomplete.len(), 1);
+        assert!(subset.notify_dynamic_signature_analysis_incomplete.is_empty());
         assert!(!subset.call_edges.is_empty(), "complete direct calls remain projectable");
     }
 
