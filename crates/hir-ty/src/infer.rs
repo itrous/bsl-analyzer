@@ -7870,8 +7870,6 @@ fn weaving_notify_body_env(
     let Some(ext_declaration) = db.interface_method(ext_method) else {
         return (EnvFlags::EMPTY, EnvFlags::ALL);
     };
-    let ext_possible = ext_declaration.preproc_env | ext_declaration.preproc_undecided;
-
     let symbols = db.symbol_tree_ref(ext_module);
     let parse = db.parse(ext_file);
     let interception = symbols
@@ -7880,8 +7878,13 @@ fn weaving_notify_body_env(
         .and_then(|method| method.syntax_node(&parse))
         .and_then(|node| hir_def::weaving::interceptor_target(&node));
     let Some(interception) = interception else {
-        return (EnvFlags::EMPTY, EnvFlags::ALL);
+        return declared_notify_method_env(
+            &db.module_metadata(ext_module),
+            &ext_declaration,
+            &options,
+        );
     };
+    let ext_possible = ext_declaration.preproc_env | ext_declaration.preproc_undecided;
     let base_declaration =
         db.module_interface_ref(base_module).find_method(&Name::new(&interception.target));
     let Some(base_declaration) = base_declaration else {

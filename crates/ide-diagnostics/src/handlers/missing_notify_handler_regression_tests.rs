@@ -874,6 +874,94 @@ fn weaving_extension_object_module_preserves_self_and_shadowed_receiver_verdicts
     }
 }
 
+#[test]
+fn weaving_object_extension_method_uses_its_declared_notify_environment() {
+    const CALLER: &str = "Documents/Заказ/Ext/ObjectModule.bsl";
+    const BASE_METHOD: &str = "&НаКлиенте\nПроцедура Проверить()\nКонецПроцедуры\n";
+    const BASE_DOCUMENT_XML: &str =
+        include_str!("../../../bsl-metadata/fixtures/extension_metadata/base/Documents/Заказ.xml");
+    const EXTENSION_DOCUMENT_XML: &str = include_str!(
+        "../../../bsl-metadata/fixtures/extension_metadata/extension/Documents/Заказ.xml"
+    );
+    const BASE_CONFIGURATION: &str =
+        include_str!("../../../bsl-metadata/fixtures/extension_metadata/base/Configuration.xml");
+    const EXTENSION_CONFIGURATION: &str = include_str!(
+        "../../../bsl-metadata/fixtures/extension_metadata/extension/Configuration.xml"
+    );
+    const EXTENSION: &str = r#"&ИзменениеИКонтроль("Проверить")
+&НаКлиенте
+Процедура Расш_Проверить()
+#Вставка
+    О = Новый ОписаниеОповещения("CavMissing", ЭтотОбъект);
+#КонецВставки
+КонецПроцедуры
+
+&НаКлиенте
+Процедура Расш_Регистрация()
+    О = Новый ОписаниеОповещения("ЕстьЭкспорт", ЭтотОбъект);
+    О = Новый ОписаниеОповещения("НетОбработчика", ЭтотОбъект);
+    О = Новый ОписаниеОповещения("ТолькоСервер", ЭтотОбъект);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура Расш_Затенение(ЭтотОбъект)
+    О = Новый ОписаниеОповещения("Затенённый", ЭтотОбъект);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура ЕстьЭкспорт() Экспорт
+КонецПроцедуры
+
+#Если Сервер Тогда
+&НаСервере
+Процедура ТолькоСервер() Экспорт
+КонецПроцедуры
+#КонецЕсли
+"#;
+
+    let mut builder = CfeFixtureBuilder::new(BASE_CONFIGURATION);
+    builder.add_extension("Расш", EXTENSION_CONFIGURATION);
+    let diagnostics = crate::test_utils::check_cfe_at_with_db(
+        CALLER,
+        EXTENSION,
+        builder.build(),
+        &[],
+        DiagnosticsConfig::all_enabled(),
+        |fixture| {
+            let base = fixture.root().join("Documents/Заказ");
+            std::fs::create_dir_all(base.join("Ext")).unwrap();
+            std::fs::write(fixture.root().join("Documents/Заказ.xml"), BASE_DOCUMENT_XML).unwrap();
+            std::fs::write(base.join("Ext/ObjectModule.bsl"), BASE_METHOD).unwrap();
+            let extension_root = &fixture.extensions()[0].root();
+            std::fs::create_dir_all(extension_root.join("Documents")).unwrap();
+            std::fs::write(extension_root.join("Documents/Заказ.xml"), EXTENSION_DOCUMENT_XML)
+                .unwrap();
+        },
+        |db, ctx| {
+            assert_eq!(ctx.module_metadata().module_type, bsl_metadata::ModuleType::ObjectModule);
+            assert!(ide_db::effective_target(db, ctx.file_id).is_some());
+            assert!(ide_db::weaving_target(db, ctx.file_id).is_some());
+            crate::file_diagnostics(db, ctx.file_id, ctx.config)
+        },
+    );
+    let missing = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == crate::DiagnosticCode::MissingNotifyHandler)
+        .collect::<Vec<_>>();
+    assert_eq!(missing.len(), 3, "{diagnostics:#?}");
+    for name in ["CavMissing", "НетОбработчика", "ТолькоСервер"] {
+        assert!(missing.iter().any(|diagnostic| diagnostic.message.contains(name)), "{missing:#?}");
+    }
+    assert!(
+        missing.iter().all(|diagnostic| !diagnostic.message.contains("Затенённый")),
+        "{missing:#?}"
+    );
+    assert!(
+        missing.iter().all(|diagnostic| !diagnostic.message.contains("ЕстьЭкспорт")),
+        "exported target must be accepted: {missing:#?}"
+    );
+}
+
 /// The main and the error-handler slot naming the same procedure on the same receiver
 /// describe one platform invocation: one registration, one verdict. Different names or
 /// different receivers stay separate registrations — those are the dedup controls.
