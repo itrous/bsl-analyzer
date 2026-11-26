@@ -346,6 +346,61 @@ fn the_curated_overlays_reach_the_built_in_facts() {
     assert!(data.get_type_properties("ValueStorage").is_empty());
     assert_eq!(data.get_type_methods("SpreadsheetDocument").len(), 45);
     assert_eq!(data.get_type_properties("SpreadsheetDocument").len(), 63);
+    // Ten more types attested from the cross-build oracle: both surfaces, or the one that has members.
+    for name in [
+        "МенеджерВременныхТаблиц",
+        "TempTablesManager",
+        "Файл",
+        "File",
+        "Шрифт",
+        "Font",
+    ] {
+        assert!(surfaces_of(&data, name) == BOTH, "{name} is attested");
+    }
+    // Keys of a fixed structure are properties, and the other two have no properties at all.
+    for name in [
+        "БлокировкаДанных",
+        "DataLock",
+        "ФиксированныйМассив",
+        "FixedArray",
+        "ФиксированнаяСтруктура",
+        "FixedStructure",
+    ] {
+        assert!(
+            surfaces_of(&data, name) == METHODS_ONLY,
+            "{name} is attested for its methods and not for its properties"
+        );
+    }
+    for name in [
+        "Линия",
+        "Line",
+        "Граница",
+        "Boundary",
+    ] {
+        assert!(
+            surfaces_of(&data, name) == FIELDS_ONLY,
+            "{name} is attested for its properties and not for its methods"
+        );
+    }
+    // `ChoiceParameter` is spelled the same as the XDTO alias of `DataCompositionChoiceParameter`, so the English
+    // name is ambiguous and the verdict refuses it; the Russian name, which code uses, is attested.
+    assert!(surfaces_of(&data, "ПараметрВыбора") == FIELDS_ONLY, "ПараметрВыбора is attested");
+    assert!(data.is_ambiguous_type_name("ChoiceParameter"));
+    assert!(surfaces_of(&data, "ChoiceParameter") == NEITHER);
+    for (name, methods, properties) in [
+        ("TempTablesManager", 1, 1),
+        ("File", 42, 5),
+        ("DataLock", 4, 0),
+        ("Line", 0, 3),
+        ("FixedArray", 4, 0),
+        ("FixedStructure", 2, 0),
+        ("Boundary", 0, 2),
+        ("Font", 1, 8),
+        ("ChoiceParameter", 0, 2),
+    ] {
+        assert_eq!(data.get_type_methods(name).len(), methods, "{name} methods");
+        assert_eq!(data.get_type_properties(name).len(), properties, "{name} properties");
+    }
     // The collections that address their elements by name are attested for the
     // methods alone: an element name is answered as a property, so the property
     // surface stays open.

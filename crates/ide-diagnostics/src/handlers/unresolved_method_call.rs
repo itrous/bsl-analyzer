@@ -1134,6 +1134,258 @@ mod tests {
         assert!(umc.is_empty(), "a receiver not attested for methods stays open: {umc:?}");
     }
 
+    /// A temp tables manager is attested for its methods, so a call it does not have is reported.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_a_temp_tables_manager_method_is_reported() {
+        let umc = platform_umc(
+            r#"Процедура Тест()
+    О = Новый МенеджерВременныхТаблиц;
+    О.НетТакогоМетода();
+КонецПроцедуры"#,
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(umc.len(), 1, "expected one UnresolvedMethodCall, got: {umc:?}");
+            assert!(umc[0].contains("НетТакогоМетода"), "message must name the method: {umc:?}");
+            assert!(umc[0].contains("МенеджерВременныхТаблиц"), "message must name the receiver type: {umc:?}");
+        } else {
+            assert!(umc.is_empty(), "an unknown platform version keeps the miss silent: {umc:?}");
+        }
+    }
+
+    /// THE CONTROL: a method the temp tables manager really has is no miss.
+    #[test]
+    fn a_real_method_of_a_temp_tables_manager_stays_silent() {
+        let umc = platform_umc(
+            r#"Процедура Тест()
+    О = Новый МенеджерВременныхТаблиц;
+    О.Закрыть();
+КонецПроцедуры"#,
+        );
+        assert!(umc.is_empty(), "a method the platform has is no miss: {umc:?}");
+    }
+
+    /// A file is attested for its methods, so a call it does not have is reported.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_a_file_method_is_reported() {
+        let umc = platform_umc(
+            r#"Процедура Тест()
+    О = Новый Файл("C:\х.txt");
+    О.НетТакогоМетода();
+КонецПроцедуры"#,
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(umc.len(), 1, "expected one UnresolvedMethodCall, got: {umc:?}");
+            assert!(umc[0].contains("НетТакогоМетода"), "message must name the method: {umc:?}");
+            assert!(umc[0].contains("Файл"), "message must name the receiver type: {umc:?}");
+        } else {
+            assert!(umc.is_empty(), "an unknown platform version keeps the miss silent: {umc:?}");
+        }
+    }
+
+    /// THE CONTROL: a method the file really has is no miss.
+    #[test]
+    fn a_real_method_of_a_file_stays_silent() {
+        let umc = platform_umc(
+            r#"Процедура Тест()
+    О = Новый Файл("C:\х.txt");
+    О.ЭтоФайл();
+КонецПроцедуры"#,
+        );
+        assert!(umc.is_empty(), "a method the platform has is no miss: {umc:?}");
+    }
+
+    /// A data lock is attested for its methods, so a call it does not have is reported.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_a_data_lock_method_is_reported() {
+        let umc = platform_umc(
+            r#"Процедура Тест()
+    О = Новый БлокировкаДанных;
+    О.НетТакогоМетода();
+КонецПроцедуры"#,
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(umc.len(), 1, "expected one UnresolvedMethodCall, got: {umc:?}");
+            assert!(umc[0].contains("НетТакогоМетода"), "message must name the method: {umc:?}");
+            assert!(umc[0].contains("БлокировкаДанных"), "message must name the receiver type: {umc:?}");
+        } else {
+            assert!(umc.is_empty(), "an unknown platform version keeps the miss silent: {umc:?}");
+        }
+    }
+
+    /// THE CONTROL: a method the data lock really has is no miss.
+    #[test]
+    fn a_real_method_of_a_data_lock_stays_silent() {
+        let umc = platform_umc(
+            r#"Процедура Тест()
+    О = Новый БлокировкаДанных;
+    О.Заблокировать();
+КонецПроцедуры"#,
+        );
+        assert!(umc.is_empty(), "a method the platform has is no miss: {umc:?}");
+    }
+
+    /// A fixed array is attested for its methods, so a call it does not have is reported.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_a_fixed_array_method_is_reported() {
+        let umc = platform_umc(
+            r#"Процедура Тест()
+    О = Новый ФиксированныйМассив(Новый Массив);
+    О.НетТакогоМетода();
+КонецПроцедуры"#,
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(umc.len(), 1, "expected one UnresolvedMethodCall, got: {umc:?}");
+            assert!(umc[0].contains("НетТакогоМетода"), "message must name the method: {umc:?}");
+            assert!(umc[0].contains("ФиксированныйМассив"), "message must name the receiver type: {umc:?}");
+        } else {
+            assert!(umc.is_empty(), "an unknown platform version keeps the miss silent: {umc:?}");
+        }
+    }
+
+    /// THE CONTROL: a method the fixed array really has is no miss.
+    #[test]
+    fn a_real_method_of_a_fixed_array_stays_silent() {
+        let umc = platform_umc(
+            r#"Процедура Тест()
+    О = Новый ФиксированныйМассив(Новый Массив);
+    О.Количество();
+КонецПроцедуры"#,
+        );
+        assert!(umc.is_empty(), "a method the platform has is no miss: {umc:?}");
+    }
+
+    /// A fixed structure is attested for its methods, so a call it does not have is reported.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_a_fixed_structure_method_is_reported() {
+        let umc = platform_umc(
+            r#"Процедура Тест()
+    О = Новый ФиксированнаяСтруктура("Код", 1);
+    О.НетТакогоМетода();
+КонецПроцедуры"#,
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(umc.len(), 1, "expected one UnresolvedMethodCall, got: {umc:?}");
+            assert!(umc[0].contains("НетТакогоМетода"), "message must name the method: {umc:?}");
+            assert!(umc[0].contains("ФиксированнаяСтруктура"), "message must name the receiver type: {umc:?}");
+        } else {
+            assert!(umc.is_empty(), "an unknown platform version keeps the miss silent: {umc:?}");
+        }
+    }
+
+    /// THE CONTROL: a method the fixed structure really has is no miss.
+    #[test]
+    fn a_real_method_of_a_fixed_structure_stays_silent() {
+        let umc = platform_umc(
+            r#"Процедура Тест()
+    О = Новый ФиксированнаяСтруктура("Код", 1);
+    О.Количество();
+КонецПроцедуры"#,
+        );
+        assert!(umc.is_empty(), "a method the platform has is no miss: {umc:?}");
+    }
+
+    /// A font is attested for its methods, so a call it does not have is reported.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_a_font_method_is_reported() {
+        let umc = platform_umc(
+            r#"Процедура Тест()
+    О = Новый Шрифт("Arial", 10);
+    О.НетТакогоМетода();
+КонецПроцедуры"#,
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(umc.len(), 1, "expected one UnresolvedMethodCall, got: {umc:?}");
+            assert!(umc[0].contains("НетТакогоМетода"), "message must name the method: {umc:?}");
+            assert!(umc[0].contains("Шрифт"), "message must name the receiver type: {umc:?}");
+        } else {
+            assert!(umc.is_empty(), "an unknown platform version keeps the miss silent: {umc:?}");
+        }
+    }
+
+    /// THE CONTROL: a method the font really has is no miss.
+    #[test]
+    fn a_real_method_of_a_font_stays_silent() {
+        let umc = platform_umc(
+            r#"Процедура Тест()
+    О = Новый Шрифт("Arial", 10);
+    О.ПолучитьАбсолютный();
+КонецПроцедуры"#,
+        );
+        assert!(umc.is_empty(), "a method the platform has is no miss: {umc:?}");
+    }
+
+    /// THE CONTROL for the fields-only attestation: the line method surface is deliberately unattested, so an unknown call stays silent.
+    #[test]
+    fn a_miss_on_a_line_method_stays_silent_because_only_fields_are_attested() {
+        let umc = platform_umc(
+            r#"Процедура Тест()
+    О = Новый Линия(1, 1);
+    О.НетТакогоМетода();
+КонецПроцедуры"#,
+        );
+        assert!(umc.is_empty(), "a receiver not attested for methods stays open: {umc:?}");
+    }
+
+    /// THE CONTROL for the fields-only attestation: the boundary method surface is deliberately unattested, so an unknown call stays silent.
+    #[test]
+    fn a_miss_on_a_boundary_method_stays_silent_because_only_fields_are_attested() {
+        let umc = platform_umc(
+            r#"Процедура Тест()
+    О = Новый Граница(1, ВидГраницы.Включая);
+    О.НетТакогоМетода();
+КонецПроцедуры"#,
+        );
+        assert!(umc.is_empty(), "a receiver not attested for methods stays open: {umc:?}");
+    }
+
+    /// THE CONTROL for the fields-only attestation: the form attribute method surface is deliberately unattested, so an unknown call stays silent.
+    #[test]
+    fn a_miss_on_a_form_attribute_method_stays_silent_because_only_fields_are_attested() {
+        let umc = platform_umc(
+            r#"Процедура Тест()
+    О = Новый РеквизитФормы("Имя", Новый ОписаниеТипов("Строка"));
+    О.НетТакогоМетода();
+КонецПроцедуры"#,
+        );
+        assert!(umc.is_empty(), "a receiver not attested for methods stays open: {umc:?}");
+    }
+
+    /// THE CONTROL for the fields-only attestation: the choice parameter method surface is deliberately unattested, so an unknown call stays silent.
+    #[test]
+    fn a_miss_on_a_choice_parameter_method_stays_silent_because_only_fields_are_attested() {
+        let umc = platform_umc(
+            r#"Процедура Тест()
+    О = Новый ПараметрВыбора("Отбор.Код", 1);
+    О.НетТакогоМетода();
+КонецПроцедуры"#,
+        );
+        assert!(umc.is_empty(), "a receiver not attested for methods stays open: {umc:?}");
+    }
+
     /// THE CONTROL that closedness did not spread: a type nobody attested stays open.
     #[test]
     fn a_miss_on_an_unattested_type_stays_silent() {

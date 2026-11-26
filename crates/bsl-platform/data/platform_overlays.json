@@ -791,6 +791,78 @@
       "verified_against_version": "8.3.17",
       "evidence_source": "platform_facts.json holds ТабличныйДокумент / SpreadsheetDocument with 45 methods (ids 6302-6346) and 63 properties (ids 12571-12633), each a contiguous id block with no foreign id inside. The composition was checked by an oracle independent of the help-index MCP server that mis-attributes members: the repository's own extractor (html-parser hbk, crates/bsl-platform/tools/html-parser) reads the platform help archives directly, and the corpora of three installed builds were compared - 8.3.17.1549, 8.3.27.2214 (the pinned build the facts come from) and 8.5.1.1343. The 8.3.17 build lists 44 methods and 55 properties and the 8.5.1 build lists 45 and 63, so the facts are a superset of 8.3.17 and the extra members are confirmed by the newer 8.5.1 build; the attested surface is therefore the pinned one, not the 8.3.17 subset.",
       "rationale": "A spreadsheet document is the most used output type of print forms, and its surface is large enough that a mistyped member is easy to make and silently wrong. Both surfaces are attested because both have members. Types are matched by their Russian name, because the platform renames English names between builds (NotifyDescription in 8.3.17 became CallbackDescription in 8.3.27)."
+    },
+    {
+      "type": "TempTablesManager",
+      "verified_against_version": "8.3.17",
+      "evidence_source": "platform_facts.json holds МенеджерВременныхТаблиц / TempTablesManager with 1 method (id 1748) and 1 property (id 5503). The composition was checked by an oracle independent of the help-index MCP server that mis-attributes members: the repository's own extractor (html-parser hbk, crates/bsl-platform/tools/html-parser) reads the platform help archives directly, and the corpora of three installed builds were compared - 8.3.17.1549, 8.3.27.2214 (the pinned build the facts come from) and 8.5.1.1343, with types matched by their Russian name. The 1 method and 1 property agree across the three builds.",
+      "rationale": "Both surfaces are attested because both have members. Types are matched by their Russian name, because the platform renames English names between builds (NotifyDescription in 8.3.17 became CallbackDescription in 8.3.27)."
+    },
+    {
+      "type": "File",
+      "verified_against_version": "8.3.17",
+      "evidence_source": "platform_facts.json holds Файл / File with 42 methods (ids 6024-6065) and 5 properties (ids 12345-12349). The composition was checked by an oracle independent of the help-index MCP server that mis-attributes members: the repository's own extractor (html-parser hbk, crates/bsl-platform/tools/html-parser) reads the platform help archives directly, and the corpora of three installed builds were compared - 8.3.17.1549, 8.3.27.2214 (the pinned build the facts come from) and 8.5.1.1343, with types matched by their Russian name. The builds differ: 28 methods and 5 properties in 8.3.17 and 42 methods and 5 properties in 8.3.27 and 8.5.1, so the facts are a superset of 8.3.17 and the extra members are confirmed by the newer 8.5.1 build; the attested surface is therefore the pinned one, not the 8.3.17 subset.",
+      "rationale": "Both surfaces are attested because both have members. Types are matched by their Russian name, because the platform renames English names between builds (NotifyDescription in 8.3.17 became CallbackDescription in 8.3.27)."
+    },
+    {
+      "type": "DataLock",
+      "verified_against_version": "8.3.17",
+      "verified_surface": [
+        "methods"
+      ],
+      "evidence_source": "platform_facts.json holds БлокировкаДанных / DataLock with 4 methods (ids 3254-3257) and 0 properties. The composition was checked by an oracle independent of the help-index MCP server that mis-attributes members: the repository's own extractor (html-parser hbk, crates/bsl-platform/tools/html-parser) reads the platform help archives directly, and the corpora of three installed builds were compared - 8.3.17.1549, 8.3.27.2214 (the pinned build the facts come from) and 8.5.1.1343, with types matched by their Russian name. The 4 methods and 0 properties agree across the three builds.",
+      "rationale": "Only the method surface is attested: the type has no properties, and an empty surface is left open because closing it buys no misspelling check. Types are matched by their Russian name, because the platform renames English names between builds (NotifyDescription in 8.3.17 became CallbackDescription in 8.3.27)."
+    },
+    {
+      "type": "Line",
+      "verified_against_version": "8.3.17",
+      "verified_surface": [
+        "fields"
+      ],
+      "evidence_source": "platform_facts.json holds Линия / Line with 0 methods and 3 properties (ids 9099-9101). The composition was checked by an oracle independent of the help-index MCP server that mis-attributes members: the repository's own extractor (html-parser hbk, crates/bsl-platform/tools/html-parser) reads the platform help archives directly, and the corpora of three installed builds were compared - 8.3.17.1549, 8.3.27.2214 (the pinned build the facts come from) and 8.5.1.1343, with types matched by their Russian name. The 0 methods and 3 properties agree across the three builds.",
+      "rationale": "Only the property surface is attested: the type has no methods, and an empty surface is left open because closing it buys no misspelling check. Types are matched by their Russian name, because the platform renames English names between builds (NotifyDescription in 8.3.17 became CallbackDescription in 8.3.27)."
+    },
+    {
+      "type": "FixedArray",
+      "verified_against_version": "8.3.17",
+      "verified_surface": [
+        "methods"
+      ],
+      "evidence_source": "platform_facts.json holds ФиксированныйМассив / FixedArray with 4 methods (ids 1768-1771) and 0 properties. The composition was checked by an oracle independent of the help-index MCP server that mis-attributes members: the repository's own extractor (html-parser hbk, crates/bsl-platform/tools/html-parser) reads the platform help archives directly, and the corpora of three installed builds were compared - 8.3.17.1549, 8.3.27.2214 (the pinned build the facts come from) and 8.5.1.1343, with types matched by their Russian name. The 4 methods and 0 properties agree across the three builds.",
+      "rationale": "Only the method surface is attested: the type has no properties, and an empty surface is left open because closing it buys no misspelling check. Types are matched by their Russian name, because the platform renames English names between builds (NotifyDescription in 8.3.17 became CallbackDescription in 8.3.27)."
+    },
+    {
+      "type": "FixedStructure",
+      "verified_against_version": "8.3.17",
+      "verified_surface": [
+        "methods"
+      ],
+      "evidence_source": "platform_facts.json holds ФиксированнаяСтруктура / FixedStructure with 2 methods (ids 1778-1779) and 0 properties. The composition was checked by an oracle independent of the help-index MCP server that mis-attributes members: the repository's own extractor (html-parser hbk, crates/bsl-platform/tools/html-parser) reads the platform help archives directly, and the corpora of three installed builds were compared - 8.3.17.1549, 8.3.27.2214 (the pinned build the facts come from) and 8.5.1.1343, with types matched by their Russian name. The 2 methods and 0 properties agree across the three builds.",
+      "rationale": "Only the method surface is attested: a fixed structure's keys are read as properties, so any key name is legitimate code and the property surface stays open. Types are matched by their Russian name, because the platform renames English names between builds (NotifyDescription in 8.3.17 became CallbackDescription in 8.3.27)."
+    },
+    {
+      "type": "Boundary",
+      "verified_against_version": "8.3.17",
+      "verified_surface": [
+        "fields"
+      ],
+      "evidence_source": "platform_facts.json holds Граница / Boundary with 0 methods and 2 properties (ids 303-304). The composition was checked by an oracle independent of the help-index MCP server that mis-attributes members: the repository's own extractor (html-parser hbk, crates/bsl-platform/tools/html-parser) reads the platform help archives directly, and the corpora of three installed builds were compared - 8.3.17.1549, 8.3.27.2214 (the pinned build the facts come from) and 8.5.1.1343, with types matched by their Russian name. The 0 methods and 2 properties agree across the three builds.",
+      "rationale": "Only the property surface is attested: the type has no methods, and an empty surface is left open because closing it buys no misspelling check. Types are matched by their Russian name, because the platform renames English names between builds (NotifyDescription in 8.3.17 became CallbackDescription in 8.3.27)."
+    },
+    {
+      "type": "Font",
+      "verified_against_version": "8.3.17",
+      "evidence_source": "platform_facts.json holds Шрифт / Font with 1 method (id 4000) and 8 properties (ids 9090-9097). The composition was checked by an oracle independent of the help-index MCP server that mis-attributes members: the repository's own extractor (html-parser hbk, crates/bsl-platform/tools/html-parser) reads the platform help archives directly, and the corpora of three installed builds were compared - 8.3.17.1549, 8.3.27.2214 (the pinned build the facts come from) and 8.5.1.1343, with types matched by their Russian name. The builds differ: 0 methods and 8 properties in 8.3.17 and 1 method and 8 properties in 8.3.27 and 8.5.1, so the facts are a superset of 8.3.17 and the extra members are confirmed by the newer 8.5.1 build; the attested surface is therefore the pinned one, not the 8.3.17 subset.",
+      "rationale": "Both surfaces are attested because both have members. Types are matched by their Russian name, because the platform renames English names between builds (NotifyDescription in 8.3.17 became CallbackDescription in 8.3.27)."
+    },
+    {
+      "type": "ChoiceParameter",
+      "verified_against_version": "8.3.17",
+      "verified_surface": [
+        "fields"
+      ],
+      "evidence_source": "platform_facts.json holds ПараметрВыбора / ChoiceParameter with 0 methods and 2 properties (ids 9075-9076). The composition was checked by an oracle independent of the help-index MCP server that mis-attributes members: the repository's own extractor (html-parser hbk, crates/bsl-platform/tools/html-parser) reads the platform help archives directly, and the corpora of three installed builds were compared - 8.3.17.1549, 8.3.27.2214 (the pinned build the facts come from) and 8.5.1.1343, with types matched by their Russian name. The 0 methods and 2 properties agree across the three builds.",
+      "rationale": "Only the property surface is attested: the type has no methods, and an empty surface is left open because closing it buys no misspelling check. Types are matched by their Russian name, because the platform renames English names between builds (NotifyDescription in 8.3.17 became CallbackDescription in 8.3.27)."
     }
   ],
   "parameter_passing_attestations": [
