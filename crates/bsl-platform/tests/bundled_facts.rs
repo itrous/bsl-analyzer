@@ -278,6 +278,31 @@ fn the_curated_overlays_reach_the_built_in_facts() {
     for name in ["ЗаписьJSON", "JSONWriter", "ТаблицаЗначений", "ValueTable"] {
         assert!(surfaces_of(&data, name) == BOTH, "{name} is attested");
     }
+    for name in [
+        "Массив",
+        "Array",
+        "Соответствие",
+        "Map",
+        "СписокЗначений",
+        "ValueList",
+        "ТекстовыйДокумент",
+        "TextDocument",
+        "ДеревоЗначений",
+        "ValueTree",
+        "Запрос",
+        "Query",
+        "СообщениеПользователю",
+        "UserMessage",
+    ] {
+        assert!(surfaces_of(&data, name) == BOTH, "{name} is attested");
+    }
+    // A structure's keys ARE its properties, so only its methods are attested.
+    for name in ["Структура", "Structure"] {
+        assert!(
+            surfaces_of(&data, name) == METHODS_ONLY,
+            "{name} is attested for its methods and not for its properties"
+        );
+    }
     // The collections that address their elements by name are attested for the
     // methods alone: an element name is answered as a property, so the property
     // surface stays open.
@@ -298,7 +323,7 @@ fn the_curated_overlays_reach_the_built_in_facts() {
     assert!(data.get_type_properties("StandardAttributeDescriptions").is_empty());
     // ...and the types nobody attested stay open, however complete they look.
     assert!(surfaces_of(&data, "ТабличныйДокумент") == NEITHER);
-    assert!(surfaces_of(&data, "Запрос") == NEITHER);
+    assert!(surfaces_of(&data, "ЗаписьXML") == NEITHER);
     assert!(surfaces_of(&data, "ЗаписьJSONНеТакой") == NEITHER);
 
     // The members the attestation covers are the ones the positive tests call
@@ -311,6 +336,9 @@ fn the_curated_overlays_reach_the_built_in_facts() {
     assert_eq!(data.get_type_properties("SpreadsheetDocumentRange").len(), 63);
     assert!(data.get_property("SpreadsheetDocumentRange", "ТекущаяОбласть").is_none());
     assert!(data.get_method("JSONWriter", "ЗаписатьНачалоТаблицы").is_none());
+    assert_eq!(data.get_type_methods("Array").len(), 9);
+    assert_eq!(data.get_type_methods("Structure").len(), 5);
+    assert!(data.get_type_properties("Structure").is_empty());
     assert_eq!(data.get_type_methods("ValueTable").len(), 19);
     assert_eq!(data.get_type_properties("ValueTable").len(), 2);
     assert!(data.get_method("ТаблицаЗначений", "Прочитать").is_none());

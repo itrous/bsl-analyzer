@@ -957,6 +957,69 @@ mod tests {
         }
     }
 
+    /// An array is the commonest receiver of a mistyped call: it is attested, so a method
+    /// the platform does not have is reported, and the real ones stay silent.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_an_array_is_reported() {
+        let umc = platform_umc(
+            "Процедура Тест()\n    М = Новый Массив;\n    М.Добавить(1);\n    М.НетТакогоМетода();\nКонецПроцедуры",
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(umc.len(), 1, "expected one UnresolvedMethodCall, got: {umc:?}");
+            assert!(umc[0].contains("НетТакогоМетода"), "message must name the method: {umc:?}");
+            assert!(umc[0].contains("Массив"), "message must name the receiver type: {umc:?}");
+        } else {
+            assert!(umc.is_empty(), "an unknown platform version keeps the miss silent: {umc:?}");
+        }
+    }
+
+    /// The control that an attestation also takes effect through the plain
+    /// `PlatformObject` path: a value tree has no kind of its own and needs no arm.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_a_value_tree_is_reported() {
+        let umc = platform_umc(
+            "Процедура Тест()\n    Д = Новый ДеревоЗначений;\n    Д.НетТакогоМетода();\nКонецПроцедуры",
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(umc.len(), 1, "expected one UnresolvedMethodCall, got: {umc:?}");
+            assert!(umc[0].contains("НетТакогоМетода"), "message must name the method: {umc:?}");
+            assert!(
+                umc[0].contains("ДеревоЗначений"),
+                "message must name the receiver type: {umc:?}"
+            );
+        } else {
+            assert!(umc.is_empty(), "an unknown platform version keeps the miss silent: {umc:?}");
+        }
+    }
+
+    /// A structure is attested for its methods only: its keys are properties, but the
+    /// method list is the platform's own, so a call it does not have is reported.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_a_structure_is_reported() {
+        let umc = platform_umc(
+            "Процедура Тест()\n    С = Новый Структура;\n    С.Вставить(\"К\", 1);\n    С.НетТакогоМетода();\nКонецПроцедуры",
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(umc.len(), 1, "expected one UnresolvedMethodCall, got: {umc:?}");
+            assert!(umc[0].contains("НетТакогоМетода"), "message must name the method: {umc:?}");
+            assert!(umc[0].contains("Структура"), "message must name the receiver type: {umc:?}");
+        } else {
+            assert!(umc.is_empty(), "an unknown platform version keeps the miss silent: {umc:?}");
+        }
+    }
+
     /// The other half of the contract, on the profile that exercises it: with a corpus
     /// whose platform version cannot be determined the completeness gate stays shut, so
     /// the very same call is silent. The controls say why that silence is the contract

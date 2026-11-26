@@ -689,6 +689,55 @@
       },
       "evidence_source": "The pinned 8.3.27 platform_data.json identified in PROVENANCE.md (SHA-256 3c759994cbd82a1522b1c497d9f2ef68c77b776d5c6723ba5a72623b570cacce) lists DOMNodeType / ТипУзлаDOM as one type with no methods and exactly 13 properties, ids 2468-2480. The corpus-contract test checks every id and both member names against that corpus; the served snapshot must carry exactly this member set. The type has no docs-gap synthesized members and is not extended by configuration metadata.",
       "rationale": "The enumeration has a fixed value surface. Its documented Element / Элемент exists, while УзелЭлемента does not. Exact member-set matching refuses truncated or changed extracts before the existing version and unique-owner gates can attest a missing member."
+    },
+    {
+      "type": "Array",
+      "verified_against_version": "8.3.17",
+      "evidence_source": "platform_facts.json holds Массив / Array with 9 methods (ids 1749-1757, one contiguous block bounded by records of other types) and no property. The installed 8.3.17 platform help (HBK) lists the same 9 methods and no property. The type name is unique in the facts in both languages (Массив / Array resolve to one type).",
+      "rationale": "Массив is a core platform type that real code calls constantly, and a mistyped member on it is the commonest defect the check could name. The extract lists its whole surface at 8.3.17 and 8.3.27 (the newer release only adds members), so a member outside it fails at run time and the miss is a defect of the checked code, not a gap in the extract."
+    },
+    {
+      "type": "Map",
+      "verified_against_version": "8.3.17",
+      "evidence_source": "platform_facts.json holds Соответствие / Map with 5 methods (ids 1780-1784, one contiguous block bounded by records of other types) and no property. The installed 8.3.17 platform help (HBK) lists the same 5 methods and no property. The type name is unique in the facts in both languages (Соответствие / Map resolve to one type).",
+      "rationale": "Соответствие is a core platform type that real code calls constantly, and a mistyped member on it is the commonest defect the check could name. The extract lists its whole surface at 8.3.17 and 8.3.27 (the newer release only adds members), so a member outside it fails at run time and the miss is a defect of the checked code, not a gap in the extract."
+    },
+    {
+      "type": "Structure",
+      "verified_against_version": "8.3.17",
+      "verified_surface": ["methods"],
+      "evidence_source": "platform_facts.json holds Структура / Structure with 5 methods (ids 1785-1789, one contiguous block bounded by records of other types) and no property. The installed 8.3.17 platform help (HBK) lists the same 5 methods and no property. A structure's keys are reached as properties, so only the method surface is attested. The type name is unique in the facts in both languages (Структура / Structure resolve to one type).",
+      "rationale": "A structure's keys are reached as properties, so a name read from it is not a miss in the extract and its field surface can never be closed; the method list is the platform's own, so a call such as `Структура.НетТакогоМетода()` is a call the platform does not answer. Only the method surface is attested; the field surface is deliberately left unattested."
+    },
+    {
+      "type": "ValueList",
+      "verified_against_version": "8.3.17",
+      "evidence_source": "platform_facts.json holds СписокЗначений / ValueList with 22 methods (ids 1790-1811, one contiguous block bounded by records of other types) and 2 properties. The installed 8.3.17 platform help (HBK) lists 20 methods and the same 2 properties (ДоступныеЗначения, ТипЗначения); the facts add only the newer ОтметитьЭлементыАсинх and ВыбратьЭлементАсинх. The type name is unique in the facts in both languages (СписокЗначений / ValueList resolve to one type).",
+      "rationale": "СписокЗначений is a core platform type that real code calls constantly, and a mistyped member on it is the commonest defect the check could name. The extract lists its whole surface at 8.3.17 and 8.3.27 (the newer release only adds members), so a member outside it fails at run time and the miss is a defect of the checked code, not a gap in the extract."
+    },
+    {
+      "type": "TextDocument",
+      "verified_against_version": "8.3.17",
+      "evidence_source": "platform_facts.json holds ТекстовыйДокумент / TextDocument with 19 methods (ids 6272-6290, one contiguous block bounded by records of other types) and 6 properties. The installed 8.3.17 platform help (HBK) lists 17 distinct method names and the same 6 properties; the facts add only the newer ПрочитатьАсинх and ЗаписатьАсинх. The type name is unique in the facts in both languages (ТекстовыйДокумент / TextDocument resolve to one type).",
+      "rationale": "ТекстовыйДокумент is a core platform type that real code calls constantly, and a mistyped member on it is the commonest defect the check could name. The extract lists its whole surface at 8.3.17 and 8.3.27 (the newer release only adds members), so a member outside it fails at run time and the miss is a defect of the checked code, not a gap in the extract."
+    },
+    {
+      "type": "ValueTree",
+      "verified_against_version": "8.3.17",
+      "evidence_source": "platform_facts.json holds ДеревоЗначений / ValueTree with 2 methods (ids 1848-1849, one contiguous block bounded by records of other types) and 2 properties. The installed 8.3.17 platform help (HBK) lists the same 2 methods (ВыбратьСтроку, Скопировать) and the same 2 properties (Колонки, Строки). The type name is unique in the facts in both languages (ДеревоЗначений / ValueTree resolve to one type).",
+      "rationale": "ДеревоЗначений is a core platform type that real code calls constantly, and a mistyped member on it is the commonest defect the check could name. The extract lists its whole surface at 8.3.17 and 8.3.27 (the newer release only adds members), so a member outside it fails at run time and the miss is a defect of the checked code, not a gap in the extract."
+    },
+    {
+      "type": "Query",
+      "verified_against_version": "8.3.17",
+      "evidence_source": "platform_facts.json holds Запрос / Query with 5 methods (ids 1711-1715, one contiguous block bounded by records of other types) and 7 properties. The installed 8.3.17 platform help (HBK) lists the same 5 methods and 5 properties; the facts add only the newer properties ИспользованиеКопийБазыДанных and ИспользуемыеКопииБазыДанных. The type name is unique in the facts in both languages (Запрос / Query resolve to one type).",
+      "rationale": "Запрос is a core platform type that real code calls constantly, and a mistyped member on it is the commonest defect the check could name. The extract lists its whole surface at 8.3.17 and 8.3.27 (the newer release only adds members), so a member outside it fails at run time and the miss is a defect of the checked code, not a gap in the extract."
+    },
+    {
+      "type": "UserMessage",
+      "verified_against_version": "8.3.17",
+      "evidence_source": "platform_facts.json holds СообщениеПользователю / UserMessage with 2 methods (ids 2030-2031, one contiguous block bounded by records of other types) and 5 properties. The installed 8.3.17 platform help (HBK) lists the same 2 methods and the same 5 properties. The type name is unique in the facts in both languages (СообщениеПользователю / UserMessage resolve to one type).",
+      "rationale": "СообщениеПользователю is a core platform type that real code calls constantly, and a mistyped member on it is the commonest defect the check could name. The extract lists its whole surface at 8.3.17 and 8.3.27 (the newer release only adds members), so a member outside it fails at run time and the miss is a defect of the checked code, not a gap in the extract."
     }
   ],
   "parameter_passing_attestations": [

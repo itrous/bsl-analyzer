@@ -843,6 +843,65 @@ mod tests {
         }
     }
 
+    /// A query is attested for its properties, so a field it does not have is reported.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_a_query_is_reported() {
+        let code = r#"Процедура Тест()
+    Запрос = Новый Запрос;
+    Текст = Запрос.Текст;
+    Нет = Запрос.НетТакогоПоля;
+КонецПроцедуры"#;
+        let unresolved = unresolved_fields(code);
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(unresolved.len(), 1, "expected one miss on the query, got: {unresolved:?}");
+            assert!(
+                unresolved[0].message.contains("НетТакогоПоля"),
+                "message must name the missing field, got: {}",
+                unresolved[0].message
+            );
+            assert!(
+                unresolved[0].message.contains("Запрос"),
+                "message must name the receiver type, got: {}",
+                unresolved[0].message
+            );
+        } else {
+            assert!(
+                unresolved.is_empty(),
+                "an unknown platform version keeps the miss silent: {unresolved:?}"
+            );
+        }
+    }
+
+    /// THE CONTROL: a structure's keys are reached as properties, so a name read from it
+    /// is no miss in the extract. The structure is attested for its methods only, and the
+    /// absent-field check must stay silent on a name read from a bare one. A structure
+    /// with known keys (`Вставить` seen) is a different, already-working path: the
+    /// structure facet itself reports an unknown key, independently of any attestation.
+    #[test]
+    fn a_name_read_from_a_structure_stays_silent_because_keys_are_properties() {
+        let unresolved = unresolved_fields(
+            r#"Процедура Тест()
+    С = Новый Структура;
+    Значение = С.Ключ;
+КонецПроцедуры"#,
+        );
+        assert!(
+            unresolved.is_empty(),
+            "a structure key is a property read, not a miss: {unresolved:?}"
+        );
+        assert!(
+            !bsl_platform::PlatformData::instance().platform_type_member_surface_verified(
+                "Structure",
+                bsl_platform::MemberSurface::Fields,
+            ),
+            "the field surface of a structure must never be attested"
+        );
+    }
+
     /// The other half of the contract, on the profile that exercises it: with a corpus
     /// whose platform version cannot be determined the completeness gate stays shut, so
     /// the very same miss is silent. The controls say why that silence is the contract
