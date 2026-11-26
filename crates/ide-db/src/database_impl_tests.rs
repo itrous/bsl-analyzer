@@ -9780,6 +9780,107 @@ fn dataflow_writes_i14_body_flow_identity() {
     effective_body_has_its_own_flow();
 }
 
+#[test]
+fn body_flow_budget_refuses_cold_memo_queries_before_they_run() {
+    let mut db = RootDatabaseImpl::new_with_salsa_events();
+    let file_id = FileId(0);
+    let mut files = FileSet::new();
+    files.insert(file_id, VfsPath::new("/Module.bsl"));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(files));
+    db.set_file_source_root(file_id, SourceRootId(0));
+    let statements = (0..256).map(|index| format!("\tA{index} = {index};\n")).collect::<String>();
+    db.set_file_text(file_id, &format!("Процедура Т()\n{statements}КонецПроцедуры\n{statements}"));
+    let module = ModuleId::new(file_id);
+    let method = db.symbol_tree(module).find_method(&hir::Name::new("Т")).expect("method").id;
+    let input = hir::MethodIdInput::new(&db, method);
+    let method_flow = hir::BodyFlow::for_method(&db, input, db.method_body_ref(input));
+    let module_body = db.module_bodies_ref(module).module_code_arc().expect("module code").clone();
+    let module_flow = hir::BodyFlow::for_module_code(&db, file_id, &module_body);
+
+    assert!(db.salsa_events_reset());
+    let mut cancellation_checks = 0;
+    let mut refuse = |_: usize| {
+        cancellation_checks += 1;
+        false
+    };
+    assert!(method_flow.cfg_with_work(&db, &mut refuse).is_none());
+    assert!(method_flow.events_with_work(&db, &mut refuse).is_none());
+    assert!(module_flow.cfg_with_work(&db, &mut refuse).is_none());
+    assert!(module_flow.events_with_work(&db, &mut refuse).is_none());
+    assert_eq!(cancellation_checks, 4, "each cold query is charged before it starts");
+    assert_eq!(db.salsa_family_churn("method_cfg_query").unwrap().0, 0);
+    assert_eq!(db.salsa_family_churn("method_body_events_query").unwrap().0, 0);
+    assert_eq!(db.salsa_family_churn("module_level_cfg_query").unwrap().0, 0);
+    assert_eq!(db.salsa_family_churn("module_code_body_events_query").unwrap().0, 0);
+
+    let mut cancellation_checks = 0;
+    let mut allow = |work: usize| {
+        if work >= 128 {
+            cancellation_checks += 1;
+        }
+        true
+    };
+    assert!(method_flow.cfg_with_work(&db, &mut allow).is_some());
+    assert!(method_flow.events_with_work(&db, &mut allow).is_some());
+    assert!(module_flow.cfg_with_work(&db, &mut allow).is_some());
+    assert!(module_flow.events_with_work(&db, &mut allow).is_some());
+    assert_eq!(cancellation_checks, 4, "large cold builds reach their cancellation check");
+}
+
+#[test]
+fn effective_owner_inference_reuses_tracked_effective_returns() {
+    let temp = tempfile::tempdir().unwrap();
+    let main_root = temp.path().join("src/cf");
+    let ext_root = temp.path().join("src/cfe/X");
+    std::fs::create_dir_all(&main_root).unwrap();
+    std::fs::create_dir_all(&ext_root).unwrap();
+
+    let mut db = RootDatabaseImpl::new_with_salsa_events();
+    db.set_all_config_paths(
+        vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
+    let base_file = FileId(0);
+    let ext_file = FileId(1);
+    let mut files = FileSet::new();
+    files.insert(
+        base_file,
+        VfsPath::new(main_root.join("CommonModules/М/Ext/Module.bsl").to_string_lossy().as_ref()),
+    );
+    files.insert(
+        ext_file,
+        VfsPath::new(ext_root.join("CommonModules/М/Ext/Module.bsl").to_string_lossy().as_ref()),
+    );
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(files));
+    db.set_file_source_root(base_file, SourceRootId(0));
+    db.set_file_source_root(ext_file, SourceRootId(0));
+    db.set_file_text(base_file, "Функция Цель() Экспорт\nВозврат 0;\nКонецФункции\n");
+    db.set_file_text(
+        ext_file,
+        "&ИзменениеИКонтроль(\"Цель\")\nФункция Расш_Цель()\n#Вставка\nВозврат 1;\n#КонецВставки\nКонецФункции\n",
+    );
+
+    let eid = hir::EffectiveModuleId::new(&db, base_file, ext_file);
+    let target = db
+        .symbol_tree(ModuleId::new(base_file))
+        .find_method(&hir::Name::new("Цель"))
+        .expect("base target")
+        .id;
+    let body = hir::module_bodies_effective(&db, eid)
+        .body(target.local_id)
+        .expect("effective target body")
+        .clone();
+    assert!(db.salsa_events_reset());
+    for _ in 0..2 {
+        hir::infer_effective_owner(&db, eid, hir::DefWithBodyId::Method(target.local_id), &body);
+    }
+    assert_eq!(
+        db.salsa_family_churn("effective_method_returns").unwrap().0,
+        1,
+        "the first owner inference computes the tracked return query; the second reads its memo",
+    );
+}
+
 /// A budget stop says what one reader could afford, not what the body is: a later
 /// reader with room solves the same flow, and a warmed flow answers without
 /// charging its reader at all.

@@ -8032,8 +8032,11 @@ fn infer_effective_owner_with_query_facts(
         owner,
         &Arc::new(body.clone()),
     );
-    let (returns, returns_incomplete, returns_spent) =
-        effective_method_returns_and_incompleteness(db, eid, defer_query_facts, work_limit);
+    let (returns, returns_incomplete, returns_spent) = if defer_query_facts {
+        effective_method_returns_and_incompleteness(db, eid, true, work_limit)
+    } else {
+        (effective_method_returns(db, eid), false, 0)
+    };
     ctx.set_local_effective_returns(returns);
     ctx.notify_body_env = Some(effective_notify_body_env(db, eid, owner));
     if defer_query_facts {

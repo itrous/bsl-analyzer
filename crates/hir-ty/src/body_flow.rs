@@ -83,21 +83,24 @@ impl BodyFlow {
         self.events_with_work(db, &mut |_| true).expect("an unlimited work budget cannot exhaust")
     }
 
-    /// [`BodyFlow::events`] that charges the build of a body the database does not
-    /// memoise before starting it. The collection itself has no internal
-    /// cancellation point, so the charge is one estimate and the limitation is
-    /// deliberate: a caller that cannot afford the whole build builds none of it.
+    /// [`BodyFlow::events`] that charges a whole-body estimate before asking for
+    /// a database memo which may be cold. The collection has no internal
+    /// cancellation point, so a caller that cannot afford the estimate starts
+    /// none of the build.
     pub fn events_with_work(
         &self,
         db: &dyn HirDatabase,
         spend: &mut dyn FnMut(usize) -> bool,
     ) -> Option<Arc<BodyEvents>> {
         match self.origin {
-            Origin::Method(method) => Some(db.method_body_events(MethodIdInput::new(db, method))),
-            Origin::ModuleCode(file_id) => match db.module_code_body_events(file_id) {
-                Some(events) => Some(events),
-                None => self.own_events_with_work(spend),
-            },
+            Origin::Method(method) => {
+                self.memoized_with_work(spend)?;
+                Some(db.method_body_events(MethodIdInput::new(db, method)))
+            }
+            Origin::ModuleCode(file_id) => {
+                self.memoized_with_work(spend)?;
+                db.module_code_body_events(file_id)
+            }
             Origin::Detached { .. } => self.own_events_with_work(spend),
         }
     }
@@ -106,9 +109,9 @@ impl BodyFlow {
         self.cfg_with_work(db, &mut |_| true).expect("an unlimited work budget cannot exhaust")
     }
 
-    /// [`BodyFlow::cfg`] that charges the build of a body the database does not
-    /// memoise before starting it. The builder has no internal cancellation point,
-    /// so it runs whole once the estimate is affordable; see
+    /// [`BodyFlow::cfg`] that charges a whole-body estimate before asking for a
+    /// database memo which may be cold. The builder has no internal cancellation
+    /// point, so it runs whole once the estimate is affordable; see
     /// [`BodyFlow::events_with_work`].
     pub fn cfg_with_work(
         &self,
@@ -116,8 +119,14 @@ impl BodyFlow {
         spend: &mut dyn FnMut(usize) -> bool,
     ) -> Option<Arc<ControlFlowGraph>> {
         match self.origin {
-            Origin::Method(method) => Some(db.method_cfg(MethodIdInput::new(db, method))),
-            Origin::ModuleCode(file_id) => Some(db.module_code_cfg(file_id)),
+            Origin::Method(method) => {
+                self.memoized_with_work(spend)?;
+                Some(db.method_cfg(MethodIdInput::new(db, method)))
+            }
+            Origin::ModuleCode(file_id) => {
+                self.memoized_with_work(spend)?;
+                Some(db.module_code_cfg(file_id))
+            }
             Origin::Detached { .. } => self.own_cfg_with_work(spend),
         }
     }
@@ -251,6 +260,13 @@ impl BodyFlow {
             Ok(()) => solved,
             Err(_) => self.executable_reaching_defs.get().cloned().unwrap_or(solved),
         }
+    }
+
+    /// Salsa does not expose whether these queries are currently memoized. Charge
+    /// the conservative whole-body build estimate before asking for one, so a cold
+    /// query cannot do unmetered work; warm queries conservatively pay the same cost.
+    fn memoized_with_work(&self, spend: &mut dyn FnMut(usize) -> bool) -> Option<()> {
+        spend(body_build_work(&self.body)).then_some(())
     }
 
     fn seeds_params(&self) -> bool {
