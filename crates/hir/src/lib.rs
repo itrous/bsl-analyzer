@@ -239,8 +239,9 @@ pub use hir_ty::notify_targets::{
     semantic_module_call_summary_weaving_query, semantic_notify_candidates_effective_query,
     semantic_notify_candidates_query, semantic_notify_candidates_weaving_query,
     semantic_notify_facts_effective_query, semantic_notify_facts_weaving_query,
-    semantic_notify_facts_with_work_limit, NotifyCallbackSlot, NotifyCandidate,
-    NotifyCandidateKind, NotifyCandidateReceiver, NotifySignatureProtection,
+    semantic_notify_facts_weaving_with_work_limit, semantic_notify_facts_with_work_limit,
+    NotifyCallbackSlot, NotifyCandidate, NotifyCandidateKind, NotifyCandidateReceiver,
+    NotifySignatureProtection,
 };
 pub use hir_ty::proc_signature;
 pub use hir_ty::query_in_loop::{

@@ -593,6 +593,24 @@ pub fn semantic_module_call_summary_weaving_query<'db>(
     semantic_notify_facts_weaving_query(db, wid).summary.clone()
 }
 
+/// Test hook: the weaving projection with an explicit shared work limit.
+#[doc(hidden)]
+pub fn semantic_notify_facts_weaving_with_work_limit<'db>(
+    db: &'db dyn HirDatabase,
+    wid: WeavingModuleId<'db>,
+    work_limit: usize,
+) -> Arc<SemanticNotifyFacts> {
+    let file_id = wid.ext_file(db);
+    let raw = hir_def::queries::module_call_summary_query(db, FileIdInput::new(db, file_id));
+    if raw.notify_candidates.is_empty() {
+        return empty_notify_facts(&raw);
+    }
+    let projection = NotifyModuleProjection::for_weaving(db, wid);
+    let mut cancel = || db.unwind_if_revision_cancelled();
+    let mut budget = NotifyWorkBudget::with_limit(&mut cancel, work_limit);
+    semantic_notify_facts_with_budget(db, &projection, &raw, &mut budget)
+}
+
 /// Test hook: the same projection with an explicit work limit, so callers can
 /// observe the conservative exhaustion result without a pathological fixture.
 #[doc(hidden)]

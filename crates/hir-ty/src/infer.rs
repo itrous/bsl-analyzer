@@ -2849,11 +2849,6 @@ impl<'db> InferenceContext<'db> {
         self.reaching_defs_work_remaining.set(work_limit);
     }
 
-    /// Record that data this inference consumed depended on a deferred solve.
-    fn mark_reaching_defs_incomplete(&mut self) {
-        self.reaching_defs_skipped.set(true);
-    }
-
     fn account_reaching_defs_work(&mut self, spent: usize, incomplete: bool) {
         self.reaching_defs_work_spent
             .set(self.reaching_defs_work_spent.get().saturating_add(spent));
@@ -8139,10 +8134,6 @@ fn weaving_notify_body_env(
     (base_definite & ext_declaration.preproc_env, base_possible & ext_possible)
 }
 
-/// A bounded allowance for the base-return inference a notify projection needs;
-/// the same order as the notify budget, but for a single helper body.
-const DEFERRED_BASE_RETURN_WORK_LIMIT: usize = 524_288;
-
 /// The `ПродолжитьВызов` facts of a weaving extension module: the base method return and
 /// arity per interceptor, plus every recognized interception by the extension method's
 /// local id. Built in one pass over the module's methods and shared by [`infer_weaving`]
@@ -8153,9 +8144,9 @@ pub(crate) struct WeavingProceedFacts {
     pub(crate) returns: FxHashMap<hir_def::MethodKey, TypeId>,
     pub(crate) arities: FxHashMap<hir_def::MethodKey, (usize, usize)>,
     pub(crate) interceptions: FxHashMap<hir_def::MethodKey, Interception>,
-    /// A notify projection computed a base return through deferred inference, so
-    /// the consumer must treat the facts as dependent on a solve it did not run.
-    pub(crate) returns_incomplete: bool,
+    /// The base method each around interceptor wraps. A notify projection computes
+    /// its return later, against the projection's shared remaining budget.
+    pub(crate) base_methods: FxHashMap<hir_def::MethodKey, hir_def::MethodId>,
 }
 
 #[salsa::tracked(returns(clone))]
@@ -8200,25 +8191,18 @@ fn weaving_proceed_facts_impl<'db>(
         let Some(base_method) = base_symbols.find_method(&Name::new(&interception.target)) else {
             continue;
         };
+        facts.base_methods.insert(method.id.local_id, base_method.id);
         // `required` mirrors `FunctionSignature::required_count`: one past the last
         // non-defaulted parameter (defaults are trailing in well-formed BSL).
         let total = base_method.params.len();
         let required = base_method.params.iter().rposition(|p| !p.has_default).map_or(0, |i| i + 1);
         facts.arities.insert(method.id.local_id, (required, total));
 
-        let base_input = hir_def::MethodIdInput::new(db, base_method.id);
-        let (ret, incomplete) = if defer_inference {
-            method_return_type_with_deferred_inference(
-                db,
-                base_input,
-                DEFERRED_BASE_RETURN_WORK_LIMIT,
-            )
-        } else {
-            (crate::method_graph::method_return_type_query(db, base_input), false)
-        };
-        if incomplete {
-            facts.returns_incomplete = true;
+        if defer_inference {
+            continue;
         }
+        let base_input = hir_def::MethodIdInput::new(db, base_method.id);
+        let ret = crate::method_graph::method_return_type_query(db, base_input);
         if ret != db.unknown() && ret != db.undefined() {
             facts.returns.insert(method.id.local_id, ret);
         }
@@ -8233,7 +8217,7 @@ fn method_return_type_with_deferred_inference(
     db: &dyn HirDatabase,
     method: MethodIdInput<'_>,
     work_limit: usize,
-) -> (TypeId, bool) {
+) -> (TypeId, bool, usize) {
     let body = db.method_body_ref(method);
     let mut ctx = InferenceContext::new_for_method(db, method, body);
     ctx.defer_query_facts();
@@ -8241,7 +8225,8 @@ fn method_return_type_with_deferred_inference(
     ctx.infer_all();
     let result = ctx.finish();
     let incomplete = result.reaching_defs_incomplete;
-    (body_return_type(db, &result), incomplete)
+    let spent = result.reaching_defs_work_spent;
+    (body_return_type(db, &result), incomplete, spent)
 }
 
 /// Inference for one extension body under weaving, with the shared `ПродолжитьВызов`
@@ -8283,19 +8268,34 @@ fn infer_weaving_owner_with_query_facts(
     } else {
         weaving_proceed_facts(db, wid)
     };
+
+    let mut base_return = None;
+    let mut base_incomplete = false;
+    let mut base_spent = 0usize;
+    if defer_query_facts {
+        if let DefWithBodyId::Method(local_id) = owner {
+            if let Some(&base_method) = facts.base_methods.get(&local_id) {
+                let base_input = hir_def::MethodIdInput::new(db, base_method);
+                let (ret, incomplete, spent) =
+                    method_return_type_with_deferred_inference(db, base_input, work_limit);
+                base_return = (ret != db.unknown() && ret != db.undefined()).then_some(ret);
+                base_incomplete = incomplete;
+                base_spent = spent;
+            }
+        }
+    }
+
     let mut ctx =
         InferenceContext::new_weaving(db, ext_file, base_module, owner, &Arc::new(body.clone()));
     ctx.notify_body_env = Some(weaving_notify_body_env(db, wid, &facts, owner));
     if defer_query_facts {
         ctx.defer_query_facts();
-        ctx.defer_reaching_definitions_with_limit(work_limit);
-        if facts.returns_incomplete {
-            ctx.mark_reaching_defs_incomplete();
-        }
+        ctx.defer_reaching_definitions_with_limit(work_limit.saturating_sub(base_spent));
+        ctx.account_reaching_defs_work(base_spent, base_incomplete);
     }
     if let DefWithBodyId::Method(local_id) = owner {
-        if let Some(ret) = facts.returns.get(&local_id) {
-            ctx.set_proceed_return(*ret);
+        if let Some(ret) = base_return.or_else(|| facts.returns.get(&local_id).copied()) {
+            ctx.set_proceed_return(ret);
         }
         if let Some(&(required, total)) = facts.arities.get(&local_id) {
             ctx.set_proceed_arity(required, total);
