@@ -1031,10 +1031,10 @@ fn built_in_facts_are_served() -> bool {
 
 /// The absent-member checks judge a platform type only where the curated overlays
 /// attest that the extract lists its whole member surface. With the platform data of
-/// this build the spreadsheet range is attested and the spreadsheet document is not,
-/// so the same two misses answer differently — and the members that do exist stay
-/// silent on both. Both diagnostic kinds are checked together, because a receiver
-/// closed for a field must be closed for a method too.
+/// this build the spreadsheet range, the spreadsheet document and the JSON writer are
+/// attested and the JSON reader is not, so the same two misses answer differently — and
+/// the members that do exist stay silent on both. Both diagnostic kinds are checked
+/// together, because a receiver closed for a field must be closed for a method too.
 ///
 /// The assertion describes a source of a known release. The documented corpus profile
 /// serves a corpus file, which carries no platform version, so there the contract keeps
@@ -1058,6 +1058,9 @@ fn platform_member_misses_follow_the_completeness_attestation() {
     Запись.ЗаписатьНачалоОбъекта();
     Запись.ЗаписатьНачалоТаблицы();
     ТабДок.ОбластьСоОпечаткой();
+    Чтение = Новый ЧтениеJSON;
+    МолчитПоле = Чтение.НетТакогоСвойства;
+    МолчитМетод = Чтение.НетТакогоМетода();
 КонецПроцедуры
 "#;
     let (db, file_id) = setup(fixture);
@@ -1066,12 +1069,12 @@ fn platform_member_misses_follow_the_completeness_attestation() {
         assert_eq!(
             unresolved_field_names(&db, file_id),
             vec!["ТекущаяОбласть"],
-            "only the attested range's field miss is a verdict"
+            "the attested range's field miss is a verdict, the unattested reader's is not"
         );
         assert_eq!(
             unresolved_method_names(&db, file_id),
-            vec!["НетТакогоМетода", "ЗаписатьНачалоТаблицы"],
-            "both attested types answer for their method misses, the unattested document does not"
+            vec!["НетТакогоМетода", "ЗаписатьНачалоТаблицы", "ОбластьСоОпечаткой"],
+            "the three attested types answer for their method misses, the unattested reader does not"
         );
     } else {
         // A corpus run: the served file carries no platform version, so the

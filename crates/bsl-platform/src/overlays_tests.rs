@@ -829,13 +829,26 @@ fn the_curated_attestations_resolve_against_the_types_they_name() {
     )
     .unwrap();
 
-    let names: Vec<&str> = attestations.iter().map(|a| a.type_name.as_str()).collect();
+    let resolved: Vec<(&str, &str)> = attestations
+        .iter()
+        .map(|a| (a.type_name.as_str(), a.verified_against_version.as_str()))
+        .collect();
+    // Only the attestations whose type this fixture defines resolve; everything else in
+    // the curated document is dropped, which is what the parse is being shown to do. The
+    // version travels with each record, so it is asserted per type: one blanket
+    // "everything is 8.3.27" assertion went stale as soon as a type was attested against
+    // an older release, and this expectation grows with the curated document on purpose.
     assert_eq!(
-        names,
-        ["SpreadsheetDocumentRange", "JSONWriter", "ValueTable"],
-        "the curated document attests exactly these three types"
+        resolved,
+        [
+            ("SpreadsheetDocumentRange", "8.3.27"),
+            ("JSONWriter", "8.3.27"),
+            ("ValueTable", "8.3.27"),
+            ("SpreadsheetDocument", "8.3.17"),
+        ],
+        "the fixture defines ОбластьЯчеекТабличногоДокумента, ТабличныйДокумент, ЗаписьJSON \
+         and ТаблицаЗначений, so exactly their attestations resolve"
     );
-    assert!(attestations.iter().all(|a| a.verified_against_version == "8.3.27"));
 }
 
 /// Two entries for one property under different spellings are one correction

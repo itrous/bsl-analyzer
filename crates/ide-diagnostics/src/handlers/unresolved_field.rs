@@ -1136,7 +1136,10 @@ mod tests {
     Р = Х.НетТакогоПоля;
 КонецПроцедуры"#,
         );
-        assert!(unresolved.is_empty(), "a receiver not attested for properties stays open: {unresolved:?}");
+        assert!(
+            unresolved.is_empty(),
+            "a receiver not attested for properties stays open: {unresolved:?}"
+        );
     }
 
     /// A temp tables manager is attested for its properties, so a property it does not have is reported.
@@ -1364,23 +1367,40 @@ mod tests {
         assert!(unresolved.is_empty(), "a property the platform has is no miss: {unresolved:?}");
     }
 
-    /// A form attribute stays OPEN, although its field composition was verified across three
-    /// platform builds: the guard of `curated_attestations_stay_off_types_the_extract_cannot_complete`
-    /// treats every type whose name holds "form" as extended by a configuration and allows an
-    /// attestation of its methods alone, and this type has no methods at all. So nothing is
-    /// attestable here until that guard is reconsidered, which is a decision of its own.
+    /// A form attribute is attested for its properties, so a property it does not have is
+    /// reported. It is a plain descriptor object, not a form type: the guard of
+    /// `curated_attestations_stay_off_types_the_extract_cannot_complete` keeps the form types open by an
+    /// explicit list and no longer refuses a type because its name holds "form".
     #[test]
-    fn a_miss_on_a_form_attribute_stays_silent_because_the_type_is_not_attested() {
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_a_form_attribute_property_is_reported() {
         let unresolved = unresolved_fields(
             r#"Процедура Тест()
-    О = Новый РеквизитФормы("Имя", Новый ОписаниеТипов("Строка"));
-    Нет = О.НетТакогоПоля;
+    О = Новый РеквизитФормы("Товары", Новый ОписаниеТипов("ТаблицаЗначений"));
+    Нет = О.НетТакогоСвойства;
 КонецПроцедуры"#,
         );
-        assert!(
-            unresolved.is_empty(),
-            "an unattested type must accept any field, got: {unresolved:?}"
-        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(unresolved.len(), 1, "expected one miss, got: {unresolved:?}");
+            assert!(
+                unresolved[0].message.contains("НетТакогоСвойства"),
+                "message must name the missing field, got: {}",
+                unresolved[0].message
+            );
+            assert!(
+                unresolved[0].message.contains("РеквизитФормы"),
+                "message must name the receiver type, got: {}",
+                unresolved[0].message
+            );
+        } else {
+            assert!(
+                unresolved.is_empty(),
+                "an unknown platform version keeps the miss silent: {unresolved:?}"
+            );
+        }
     }
 
     /// THE CONTROL: a property the form attribute really has is no miss.
@@ -1393,6 +1413,398 @@ mod tests {
 КонецПроцедуры"#,
         );
         assert!(unresolved.is_empty(), "a property the platform has is no miss: {unresolved:?}");
+    }
+
+    /// A file dialog is attested for its properties, so a property it does not have is reported.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_a_file_dialog_property_is_reported() {
+        let unresolved = unresolved_fields(
+            r#"Процедура Тест()
+    О = Новый ДиалогВыбораФайла(РежимДиалогаВыбораФайла.Открытие);
+    Нет = О.НетТакогоСвойства;
+КонецПроцедуры"#,
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(unresolved.len(), 1, "expected one miss, got: {unresolved:?}");
+            assert!(
+                unresolved[0].message.contains("НетТакогоСвойства"),
+                "message must name the missing field, got: {}",
+                unresolved[0].message
+            );
+            assert!(
+                unresolved[0].message.contains("ДиалогВыбораФайла"),
+                "message must name the receiver type, got: {}",
+                unresolved[0].message
+            );
+        } else {
+            assert!(
+                unresolved.is_empty(),
+                "an unknown platform version keeps the miss silent: {unresolved:?}"
+            );
+        }
+    }
+
+    /// THE CONTROL: a property the file dialog really has is no miss.
+    #[test]
+    fn a_real_property_of_a_file_dialog_stays_silent() {
+        let unresolved = unresolved_fields(
+            r#"Процедура Тест()
+    О = Новый ДиалогВыбораФайла(РежимДиалогаВыбораФайла.Открытие);
+    Р = О.Каталог;
+КонецПроцедуры"#,
+        );
+        assert!(unresolved.is_empty(), "a property the platform has is no miss: {unresolved:?}");
+    }
+
+    /// A xml reader is attested for its properties, so a property it does not have is reported.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_a_xml_reader_property_is_reported() {
+        let unresolved = unresolved_fields(
+            r#"Процедура Тест()
+    О = Новый ЧтениеXML;
+    Нет = О.НетТакогоСвойства;
+КонецПроцедуры"#,
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(unresolved.len(), 1, "expected one miss, got: {unresolved:?}");
+            assert!(
+                unresolved[0].message.contains("НетТакогоСвойства"),
+                "message must name the missing field, got: {}",
+                unresolved[0].message
+            );
+            assert!(
+                unresolved[0].message.contains("ЧтениеXML"),
+                "message must name the receiver type, got: {}",
+                unresolved[0].message
+            );
+        } else {
+            assert!(
+                unresolved.is_empty(),
+                "an unknown platform version keeps the miss silent: {unresolved:?}"
+            );
+        }
+    }
+
+    /// THE CONTROL: a property the xml reader really has is no miss.
+    #[test]
+    fn a_real_property_of_a_xml_reader_stays_silent() {
+        let unresolved = unresolved_fields(
+            r#"Процедура Тест()
+    О = Новый ЧтениеXML;
+    Р = О.ИгнорироватьПробелы;
+КонецПроцедуры"#,
+        );
+        assert!(unresolved.is_empty(), "a property the platform has is no miss: {unresolved:?}");
+    }
+
+    /// A xml writer is attested for its properties, so a property it does not have is reported.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_a_xml_writer_property_is_reported() {
+        let unresolved = unresolved_fields(
+            r#"Процедура Тест()
+    О = Новый ЗаписьXML;
+    Нет = О.НетТакогоСвойства;
+КонецПроцедуры"#,
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(unresolved.len(), 1, "expected one miss, got: {unresolved:?}");
+            assert!(
+                unresolved[0].message.contains("НетТакогоСвойства"),
+                "message must name the missing field, got: {}",
+                unresolved[0].message
+            );
+            assert!(
+                unresolved[0].message.contains("ЗаписьXML"),
+                "message must name the receiver type, got: {}",
+                unresolved[0].message
+            );
+        } else {
+            assert!(
+                unresolved.is_empty(),
+                "an unknown platform version keeps the miss silent: {unresolved:?}"
+            );
+        }
+    }
+
+    /// THE CONTROL: a property the xml writer really has is no miss.
+    #[test]
+    fn a_real_property_of_a_xml_writer_stays_silent() {
+        let unresolved = unresolved_fields(
+            r#"Процедура Тест()
+    О = Новый ЗаписьXML;
+    Р = О.Отступ;
+КонецПроцедуры"#,
+        );
+        assert!(unresolved.is_empty(), "a property the platform has is no miss: {unresolved:?}");
+    }
+
+    /// A picture is attested for its properties, so a property it does not have is reported.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_a_picture_property_is_reported() {
+        let unresolved = unresolved_fields(
+            r#"Процедура Тест()
+    О = Новый Картинка;
+    Нет = О.НетТакогоСвойства;
+КонецПроцедуры"#,
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(unresolved.len(), 1, "expected one miss, got: {unresolved:?}");
+            assert!(
+                unresolved[0].message.contains("НетТакогоСвойства"),
+                "message must name the missing field, got: {}",
+                unresolved[0].message
+            );
+            assert!(
+                unresolved[0].message.contains("Картинка"),
+                "message must name the receiver type, got: {}",
+                unresolved[0].message
+            );
+        } else {
+            assert!(
+                unresolved.is_empty(),
+                "an unknown platform version keeps the miss silent: {unresolved:?}"
+            );
+        }
+    }
+
+    /// THE CONTROL: a property the picture really has is no miss.
+    #[test]
+    fn a_real_property_of_a_picture_stays_silent() {
+        let unresolved = unresolved_fields(
+            r#"Процедура Тест()
+    О = Новый Картинка;
+    Р = О.Вид;
+КонецПроцедуры"#,
+        );
+        assert!(unresolved.is_empty(), "a property the platform has is no miss: {unresolved:?}");
+    }
+
+    /// A period settings is attested for its properties, so a property it does not have is reported.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_a_period_settings_property_is_reported() {
+        let unresolved = unresolved_fields(
+            r#"Процедура Тест()
+    О = Новый НастройкаПериода;
+    Нет = О.НетТакогоСвойства;
+КонецПроцедуры"#,
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(unresolved.len(), 1, "expected one miss, got: {unresolved:?}");
+            assert!(
+                unresolved[0].message.contains("НетТакогоСвойства"),
+                "message must name the missing field, got: {}",
+                unresolved[0].message
+            );
+            assert!(
+                unresolved[0].message.contains("НастройкаПериода"),
+                "message must name the receiver type, got: {}",
+                unresolved[0].message
+            );
+        } else {
+            assert!(
+                unresolved.is_empty(),
+                "an unknown platform version keeps the miss silent: {unresolved:?}"
+            );
+        }
+    }
+
+    /// THE CONTROL: a property the period settings really has is no miss.
+    #[test]
+    fn a_real_property_of_a_period_settings_stays_silent() {
+        let unresolved = unresolved_fields(
+            r#"Процедура Тест()
+    О = Новый НастройкаПериода;
+    Р = О.ВариантНачала;
+КонецПроцедуры"#,
+        );
+        assert!(unresolved.is_empty(), "a property the platform has is no miss: {unresolved:?}");
+    }
+
+    /// A system info is attested for its properties, so a property it does not have is reported.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_a_system_info_property_is_reported() {
+        let unresolved = unresolved_fields(
+            r#"Процедура Тест()
+    О = Новый СистемнаяИнформация;
+    Нет = О.НетТакогоСвойства;
+КонецПроцедуры"#,
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(unresolved.len(), 1, "expected one miss, got: {unresolved:?}");
+            assert!(
+                unresolved[0].message.contains("НетТакогоСвойства"),
+                "message must name the missing field, got: {}",
+                unresolved[0].message
+            );
+            assert!(
+                unresolved[0].message.contains("СистемнаяИнформация"),
+                "message must name the receiver type, got: {}",
+                unresolved[0].message
+            );
+        } else {
+            assert!(
+                unresolved.is_empty(),
+                "an unknown platform version keeps the miss silent: {unresolved:?}"
+            );
+        }
+    }
+
+    /// THE CONTROL: a property the system info really has is no miss.
+    #[test]
+    fn a_real_property_of_a_system_info_stays_silent() {
+        let unresolved = unresolved_fields(
+            r#"Процедура Тест()
+    О = Новый СистемнаяИнформация;
+    Р = О.ВерсияПриложения;
+КонецПроцедуры"#,
+        );
+        assert!(unresolved.is_empty(), "a property the platform has is no miss: {unresolved:?}");
+    }
+
+    /// A standard period is attested for its properties, so a property it does not have is reported.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_a_standard_period_property_is_reported() {
+        let unresolved = unresolved_fields(
+            r#"Процедура Тест()
+    О = Новый СтандартныйПериод;
+    Нет = О.НетТакогоСвойства;
+КонецПроцедуры"#,
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(unresolved.len(), 1, "expected one miss, got: {unresolved:?}");
+            assert!(
+                unresolved[0].message.contains("НетТакогоСвойства"),
+                "message must name the missing field, got: {}",
+                unresolved[0].message
+            );
+            assert!(
+                unresolved[0].message.contains("СтандартныйПериод"),
+                "message must name the receiver type, got: {}",
+                unresolved[0].message
+            );
+        } else {
+            assert!(
+                unresolved.is_empty(),
+                "an unknown platform version keeps the miss silent: {unresolved:?}"
+            );
+        }
+    }
+
+    /// THE CONTROL: a property the standard period really has is no miss.
+    #[test]
+    fn a_real_property_of_a_standard_period_stays_silent() {
+        let unresolved = unresolved_fields(
+            r#"Процедура Тест()
+    О = Новый СтандартныйПериод;
+    Р = О.ДатаНачала;
+КонецПроцедуры"#,
+        );
+        assert!(unresolved.is_empty(), "a property the platform has is no miss: {unresolved:?}");
+    }
+
+    /// THE CONTROL for the methods-only attestation: the binary data property surface is deliberately unattested, so a property read stays silent.
+    #[test]
+    fn a_property_read_on_a_binary_data_stays_silent_because_only_methods_are_attested() {
+        let unresolved = unresolved_fields(
+            r#"Процедура Тест()
+    О = Новый ДвоичныеДанные("C:\\файл.bin");
+    Р = О.НетТакогоСвойства;
+КонецПроцедуры"#,
+        );
+        assert!(
+            unresolved.is_empty(),
+            "a receiver not attested for properties stays open: {unresolved:?}"
+        );
+    }
+
+    /// THE CONTROL for the methods-only attestation: the fixed map property surface is deliberately unattested, so a property read stays silent.
+    #[test]
+    fn a_property_read_on_a_fixed_map_stays_silent_because_only_methods_are_attested() {
+        let unresolved = unresolved_fields(
+            r#"Процедура Тест()
+    О = Новый ФиксированноеСоответствие(Новый Соответствие);
+    Р = О.НетТакогоСвойства;
+КонецПроцедуры"#,
+        );
+        assert!(
+            unresolved.is_empty(),
+            "a receiver not attested for properties stays open: {unresolved:?}"
+        );
+    }
+
+    /// THE CONTROL for the methods-only attestation: the composition template composer property surface is deliberately unattested, so a property read stays silent.
+    #[test]
+    fn a_property_read_on_a_composition_template_composer_stays_silent_because_only_methods_are_attested(
+    ) {
+        let unresolved = unresolved_fields(
+            r#"Процедура Тест()
+    О = Новый КомпоновщикМакетаКомпоновкиДанных;
+    Р = О.НетТакогоСвойства;
+КонецПроцедуры"#,
+        );
+        assert!(
+            unresolved.is_empty(),
+            "a receiver not attested for properties stays open: {unresolved:?}"
+        );
+    }
+
+    /// THE CONTROL for the methods-only attestation: the composition processor property surface is deliberately unattested, so a property read stays silent.
+    #[test]
+    fn a_property_read_on_a_composition_processor_stays_silent_because_only_methods_are_attested() {
+        let unresolved = unresolved_fields(
+            r#"Процедура Тест()
+    О = Новый ПроцессорКомпоновкиДанных;
+    Р = О.НетТакогоСвойства;
+КонецПроцедуры"#,
+        );
+        assert!(
+            unresolved.is_empty(),
+            "a receiver not attested for properties stays open: {unresolved:?}"
+        );
+    }
+
+    /// THE CONTROL for the methods-only attestation: the composition settings composer property surface is deliberately unattested, so a property read stays silent.
+    #[test]
+    fn a_property_read_on_a_composition_settings_composer_stays_silent_because_only_methods_are_attested(
+    ) {
+        let unresolved = unresolved_fields(
+            r#"Процедура Тест()
+    О = Новый КомпоновщикНастроекКомпоновкиДанных;
+    Р = О.НетТакогоСвойства;
+КонецПроцедуры"#,
+        );
+        assert!(
+            unresolved.is_empty(),
+            "a receiver not attested for properties stays open: {unresolved:?}"
+        );
     }
 
     /// A choice parameter is attested for its properties, so a property it does not have is reported.
@@ -1449,7 +1861,10 @@ mod tests {
     Р = О.НетТакогоПоля;
 КонецПроцедуры"#,
         );
-        assert!(unresolved.is_empty(), "a receiver not attested for properties stays open: {unresolved:?}");
+        assert!(
+            unresolved.is_empty(),
+            "a receiver not attested for properties stays open: {unresolved:?}"
+        );
     }
 
     /// THE CONTROL for the methods-only attestation: the fixed array property surface is deliberately unattested, so a property read stays silent.
@@ -1461,7 +1876,10 @@ mod tests {
     Р = О.НетТакогоПоля;
 КонецПроцедуры"#,
         );
-        assert!(unresolved.is_empty(), "a receiver not attested for properties stays open: {unresolved:?}");
+        assert!(
+            unresolved.is_empty(),
+            "a receiver not attested for properties stays open: {unresolved:?}"
+        );
     }
 
     /// THE CONTROL for the methods-only attestation: the fixed structure property surface is deliberately unattested, so a property read stays silent.
@@ -1473,7 +1891,10 @@ mod tests {
     Р = О.Код;
 КонецПроцедуры"#,
         );
-        assert!(unresolved.is_empty(), "a receiver not attested for properties stays open: {unresolved:?}");
+        assert!(
+            unresolved.is_empty(),
+            "a receiver not attested for properties stays open: {unresolved:?}"
+        );
     }
 
     /// The other half of the contract, on the profile that exercises it: with a corpus
@@ -1633,13 +2054,13 @@ mod tests {
 
     /// The gate: without an attestation the extract is not known to list every member,
     /// so the very same kind of miss proves nothing and stays silent. The receiver here
-    /// is the XML writer, whose surface is deliberately not attested —
+    /// is the JSON reader, whose surface is deliberately not attested -
     /// and reading a member that does exist is silent on the attested type, so the
     /// check does not fire on ordinary code either.
     #[test]
     fn a_miss_without_an_attestation_and_known_members_stay_silent() {
         let unattested = r#"Процедура Тест()
-    Запись = Новый ЗаписьXML;
+    Запись = Новый ЧтениеJSON;
     Нет = Запись.НетТакогоПоля;
 КонецПроцедуры"#;
         assert!(
