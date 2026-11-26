@@ -266,9 +266,7 @@ pub fn file_diagnostics_result_query<'db>(
         "file diagnostics query complete",
     );
 
-    let completeness = crate::result::notify_projection_completeness(&config, || {
-        hir::semantic_module_call_summary_query(db, file_id_input).notify_projection_incomplete
-    });
+    let completeness = crate::diagnostics_completeness(db, file_id, &config);
 
     Arc::new(DiagnosticsResult { diagnostics, completeness })
 }

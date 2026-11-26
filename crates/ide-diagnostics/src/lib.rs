@@ -214,16 +214,16 @@ pub fn diagnostics_completeness(
     config: &DiagnosticsConfig,
 ) -> DiagnosticsCompleteness {
     crate::result::notify_projection_completeness(config, || {
-        if let Some(eid) = ide_db::effective_target(db, file_id) {
-            return hir::semantic_module_call_summary_effective_query(db, eid)
-                .notify_projection_incomplete;
-        }
-        if let Some(wid) = ide_db::weaving_target(db, file_id) {
-            return hir::semantic_module_call_summary_weaving_query(db, wid)
-                .notify_projection_incomplete;
-        }
         let input = base_db::FileIdInput::new(db, file_id);
-        hir::semantic_module_call_summary_query(db, input).notify_projection_incomplete
+        let standalone_incomplete =
+            hir::semantic_module_call_summary_query(db, input).notify_projection_incomplete;
+        let effective_incomplete = ide_db::effective_target(db, file_id).is_some_and(|eid| {
+            hir::semantic_module_call_summary_effective_query(db, eid).notify_projection_incomplete
+        });
+        let weaving_incomplete = ide_db::weaving_target(db, file_id).is_some_and(|wid| {
+            hir::semantic_module_call_summary_weaving_query(db, wid).notify_projection_incomplete
+        });
+        standalone_incomplete || effective_incomplete || weaving_incomplete
     })
 }
 
