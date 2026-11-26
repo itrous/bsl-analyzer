@@ -630,7 +630,11 @@ pub fn resolved_module_summary_query<'db>(
     let global_modules = resolver.global_common_module_names(db);
     edges.extend(resolve_callback_edges(&summary, find_local, find_qualified, &global_modules));
 
-    Arc::new(crate::call_graph::ResolvedModuleSummary { module: module_id, edges })
+    Arc::new(crate::call_graph::ResolvedModuleSummary {
+        module: module_id,
+        edges,
+        notify_projection_incomplete: summary.notify_projection_incomplete,
+    })
 }
 
 /// Outcome of resolving a callback handler named by a string literal to a method in a
@@ -1115,6 +1119,10 @@ pub struct MethodOutboundFacts {
     /// Client/server dispatch, by the same rule the fold seeds (module execution
     /// context wins, else the method's own annotation).
     pub dispatch: MethodDispatch,
+    /// The module's semantic notify projection stopped at its work budget. The
+    /// notify edges are withheld from `callees`, so an empty or short list is not
+    /// evidence that the method calls nothing.
+    pub notify_projection_incomplete: bool,
     /// Resolved user-method calls.
     pub callees: Vec<crate::MethodId>,
     /// Metadata objects touched through a manager.
@@ -1213,7 +1221,14 @@ pub fn method_outbound_facts(
         seen_attr_reads.insert((*ty, object.fold_lower(), attr.fold_lower()))
     });
 
-    MethodOutboundFacts { dispatch, callees, manager_refs, query_reads, query_attr_reads }
+    MethodOutboundFacts {
+        dispatch,
+        notify_projection_incomplete: summary.notify_projection_incomplete,
+        callees,
+        manager_refs,
+        query_reads,
+        query_attr_reads,
+    }
 }
 
 #[salsa::tracked(

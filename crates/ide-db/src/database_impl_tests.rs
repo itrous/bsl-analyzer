@@ -4233,6 +4233,10 @@ fn truncated_notify_projection_publishes_no_notify_ref_edges() {
         "control: this fixture completes its notify projection"
     );
     let complete_resolved = db.resolved_module_summary(module);
+    assert!(
+        !complete_resolved.notify_projection_incomplete,
+        "control: the complete resolved summary carries no incomplete status"
+    );
     let baseline = notify_refs(&complete_resolved);
     assert!(
         baseline.iter().all(|edge| edge.provenance == EdgeProvenance::StringResolved
@@ -4248,6 +4252,10 @@ fn truncated_notify_projection_publishes_no_notify_ref_edges() {
 
     let index = GraphIndex::build(&db, &[module, ModuleId::new(target)]);
     let projected = resolve_summary_via_index(&db, module, &truncated.summary, &index);
+    assert!(
+        projected.notify_projection_incomplete,
+        "the resolved summary must carry the stopped notify projection"
+    );
     assert!(
         notify_refs(&projected).is_empty(),
         "a truncated projection must not publish notify_ref edges: {projected:#?}"
@@ -9770,6 +9778,49 @@ fn dataflow_writes_i14_body_flow_identity() {
     assert_eq!(db.salsa_family_churn("method_cfg_query").unwrap().0, 1, "only the edited body");
     assert_eq!(db.salsa_family_churn("method_body_events_query").unwrap().0, 1);
     effective_body_has_its_own_flow();
+}
+
+/// A budget stop says what one reader could afford, not what the body is: a later
+/// reader with room solves the same flow, and a warmed flow answers without
+/// charging its reader at all.
+#[test]
+fn executable_reaching_defs_budget_stop_is_not_cached() {
+    let mut db = RootDatabaseImpl::new();
+    let file_id = FileId(0);
+    let mut file_set = FileSet::new();
+    file_set.insert(file_id, VfsPath::new("/Module.bsl"));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    db.set_file_source_root(file_id, SourceRootId(0));
+    db.set_file_text(
+        file_id,
+        "Процедура Т(Знач Флаг)\n\tЕсли Флаг Тогда\n\t\tА = 1;\n\tКонецЕсли;\n\tБ = А;\nКонецПроцедуры\n",
+    );
+    let module_id = ModuleId::new(file_id);
+    let method_id = db.symbol_tree(module_id).find_method(&hir::Name::new("Т")).expect("method").id;
+    let input = hir::MethodIdInput::new(&db, method_id);
+    let flow = hir::BodyFlow::for_method(&db, input, db.method_body_ref(input));
+
+    let mut spent = 0usize;
+    let stopped = flow.executable_reaching_defs_with_work(&db, &mut |work| {
+        if spent + work > 1 {
+            return false;
+        }
+        spent += work;
+        true
+    });
+    assert!(stopped.is_none(), "the first reader's budget stops the solve");
+
+    let solved = flow
+        .executable_reaching_defs_with_work(&db, &mut |_| true)
+        .expect("a later reader with room solves the same flow");
+
+    let mut cache_work = 0usize;
+    let cached = flow.executable_reaching_defs_with_work(&db, &mut |work| {
+        cache_work += work;
+        true
+    });
+    assert!(Arc::ptr_eq(&cached.expect("the warmed flow answers"), &solved));
+    assert_eq!(cache_work, 0, "a warmed flow must not charge its reader");
 }
 
 /// The `&ИзменениеИКонтроль` splice of a method has ids of its own, so its

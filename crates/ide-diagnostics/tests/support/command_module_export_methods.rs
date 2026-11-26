@@ -42,6 +42,28 @@ const DYNAMIC_ALIAS_CHAIN_SOURCE: &str = r#"&НаКлиенте
 КонецПроцедуры
 "#;
 
+const BARE_RECEIVER_SOURCE: &str = r#"&НаКлиенте
+Процедура Зарегистрировать()
+    Получатель = ЭтотОбъект;
+    Оповещение = Новый ОписаниеОповещения("ПослеКоманды", Получатель);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура ПослеКоманды(ФиксированныйПараметр) Экспорт
+    Сообщить("обработчик");
+КонецПроцедуры
+
+Процедура ОбычныйЭкспорт() Экспорт
+КонецПроцедуры
+
+Процедура ОбычныйСПараметром(ОбычныйПараметр)
+    Сообщить("обычный");
+КонецПроцедуры
+
+Процедура ОбычныйБезВызовов()
+КонецПроцедуры
+"#;
+
 const DYNAMIC_SOURCE: &str = r#"&НаКлиенте
 Процедура Зарегистрировать()
     Параметры = Новый Массив;
@@ -98,6 +120,24 @@ pub fn command_module_callback_guard_diagnostics() -> (Vec<Diagnostic>, String) 
 )]
 pub fn command_module_dynamic_callback_guard_diagnostics() -> (Vec<Diagnostic>, String) {
     command_module_diagnostics(DYNAMIC_SOURCE, callback_guard_diagnostics)
+}
+
+#[allow(
+    dead_code,
+    reason = "The shared test module is imported by platform-facts integration suites."
+)]
+pub fn command_module_bare_receiver_callback_guard_diagnostics() -> (Vec<Diagnostic>, String) {
+    command_module_diagnostics(BARE_RECEIVER_SOURCE, |ctx| {
+        let candidates = ctx.notify_candidates();
+        assert!(
+            candidates.iter().any(|candidate| {
+                candidate.callback_name.eq_ignore_case(&hir::Name::new("ПослеКоманды"))
+                    && candidate.receiver == hir::NotifyCandidateReceiver::LocalBinding
+            }),
+            "a bare receiver bound to the current object must keep its local binding: {candidates:#?}"
+        );
+        callback_guard_diagnostics(ctx)
+    })
 }
 
 #[allow(

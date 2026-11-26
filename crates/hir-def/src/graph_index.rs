@@ -572,7 +572,11 @@ pub fn resolve_summary_via_index(
         &global_modules,
     ));
 
-    ResolvedModuleSummary { module, edges }
+    ResolvedModuleSummary {
+        module,
+        edges,
+        notify_projection_incomplete: summary.notify_projection_incomplete,
+    }
 }
 
 /// Projects a batch's resolved semantic calls to deterministic method-only pairs.
@@ -773,6 +777,7 @@ mod method_only_call_pair_tests {
                     ResolvedTarget::Unresolved(CallTarget::Unresolved),
                 ),
             ],
+            notify_projection_incomplete: false,
         };
 
         // When: the resolved summary is projected to hierarchy pairs.

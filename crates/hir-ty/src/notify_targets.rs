@@ -28,7 +28,9 @@ use crate::infer::{
     infer_effective_owner, infer_owner, infer_weaving_owner, BareNameOrigin, CallArgBinding,
     InferOwnerResult,
 };
-use crate::notify_array::{callback_arguments_for_binding_with_budget, NotifyArrayRegistration};
+use crate::notify_array::{
+    callback_arguments_for_binding_with_budget, CallbackArguments, NotifyArrayRegistration,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotifyCandidateKind {
@@ -101,10 +103,7 @@ impl NotifyCandidate {
         if self.analysis_incomplete {
             return NotifySignatureProtection::Indeterminate;
         }
-        let syntax_may_be_local = matches!(
-            self.receiver_syntax,
-            NotifyReceiverSyntax::SelfName | NotifyReceiverSyntax::Other
-        );
+        let syntax_may_be_local = self.receiver_syntax.may_name_local_callback();
         let resolved_this_object = matches!(self.receiver, NotifyCandidateReceiver::ThisObject);
         // A dynamic array's contents may name a local handler, and a resolved bare
         // receiver may still be `ЭтотОбъект`. Neither uncertainty may become a proven-
@@ -623,6 +622,10 @@ fn semantic_notify_facts_with_budget<'db>(
     let bodies = &*projection.bodies;
     let platform = PlatformDataInner::instance();
     let use_syntax_fallback = !bsl_platform::has_callback_description_constructor_facts(platform);
+    // A served snapshot that lacks constructor facts still describes the callback
+    // constructor through the bundled compatibility slots. A missing snapshot
+    // (`platform_help = none`) has no such source and keeps its syntax-only route.
+    let partial_callback_facts = use_syntax_fallback && platform.help_origin().is_some();
     let mut bodies_by_caller: FxHashMap<CallerId, &Body> = FxHashMap::default();
     let mut candidates_by_caller: FxHashMap<CallerId, Vec<usize>> = FxHashMap::default();
     let mut owner_order = Vec::new();
@@ -701,6 +704,7 @@ fn semantic_notify_facts_with_budget<'db>(
             &indices,
             &candidates,
             platform,
+            partial_callback_facts,
             current_common_module.as_ref(),
             &mut conditional_envs,
             &mut summary.notify_regs,
@@ -984,10 +988,7 @@ fn syntax_only_static_candidates(
                     Expr::Path(name) => NotifyReceiverSyntax::for_bare_name(name),
                     _ => NotifyReceiverSyntax::Other,
                 });
-            if !matches!(
-                receiver_syntax,
-                NotifyReceiverSyntax::SelfName | NotifyReceiverSyntax::Other
-            ) {
+            if !receiver_syntax.may_name_local_callback() {
                 continue;
             }
             result.push(NotifyCandidate {
@@ -1154,6 +1155,7 @@ fn normalize_owner_candidates(
     candidate_indices: &[usize],
     candidates: &[NotifyConstructorCandidate],
     platform: &PlatformDataInner,
+    partial_callback_facts: bool,
     current_common_module: Option<&Name>,
     conditional_envs: &mut ConditionalEnvIndex<'_>,
     registrations: &mut Vec<NotifyReg>,
@@ -1181,7 +1183,6 @@ fn normalize_owner_candidates(
         return;
     }
     let owner_possible_env = owner_possible_in_any_build(db, projection.file_id, owner);
-    let reaching_defs = flow.executable_reaching_defs(db);
     let mut has_dynamic_array_candidate = false;
     for &index in candidate_indices {
         if !budget.spend() {
@@ -1200,6 +1201,14 @@ fn normalize_owner_candidates(
         }
     }
     let array_registrations = if has_dynamic_array_candidate {
+        // Only a dynamic array needs the possible writes of its constructor point.
+        // The executable solve is both expensive and unmemoised, so a static-only
+        // owner never pays for it; when it runs, its index and visits spend from
+        // this projection's budget and reach its cancellation callback.
+        let reaching_defs = {
+            let mut spend = |work: usize| budget.spend_by(work);
+            flow.executable_reaching_defs_with_work(db, &mut spend)
+        };
         crate::notify_array::collect_notify_array_registrations_with_budget(
             db,
             body,
@@ -1263,7 +1272,10 @@ fn normalize_owner_candidates(
         if site_reachable {
             reachable_dynamic_constructors.insert((candidate.caller, candidate.constructor));
         }
-        if !platform.is_notify_description_type_name(platform_type_name) {
+        if !platform.is_notify_description_type_name(platform_type_name)
+            && !(partial_callback_facts
+                && bsl_platform::is_callback_description_type_name(platform_type_name))
+        {
             continue;
         }
         let not_compiled = constructor_is_not_compiled(
@@ -1318,14 +1330,24 @@ fn normalize_owner_candidates(
             continue;
         }
 
-        let Some(binding) = bindings_by_call.get(&candidate.constructor).copied() else {
-            continue;
+        let binding = bindings_by_call.get(&candidate.constructor).copied();
+        let arguments = match binding {
+            Some(binding) => callback_arguments_for_binding_with_budget(binding, budget)
+                .or_else(|| partial_callback_facts.then(bundled_callback_arguments)),
+            None if partial_callback_facts => Some(bundled_callback_arguments()),
+            None => None,
         };
-        let Some(arguments) = callback_arguments_for_binding_with_budget(binding, budget) else {
+        let Some(arguments) = arguments else {
             if budget.exhausted() {
                 return;
             }
             continue;
+        };
+        let argument_expr = |index: usize| -> Option<ExprId> {
+            match binding {
+                Some(binding) => binding.args.get(index).copied(),
+                None => args.get(index).map(|&idx| ExprId::from_idx(idx)),
+            }
         };
         let mut candidate_regs = Vec::with_capacity(2);
         for (handler_argument, receiver_argument, slot) in [
@@ -1335,12 +1357,11 @@ fn normalize_owner_candidates(
             if !budget.spend() {
                 return;
             }
-            let Some(&callback_expr) = handler_argument.and_then(|index| binding.args.get(index))
-            else {
+            let Some(callback_expr) = handler_argument.and_then(argument_expr) else {
                 continue;
             };
             let Some(callback_name) = string_literal_id(body, callback_expr) else { continue };
-            let receiver = receiver_argument.and_then(|index| binding.args.get(index)).copied();
+            let receiver = receiver_argument.and_then(argument_expr);
             let receiver_syntax = receiver_syntax(body, receiver);
             let registration = build_notify_registration(
                 db,
@@ -1496,6 +1517,20 @@ fn receiver_syntax(body: &Body, receiver: Option<ExprId>) -> NotifyReceiverSynta
     match receiver.map(|expr| body.expr(expr)) {
         Some(Expr::Path(name)) => NotifyReceiverSyntax::for_bare_name(name),
         _ => NotifyReceiverSyntax::Other,
+    }
+}
+
+/// The bundled compatibility projection of callback argument positions. A served
+/// snapshot without constructor facts cannot project them from its own schema; the
+/// bundled slots describe the same constructor, and only the receiver's runtime
+/// identity still needs inference.
+fn bundled_callback_arguments() -> CallbackArguments {
+    let slots = bsl_platform::bundled_callback_description_slots();
+    CallbackArguments {
+        handler: Some(slots.handler),
+        receiver: Some(slots.receiver),
+        error_handler: Some(slots.error_handler),
+        error_receiver: Some(slots.error_receiver),
     }
 }
 

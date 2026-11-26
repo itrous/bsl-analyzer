@@ -81,8 +81,12 @@ pub(super) fn attach_fixes(ctx: &DiagnosticsContext, diagnostics: &mut [Diagnost
     let root = ctx.parse().syntax_node();
     let sibling_roots = ctx.sibling_body_roots();
     let runs_dynamic_code = runs_dynamic_code(&root) || sibling_roots.iter().any(runs_dynamic_code);
+    let module_id = hir::ModuleId::new(ctx.file_id);
     let binds_computed_callback =
-        binds_computed_callback(&root) || sibling_roots.iter().any(binds_computed_callback);
+        ctx.call_summary(module_id).binds_computed_callback
+            || ctx.module_index().sibling_bodies(ctx.file_id).into_iter().any(|file_id| {
+                ctx.call_summary(hir::ModuleId::new(file_id)).binds_computed_callback
+            });
     let mut string_literals = string_literal_texts(&root);
     for sibling in &sibling_roots {
         string_literals.extend(string_literal_texts(sibling));
@@ -284,97 +288,6 @@ fn runs_dynamic_code(root: &SyntaxNode) -> bool {
         }),
         _ => false,
     })
-}
-
-/// `Новый ОписаниеОповещения(Имя, …)` (or `Новый("ОписаниеОповещения", Имя, …)`) or
-/// `Элемент.УстановитьДействие("Событие", Имя)` whose handler name is not one string
-/// literal: the platform calls whatever method the value names, with the arguments the
-/// platform passes.
-fn binds_computed_callback(root: &SyntaxNode) -> bool {
-    root.descendants().any(|node| match node.kind() {
-        SyntaxKind::NEW_EXPR => notify_description_with_computed_name(&node),
-        SyntaxKind::CALL_EXPR => set_action_with_computed_name(&node),
-        _ => false,
-    })
-}
-
-fn set_action_with_computed_name(call: &SyntaxNode) -> bool {
-    let is_set_action = call
-        .first_child()
-        .and_then(|callee| syntax::ast_utils::field_tail_name_token(&callee))
-        .is_some_and(|name| {
-            matches!(name.text().fold_lower().as_str(), "установитьдействие" | "setaction")
-        });
-    if !is_set_action {
-        return false;
-    }
-    let Some(args) = call.children().find(|node| node.kind() == SyntaxKind::ARG_LIST) else {
-        return false;
-    };
-    match list_slots(&args) {
-        Some(slots) => slots
-            .get(1)
-            .is_some_and(|slot| !slot.items.is_empty() && string_literal(slot).is_none()),
-        None => true,
-    }
-}
-
-fn notify_description_with_computed_name(new_expr: &SyntaxNode) -> bool {
-    let Some(args) = new_expr.children().find(|node| node.kind() == SyntaxKind::ARG_LIST) else {
-        return false;
-    };
-    let slots = list_slots(&args);
-    let base = match syntax::ast_utils::new_expr_type_name_token(new_expr) {
-        Some(type_name) if bsl_platform::is_callback_description_type_name(type_name.text()) => 0,
-        Some(_) => return false,
-        None => match slots.as_ref().and_then(|slots| slots.first()) {
-            Some(first)
-                if string_literal(first)
-                    .is_some_and(|name| bsl_platform::is_callback_description_type_name(&name)) =>
-            {
-                1
-            }
-            _ => return false,
-        },
-    };
-    let Some(slots) = slots else {
-        return true;
-    };
-    let callback_slots = bsl_platform::bundled_callback_description_slots();
-    [callback_slots.handler, callback_slots.error_handler]
-        .into_iter()
-        .filter_map(|index| slots.get(base + index))
-        .any(|slot| !slot.items.is_empty() && string_literal(slot).is_none())
-}
-
-/// The text of a position holding exactly one single-line string literal, unquoted.
-fn string_literal(slot: &Slot) -> Option<String> {
-    let [SyntaxElement::Node(node)] = slot.items.as_slice() else {
-        return None;
-    };
-    let mut node = node.clone();
-    while matches!(node.kind(), SyntaxKind::EXPR | SyntaxKind::PAREN_EXPR) {
-        let mut children = node.children();
-        let (Some(inner), None) = (children.next(), children.next()) else {
-            return None;
-        };
-        node = inner;
-    }
-    if node.kind() != SyntaxKind::LITERAL {
-        return None;
-    }
-    let mut tokens = node
-        .descendants_with_tokens()
-        .filter_map(|element| element.into_token())
-        .filter(|token| !is_trivia(token.kind()));
-    let (Some(token), None) = (tokens.next(), tokens.next()) else {
-        return None;
-    };
-    if token.kind() != SyntaxKind::STRING {
-        return None;
-    }
-    let text = token.text();
-    text.strip_prefix('"').and_then(|text| text.strip_suffix('"')).map(str::to_string)
 }
 
 /// An argument whose evaluation does nothing but produce its value: a literal, a bare

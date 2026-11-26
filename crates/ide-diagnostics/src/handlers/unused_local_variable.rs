@@ -687,18 +687,25 @@ mod tests {
         );
     }
 
-    /// An assignment with no target-ownership verdict is not enough to prove a
-    /// local, even when it appears in inserted extension code.
+    /// Код `#Вставка` принадлежит effective-проходу, и мёртвая запись внутри него
+    /// обязана дожить до конца конвейера: вердикт о цели присваивания приходит из
+    /// inference того же spliced-тела, а не из отдельного файла расширения.
     #[test]
-    fn an_unresolved_target_inside_a_change_and_validate_insert_is_not_a_local() {
+    fn a_dead_store_inside_a_change_and_validate_insert_survives() {
         let diags = extension_pair_diagnostics(
             "Процедура Цель() Экспорт\nКонецПроцедуры\n",
             "&ИзменениеИКонтроль(\"Цель\")\nПроцедура Цель()\n#Вставка\n\tМертвая = 1;\n#КонецВставки\nКонецПроцедуры\n",
         );
+        let unused: Vec<_> =
+            diags.iter().filter(|d| d.code == DiagnosticCode::UnusedLocalVariable).collect();
         assert_eq!(
-            diags.iter().filter(|d| d.code == DiagnosticCode::UnusedLocalVariable).count(),
-            0,
-            "the missing target verdict does not establish local ownership:\n{diags:#?}"
+            unused.len(),
+            1,
+            "the insert's own dead store belongs to the extension author:\n{diags:#?}"
+        );
+        assert!(
+            unused[0].message.contains("Мертвая"),
+            "the finding is the inserted store, not another body's:\n{unused:#?}"
         );
     }
 

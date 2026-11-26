@@ -122,7 +122,9 @@ pub(crate) fn collect_notify_array_registrations(
 /// exhaustion must treat the owner's notification facts as incomplete instead of publishing
 /// these registrations as complete. A missing reaching-definitions solution is such a stop: the
 /// solver published nothing, so the possible writes are unknown and the pass marks the budget
-/// incomplete rather than answering with the registrations it happens to keep.
+/// incomplete rather than answering with the registrations it happens to keep. A body whose
+/// lowering dropped statements is the same kind of stop: a write that could invalidate an array
+/// may be missing, so the pass marks the budget incomplete and publishes nothing.
 pub(crate) fn collect_notify_array_registrations_with_budget(
     db: &dyn TypeKernelDb,
     body: &Body,
@@ -133,6 +135,10 @@ pub(crate) fn collect_notify_array_registrations_with_budget(
     budget: &mut NotifyWorkBudget<'_>,
 ) -> Vec<NotifyArrayRegistration> {
     if body.is_lowering_incomplete() {
+        // Lowering dropped a statement, so a write that would rebind or invalidate a
+        // tracked array may be missing from the body. The registrations the lowered
+        // prefix still proves cannot stand for the whole body's projection.
+        budget.mark_incomplete();
         return Vec::new();
     }
     let Some(reaching_defs) = reaching_defs else {
@@ -1313,6 +1319,33 @@ mod tests {
         assert!(
             cancellations > 0,
             "the array pass must reach the shared cancellation check while spending"
+        );
+    }
+
+    #[test]
+    fn incomplete_lowering_marks_the_empty_projection_incomplete() {
+        // The array proof before the malformed statement is valid on its own; the body's
+        // lowering dropped the tail, so the pass cannot answer for the whole body.
+        let source = r#"Процедура Test()
+    Перем Параметры;
+    Перем Оповещение;
+    Параметры = Новый Массив;
+    Параметры.Добавить("Готово");
+    Параметры.Добавить(ЭтотОбъект);
+    Оповещение = Новый("CallbackDescription", Параметры);
+    Если Флаг Х = 1; КонецЕсли;
+КонецПроцедуры"#;
+
+        let parse = parser::parse(source);
+        let bodies = hir_def::ModuleBodies::from_parse(&parse);
+        let body = bodies.iter_bodies().next().expect("the fixture declares a method").1;
+        assert!(body.is_lowering_incomplete(), "the fixture must drop a statement");
+
+        let (registrations, exhausted) = collection_under_budget(source, 100_000, &mut || {});
+        assert!(exhausted, "the dropped tail must mark the projection incomplete");
+        assert!(
+            registrations.is_empty(),
+            "no registration may pass for the incomplete body: {registrations:#?}"
         );
     }
 

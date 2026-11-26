@@ -71,6 +71,19 @@ pub trait Lattice: Clone + PartialEq + Eq {
     fn is_more_informative_than(&self, other: &Self) -> bool {
         self == other
     }
+
+    /// Work proportional to this state's size for a clone, join or equality
+    /// comparison. The default is one unit; a lattice whose states own large
+    /// sets overrides it so a metered solve charges their real weight.
+    fn work_weight(&self) -> usize {
+        1
+    }
+}
+
+/// Spends at least one unit for a state operation, so an empty state still
+/// reaches the caller's cancellation check.
+fn spend_for_state<L: Lattice>(spend: &mut dyn FnMut(usize) -> bool, state: &L) -> bool {
+    spend(state.work_weight().max(1))
 }
 
 pub trait Transfer<L: Lattice> {
@@ -188,13 +201,25 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
     }
 
     pub fn solve(self) -> Option<DataflowResult<L>> {
+        self.solve_with_work(&mut |_| true)
+    }
+
+    /// [`DataflowSolver::solve`] that reports its work to `spend` and stops with a
+    /// non-converged result as soon as `spend` refuses more work. A block visit, each
+    /// traversed incoming or outgoing edge, and every state clone, transfer and join
+    /// spend in proportion to [`Lattice::work_weight`], so repeated visits of a block
+    /// and merges of large states are metered on every round.
+    pub fn solve_with_work(
+        self,
+        spend: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<DataflowResult<L>> {
         match self.direction {
-            Direction::Forward => self.solve_forward(),
-            Direction::Backward => self.solve_backward(),
+            Direction::Forward => self.solve_forward(spend),
+            Direction::Backward => self.solve_backward(spend),
         }
     }
 
-    fn solve_forward(mut self) -> Option<DataflowResult<L>> {
+    fn solve_forward(mut self, spend: &mut dyn FnMut(usize) -> bool) -> Option<DataflowResult<L>> {
         use std::collections::VecDeque;
 
         let entry = self.cfg.start();
@@ -214,9 +239,15 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
         let mut iterations = 0;
         let mut converged = true;
 
-        while let Some(block_idx) = worklist.pop_front() {
+        'solve: while let Some(block_idx) = worklist.pop_front() {
             worklist_set.remove(&block_idx);
             iterations += 1;
+
+            if !spend(1) {
+                tracing::debug!("Forward dataflow analysis stopped by its work budget");
+                converged = false;
+                break;
+            }
 
             if iterations > self.max_iterations {
                 tracing::warn!(
@@ -235,16 +266,31 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
             } else {
                 let mut state: Option<L> = None;
                 for (pred_idx, edge_kind) in self.cfg.incoming_edges(block_idx) {
+                    if !spend(1) {
+                        converged = false;
+                        break 'solve;
+                    }
                     if !self.crosses(pred_idx, *edge_kind) {
                         continue;
                     }
                     if let Some(pred_out) = self.block_out.get(&pred_idx) {
-                        let edge_state = self.transfer_edge_state(pred_idx, *edge_kind, pred_out);
+                        let Some(edge_state) =
+                            self.transfer_edge_state(pred_idx, *edge_kind, pred_out, spend)
+                        else {
+                            converged = false;
+                            break 'solve;
+                        };
                         match &mut state {
                             None => {
                                 state = Some(edge_state);
                             }
                             Some(s) => {
+                                if !spend_for_state(spend, s)
+                                    || !spend_for_state(spend, &edge_state)
+                                {
+                                    converged = false;
+                                    break 'solve;
+                                }
                                 s.join_in_place(&edge_state);
                             }
                         }
@@ -255,20 +301,39 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
                 })
             };
 
+            if !spend_for_state(spend, &in_state) {
+                converged = false;
+                break;
+            }
             self.block_in.insert(block_idx, in_state.clone());
 
-            let out_state = self.transfer_block(block_idx, &in_state);
+            let Some(out_state) = self.transfer_block(block_idx, &in_state, spend) else {
+                converged = false;
+                break;
+            };
 
             let changed = if let Some(old_out) = self.block_out.get(&block_idx) {
+                if !spend_for_state(spend, &out_state) || !spend_for_state(spend, old_out) {
+                    converged = false;
+                    break;
+                }
                 &out_state != old_out
             } else {
                 true
             };
 
             if changed {
+                if !spend_for_state(spend, &out_state) {
+                    converged = false;
+                    break;
+                }
                 self.block_out.insert(block_idx, out_state);
 
                 for (succ_idx, _edge) in self.cfg.outgoing_edges(block_idx) {
+                    if !spend(1) {
+                        converged = false;
+                        break 'solve;
+                    }
                     if worklist_set.insert(succ_idx) {
                         worklist.push_back(succ_idx);
                     }
@@ -286,7 +351,7 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
         })
     }
 
-    fn solve_backward(mut self) -> Option<DataflowResult<L>> {
+    fn solve_backward(mut self, spend: &mut dyn FnMut(usize) -> bool) -> Option<DataflowResult<L>> {
         use std::collections::VecDeque;
 
         let exit = self.cfg.exit();
@@ -310,10 +375,16 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
         let mut block_visit_count: rustc_hash::FxHashMap<NodeIndex, usize> =
             rustc_hash::FxHashMap::default();
 
-        while let Some(block_idx) = worklist.pop_front() {
+        'solve: while let Some(block_idx) = worklist.pop_front() {
             worklist_set.remove(&block_idx);
             iterations += 1;
             *block_visit_count.entry(block_idx).or_insert(0) += 1;
+
+            if !spend(1) {
+                tracing::debug!("Backward dataflow analysis stopped by its work budget");
+                converged = false;
+                break;
+            }
 
             if iterations > self.max_iterations {
                 let max_visits = block_visit_count.values().max().copied().unwrap_or(0);
@@ -349,16 +420,31 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
             } else {
                 let mut state: Option<L> = None;
                 for (succ_idx, edge_kind) in self.cfg.outgoing_edges(block_idx) {
+                    if !spend(1) {
+                        converged = false;
+                        break 'solve;
+                    }
                     if !self.crosses(block_idx, *edge_kind) {
                         continue;
                     }
                     if let Some(succ_in) = self.block_in.get(&succ_idx) {
-                        let edge_state = self.transfer_edge_state(block_idx, *edge_kind, succ_in);
+                        let Some(edge_state) =
+                            self.transfer_edge_state(block_idx, *edge_kind, succ_in, spend)
+                        else {
+                            converged = false;
+                            break 'solve;
+                        };
                         match &mut state {
                             None => {
                                 state = Some(edge_state);
                             }
                             Some(s) => {
+                                if !spend_for_state(spend, s)
+                                    || !spend_for_state(spend, &edge_state)
+                                {
+                                    converged = false;
+                                    break 'solve;
+                                }
                                 s.join_in_place(&edge_state);
                             }
                         }
@@ -372,20 +458,39 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
                 })
             };
 
+            if !spend_for_state(spend, &out_state) {
+                converged = false;
+                break;
+            }
             self.block_out.insert(block_idx, out_state.clone());
 
-            let in_state = self.transfer_block(block_idx, &out_state);
+            let Some(in_state) = self.transfer_block(block_idx, &out_state, spend) else {
+                converged = false;
+                break;
+            };
 
             let changed = if let Some(old_in) = self.block_in.get(&block_idx) {
+                if !spend_for_state(spend, &in_state) || !spend_for_state(spend, old_in) {
+                    converged = false;
+                    break;
+                }
                 &in_state != old_in
             } else {
                 true
             };
 
             if changed {
+                if !spend_for_state(spend, &in_state) {
+                    converged = false;
+                    break;
+                }
                 self.block_in.insert(block_idx, in_state);
 
                 for (pred_idx, _edge) in self.cfg.incoming_edges(block_idx) {
+                    if !spend(1) {
+                        converged = false;
+                        break 'solve;
+                    }
                     if worklist_set.insert(pred_idx) {
                         worklist.push_back(pred_idx);
                     }
@@ -425,92 +530,134 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
     }
 
     /// [`Transfer::transfer_edge`], plus [`Transfer::transfer_exception_edge`] on the
-    /// `Exception` edge of a `Попытка`.
-    fn transfer_edge_state(&self, source: NodeIndex, edge_kind: CfgEdgeType, state: &L) -> L {
+    /// `Exception` edge of a `Попытка`. The edge state is a clone of `state`, so its
+    /// work is charged before the clone.
+    fn transfer_edge_state(
+        &self,
+        source: NodeIndex,
+        edge_kind: CfgEdgeType,
+        state: &L,
+        spend: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<L> {
+        if !spend_for_state(spend, state) {
+            return None;
+        }
         let mut edge_state = self.transfer.transfer_edge(edge_kind, state);
         if matches!(edge_kind, CfgEdgeType::Exception)
             && matches!(self.cfg.vertex(source), Some(cfg::CfgVertex::Try))
         {
             if let Some(try_stmt) = self.cfg.source_stmt_id(source) {
+                if !spend(1) {
+                    return None;
+                }
                 self.transfer.transfer_exception_edge(try_stmt, &mut edge_state, &self.body);
             }
         }
-        edge_state
+        Some(edge_state)
     }
 
-    fn transfer_block(&self, block_idx: NodeIndex, in_state: &L) -> L {
+    fn transfer_block(
+        &self,
+        block_idx: NodeIndex,
+        in_state: &L,
+        spend: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<L> {
         use cfg::CfgVertex;
 
         let Some(vertex) = self.cfg.vertex(block_idx) else {
-            return in_state.clone();
+            return spend_for_state(spend, in_state).then(|| in_state.clone());
         };
 
+        if !spend_for_state(spend, in_state) {
+            return None;
+        }
         match vertex {
             CfgVertex::BasicBlock(block) => {
                 let mut state = in_state.clone();
                 for &stmt_id in block.statements() {
+                    if !spend_for_state(spend, &state) {
+                        return None;
+                    }
                     self.transfer.transfer_stmt_in_place(
                         stmt_id.into_raw(),
                         &mut state,
                         &self.body,
                     );
                 }
-                state
+                Some(state)
             }
 
             CfgVertex::WhileHeader(while_vertex) => {
                 let mut state = in_state.clone();
+                if !spend_for_state(spend, &state) {
+                    return None;
+                }
                 self.transfer.transfer_expr_in_place(
                     while_vertex.condition,
                     &mut state,
                     &self.body,
                 );
-                state
+                Some(state)
             }
 
             CfgVertex::Conditional(conditional_vertex) => {
                 let mut state = in_state.clone();
+                if !spend_for_state(spend, &state) {
+                    return None;
+                }
                 self.transfer.transfer_expr_in_place(
                     conditional_vertex.condition,
                     &mut state,
                     &self.body,
                 );
-                state
+                Some(state)
             }
 
             CfgVertex::LoopEntry(entry) => {
                 let mut state = in_state.clone();
                 for &root in entry.roots() {
+                    if !spend_for_state(spend, &state) {
+                        return None;
+                    }
                     self.transfer.transfer_expr_in_place(root, &mut state, &self.body);
                 }
-                state
+                Some(state)
             }
 
             CfgVertex::ForHeader(for_vertex) => {
                 let mut state = in_state.clone();
+                if !spend_for_state(spend, &state) {
+                    return None;
+                }
                 self.transfer.transfer_loop_var_bind(for_vertex.loop_var, &mut state, &self.body);
-                state
+                Some(state)
             }
 
             CfgVertex::ForEachHeader(foreach_vertex) => {
                 let mut state = in_state.clone();
+                if !spend_for_state(spend, &state) {
+                    return None;
+                }
                 self.transfer.transfer_loop_var_bind(
                     foreach_vertex.loop_var,
                     &mut state,
                     &self.body,
                 );
-                state
+                Some(state)
             }
 
             CfgVertex::Try => {
                 let mut state = in_state.clone();
                 if let Some(try_stmt) = self.cfg.source_stmt_id(block_idx) {
+                    if !spend_for_state(spend, &state) {
+                        return None;
+                    }
                     self.transfer.transfer_try_entry(try_stmt, &mut state, &self.body);
                 }
-                state
+                Some(state)
             }
 
-            _ => in_state.clone(),
+            _ => Some(in_state.clone()),
         }
     }
 }

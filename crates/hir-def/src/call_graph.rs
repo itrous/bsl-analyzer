@@ -46,6 +46,11 @@ pub struct ModuleCallSummary {
     /// evidence that registrations were only partly read. Suppressed findings behind this
     /// flag must reach consumers as incompleteness, never as a complete empty answer.
     pub notify_projection_incomplete: bool,
+    /// Some body binds a callback or a form action by a name that is not one string
+    /// literal, or did not lower completely enough to rule that out. A file-local
+    /// rewrite cannot see those call sites, so consumers that would change a
+    /// signature must stay conservative for the whole module.
+    pub binds_computed_callback: bool,
     /// Platform-validated registrations. Raw `hir-def` summaries leave this empty.
     pub notify_regs: Vec<NotifyReg>,
     pub idle_handler_regs: Vec<IdleReg>,
@@ -184,6 +189,7 @@ impl ModuleCallSummary {
             notify_dynamic_signature_handler_sites: Vec::new(),
             notify_dynamic_signature_analysis_incomplete: Vec::new(),
             notify_projection_incomplete: self.notify_projection_incomplete,
+            binds_computed_callback: false,
             notify_regs,
             idle_handler_regs,
             set_action_regs: Vec::new(),
@@ -456,6 +462,13 @@ impl NotifyReceiverSyntax {
             Self::BareName
         }
     }
+
+    /// Whether a callback beside this receiver may be a method of the current module
+    /// from its syntax alone. A bare name needs semantic resolution; this projection
+    /// therefore never guesses it into the protected or the foreign side.
+    pub fn may_name_local_callback(self) -> bool {
+        matches!(self, Self::SelfName | Self::Other)
+    }
 }
 
 /// Where a `Новый ОписаниеОповещения` callback's handler lives. `hir-ty` resolves
@@ -545,6 +558,11 @@ pub struct FormEventEntry {
 pub struct ResolvedModuleSummary {
     pub module: ModuleId,
     pub edges: Vec<ResolvedCallEdge>,
+    /// The module's semantic notify projection stopped at its work budget, so
+    /// `edges` holds no notify edges. A consumer cannot tell such a missing edge
+    /// from a complete projection that has none; it must surface
+    /// this status instead of reading the edge list as complete.
+    pub notify_projection_incomplete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -911,6 +929,7 @@ pub(crate) fn extract_call_summary_with_cancellation(
     // Set when a body's lower alias pass stopped at its work budget; the semantic
     // projection adds its own stops on top of this.
     let mut notify_projection_incomplete = false;
+    let mut binds_computed_callback = false;
 
     // Bodies come in item order, which is deterministic.
     for (local_id, lower_result) in module_bodies.iter_lower_results() {
@@ -931,6 +950,7 @@ pub(crate) fn extract_call_summary_with_cancellation(
             &mut name_literals,
             &mut name_literal_ref_sites,
             &mut notify_projection_incomplete,
+            &mut binds_computed_callback,
             cancel,
         );
     }
@@ -953,6 +973,7 @@ pub(crate) fn extract_call_summary_with_cancellation(
             &mut name_literals,
             &mut name_literal_ref_sites,
             &mut notify_projection_incomplete,
+            &mut binds_computed_callback,
             cancel,
         );
     }
@@ -994,6 +1015,7 @@ pub(crate) fn extract_call_summary_with_cancellation(
         notify_dynamic_signature_handler_sites,
         notify_dynamic_signature_analysis_incomplete,
         notify_projection_incomplete,
+        binds_computed_callback,
         notify_regs: Vec::new(),
         idle_handler_regs,
         set_action_regs,
@@ -1140,8 +1162,14 @@ fn extract_from_body(
     name_literals: &mut FxHashSet<MethodKey>,
     name_literal_ref_sites: &mut Vec<NameLiteralRefSite>,
     notify_projection_incomplete: &mut bool,
+    binds_computed_callback: &mut bool,
     cancel: &mut dyn FnMut(),
 ) {
+    // A body that did not lower completely may have an argument list this pass never
+    // saw. Its bindings cannot be read as literal-only without proving the missing part.
+    if body.is_lowering_incomplete() {
+        *binds_computed_callback = true;
+    }
     let common_bindings = crate::common_module_ref::common_module_var_bindings(body);
     let mut alias_resolver = None;
     let mut resolver_initialized = false;
@@ -1265,9 +1293,19 @@ fn extract_from_body(
                         }
                     }
                     Expr::Field { base: field_base, field } => {
-                        if is_set_action(&field.as_str().fold_lower())
-                            && is_form_element_action_receiver(body, *field_base)
-                        {
+                        let set_action = is_set_action(&field.as_str().fold_lower());
+                        if set_action {
+                            let computed = args.get(1).is_some_and(|&arg| {
+                                !matches!(
+                                    body.expr_idx(arg),
+                                    Expr::Missing | Expr::Literal(Literal::String(_))
+                                )
+                            });
+                            if computed {
+                                *binds_computed_callback = true;
+                            }
+                        }
+                        if set_action && is_form_element_action_receiver(body, *field_base) {
                             if let Some(reg) = extract_set_action_reg(body, caller, args, range) {
                                 set_action_regs.push(reg);
                             }
@@ -1301,6 +1339,7 @@ fn extract_from_body(
                     args,
                     notify_signature_handlers,
                     notify_additional_signature_handlers,
+                    binds_computed_callback,
                 );
             }
             _ => {}
@@ -1319,6 +1358,7 @@ fn extract_notify_handlers(
     args: &[ExprIdx],
     compatibility_handlers: &mut Vec<Name>,
     additional_handlers: &mut Vec<Name>,
+    binds_computed_callback: &mut bool,
 ) {
     let (type_name, slot_offset) = match type_name {
         Some(type_name) => (type_name.as_str().to_owned(), 0),
@@ -1344,7 +1384,14 @@ fn extract_notify_handlers(
         [(slots.handler, slots.receiver), (slots.error_handler, slots.error_receiver)]
     {
         let Some(&handler_idx) = args.get(handler_slot + slot_offset) else { continue };
-        let Some(handler) = extract_string_literal(body, handler_idx) else { continue };
+        let handler = match body.expr_idx(handler_idx) {
+            Expr::Literal(Literal::String(handler)) => handler,
+            Expr::Missing => continue,
+            _ => {
+                *binds_computed_callback = true;
+                continue;
+            }
+        };
         let receiver_syntax =
             args.get(receiver_slot + slot_offset).map_or(NotifyReceiverSyntax::Other, |&idx| {
                 match body.expr_idx(idx) {
@@ -1352,12 +1399,12 @@ fn extract_notify_handlers(
                     _ => NotifyReceiverSyntax::Other,
                 }
             });
-        if matches!(receiver_syntax, NotifyReceiverSyntax::SelfName | NotifyReceiverSyntax::Other) {
+        if receiver_syntax.may_name_local_callback() {
             if is_compatibility_name {
-                compatibility_handlers.push(Name::new(&handler));
+                compatibility_handlers.push(Name::new(handler));
             }
             if is_additional_name {
-                additional_handlers.push(Name::new(&handler));
+                additional_handlers.push(Name::new(handler));
             }
         }
     }
@@ -2240,7 +2287,7 @@ fn extract_dynamic_notify_handlers(
                     _ => NotifyReceiverSyntax::Other,
                 }
             });
-        if matches!(receiver_syntax, NotifyReceiverSyntax::SelfName | NotifyReceiverSyntax::Other) {
+        if receiver_syntax.may_name_local_callback() {
             push_dynamic_notify_handler(
                 &handler,
                 ExprId::from_idx(values[handler_slot]),
@@ -2983,6 +3030,7 @@ mod tests {
             notify_dynamic_signature_handler_sites: Vec::new(),
             notify_dynamic_signature_analysis_incomplete: Vec::new(),
             notify_projection_incomplete: false,
+            binds_computed_callback: false,
             notify_regs: vec![
                 NotifyReg {
                     caller: CallerId::Method(MethodKey::first("Главная")),

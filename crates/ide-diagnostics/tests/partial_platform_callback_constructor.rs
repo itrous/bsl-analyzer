@@ -94,6 +94,14 @@ fn partial_callback_facts_report_ordinary_exports_but_keep_callback_protections(
         "dynamic constructor",
     );
 
+    let (bare_diagnostics, bare_source) =
+        command_module_export_methods::command_module_bare_receiver_callback_guard_diagnostics();
+    assert_handlers_protected_and_controls_flagged(
+        &bare_source,
+        &bare_diagnostics,
+        "bare receiver bound to the current object",
+    );
+
     // This direct guard control is included to keep its support helper live in this binary.
     // The facts-present counterpart lives in command_module_export_methods_platform_facts.
     let (export_diagnostics, export_source) =

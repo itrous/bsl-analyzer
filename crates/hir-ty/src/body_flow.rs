@@ -135,17 +135,51 @@ impl BodyFlow {
         &self,
         db: &dyn HirDatabase,
     ) -> Option<Arc<ReachingDefsResult>> {
-        self.executable_reaching_defs
-            .get_or_init(|| {
-                dataflow::reaching_defs::solve_executable_reaching_definitions(
-                    self.cfg(db),
-                    &self.body,
-                    self.events(db),
-                    self.seeds_params(),
-                    dataflow::reaching_defs::RecoveredBody::Solve,
-                )
-            })
-            .clone()
+        self.executable_reaching_defs_with_work(db, &mut |_| true)
+    }
+
+    /// [`BodyFlow::executable_reaching_defs`] that charges the solve's actual work
+    /// to `spend` and stops when it refuses more. The index build, the entry state
+    /// and every block visit are covered, so a caller's work budget also bounds a
+    /// body whose dynamic-array proof would otherwise solve on its own.
+    ///
+    /// A stop caused by `spend` says how much of the body this caller could afford,
+    /// not what the body is, so it is not cached: a later reader with room solves
+    /// the same flow from scratch. A solution, or a failure of the solve's own
+    /// visit bound, is a property of the body and is kept.
+    pub fn executable_reaching_defs_with_work(
+        &self,
+        db: &dyn HirDatabase,
+        spend: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<Arc<ReachingDefsResult>> {
+        if let Some(cached) = self.executable_reaching_defs.get() {
+            return cached.clone();
+        }
+
+        let mut refused = false;
+        let solved = dataflow::reaching_defs::solve_executable_reaching_definitions_with_work(
+            self.cfg(db),
+            &self.body,
+            self.events(db),
+            self.seeds_params(),
+            dataflow::reaching_defs::RecoveredBody::Solve,
+            &mut |work| {
+                if spend(work) {
+                    true
+                } else {
+                    refused = true;
+                    false
+                }
+            },
+        );
+        if refused {
+            return solved;
+        }
+
+        match self.executable_reaching_defs.set(solved.clone()) {
+            Ok(()) => solved,
+            Err(_) => self.executable_reaching_defs.get().cloned().unwrap_or(solved),
+        }
     }
 
     fn seeds_params(&self) -> bool {

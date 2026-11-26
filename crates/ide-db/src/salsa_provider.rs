@@ -530,6 +530,30 @@ impl AnalysisProvider for SalsaProvider<'_> {
     }
 
     fn infer_owner(&self, file_id: FileId, owner: DefWithBodyId) -> hir::InferOwnerResult {
+        // Owner inference is a per-body projection of the same merge routing as `infer`:
+        // an effective `#Вставка` body must be inferred in the spliced module context and a
+        // weaving interceptor in the base-fallback one, otherwise its assignment-target
+        // verdicts describe a different body than the one the caller is walking.
+        if let Some(eid) = self.effective_for(file_id) {
+            let bodies = hir::module_bodies_effective(self.db, eid);
+            let body = match owner {
+                DefWithBodyId::Method(local_id) => bodies.body(local_id),
+                DefWithBodyId::ModuleCode => bodies.module_code(),
+            };
+            if let Some(body) = body {
+                return hir::infer_effective_owner(self.db, eid, owner, body);
+            }
+        }
+        if let Some(wid) = self.weaving_for(file_id) {
+            let bodies = self.db.module_bodies(ModuleId::new(file_id));
+            let body = match owner {
+                DefWithBodyId::Method(local_id) => bodies.body(local_id),
+                DefWithBodyId::ModuleCode => bodies.module_code(),
+            };
+            if let Some(body) = body {
+                return hir::infer_weaving_owner(self.db, wid, owner, body);
+            }
+        }
         hir::infer_owner(self.db, file_id, owner)
     }
 

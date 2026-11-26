@@ -1301,6 +1301,183 @@ fn dataflow_writes_i12_long_method_converges() {
     );
 }
 
+/// The executable solve charges its whole work: a `Выполнить` statement's write index
+/// spends one unit per name it may assign, so a caller's budget bounds the solver even
+/// when the body itself is small.
+#[test]
+fn executable_solver_charges_its_write_index_and_execute_writes() {
+    const NAMES: usize = 8;
+    const EXECUTES: usize = 4;
+    let mut source = String::from("Процедура Т()\n");
+    for index in 0..NAMES {
+        source.push_str(&format!("    Перем A{index};\n"));
+    }
+    for _ in 0..EXECUTES {
+        source.push_str("    Выполнить(\"A0 = 1\");\n");
+    }
+    source.push_str("КонецПроцедуры\n");
+    let f = fixture(&source);
+    let names = f.events.names().len();
+    assert!(names >= NAMES, "the fixture declares its names: {names}");
+
+    let mut spent = 0usize;
+    let solved = solve_executable_reaching_definitions_with_work(
+        f.cfg.clone(),
+        &f.body,
+        f.events.clone(),
+        true,
+        RecoveredBody::Solve,
+        &mut |work| {
+            spent += work;
+            true
+        },
+    );
+    assert!(solved.is_some(), "an unlimited budget publishes the solution");
+    assert!(
+        spent >= names * EXECUTES,
+        "every Выполнить charges each name its write index may assign: spent {spent}, names {names}"
+    );
+
+    let mut remaining = spent - 1;
+    let stopped = solve_executable_reaching_definitions_with_work(
+        f.cfg.clone(),
+        &f.body,
+        f.events.clone(),
+        true,
+        RecoveredBody::Solve,
+        &mut |work| {
+            if work > remaining {
+                return false;
+            }
+            remaining -= work;
+            true
+        },
+    );
+    assert!(
+        stopped.is_none(),
+        "a budget one unit short must not publish a partial index or solution"
+    );
+}
+
+/// The write index charges every root, call and argument it visits, including an
+/// argument that is not a bare name and so yields no write event.
+#[test]
+fn definition_index_charges_every_root_call_and_argument() {
+    let source = "Процедура Т()\n    Ф(1, 2, 3);\nКонецПроцедуры\n";
+    let body = lower(source);
+    let events = Arc::new(BodyEvents::collect(&body));
+    let mut charges = 0usize;
+    let index = DefinitionIndex::from_body_with_params_with_work(
+        &body,
+        &events,
+        params_of(&body, true),
+        &mut |_| {
+            charges += 1;
+            true
+        },
+    )
+    .expect("an unlimited budget indexes the body");
+    assert_eq!(index.len(), 1, "the call itself contributes no definition");
+    assert!(
+        charges >= 1 + 1 + 1 + 3,
+        "statement, root, call and all three literal arguments are charged: {charges}"
+    );
+}
+
+/// `Выполнить` may assign every name of the body; each assigned name reaches the
+/// budget separately, so a large name set checks cancellation throughout the loop
+/// instead of once before it.
+#[test]
+fn execute_write_index_spends_for_each_name() {
+    const NAMES: usize = 32;
+    let mut source = String::from("Процедура Т()\n");
+    for index in 0..NAMES {
+        source.push_str(&format!("    Перем A{index};\n"));
+    }
+    source.push_str("    Выполнить(\"A0 = 1\");\nКонецПроцедуры\n");
+    let body = lower(&source);
+    let events = Arc::new(BodyEvents::collect(&body));
+    let mut charges = 0usize;
+    DefinitionIndex::from_body_with_params_with_work(
+        &body,
+        &events,
+        params_of(&body, true),
+        &mut |_| {
+            charges += 1;
+            true
+        },
+    )
+    .expect("an unlimited budget indexes the body");
+    assert!(
+        charges >= 2 * NAMES,
+        "the execute loop charges each assigned name: {charges} charges for {NAMES} names"
+    );
+}
+
+/// Repeated visits of loop blocks and the state merges between them are charged
+/// beyond the one-time index and entry state, so a budget that covers the index
+/// cannot buy an unbounded solve.
+#[test]
+fn executable_solver_charges_repeated_transfers_and_merges() {
+    let f = fixture(&nested_loops(4, 8));
+    let params = params_of(&f.body, true);
+    let mut index_work = 0usize;
+    let index = DefinitionIndex::from_body_with_params_with_work(
+        &f.body,
+        &f.events,
+        params.iter().cloned(),
+        &mut |work| {
+            index_work += work;
+            true
+        },
+    )
+    .expect("an unlimited budget indexes the body");
+    let mut entry_work = 0usize;
+    entry_definitions_with_work(&index, &f.events, &params, &mut |work| {
+        entry_work += work;
+        true
+    })
+    .expect("an unlimited budget seeds the entry state");
+    let pre_solve = index_work + entry_work;
+
+    let mut spent = 0usize;
+    solve_executable_reaching_definitions_with_work(
+        f.cfg.clone(),
+        &f.body,
+        f.events.clone(),
+        true,
+        RecoveredBody::Solve,
+        &mut |work| {
+            spent += work;
+            true
+        },
+    )
+    .expect("an unlimited budget solves the loop body");
+    let statements = f.body.body_stmts_typed().len();
+    assert!(
+        spent - pre_solve >= statements,
+        "each transferred statement is charged: {} solver work for {statements} statements",
+        spent - pre_solve
+    );
+
+    let mut remaining = pre_solve + (spent - pre_solve) / 2;
+    let stopped = solve_executable_reaching_definitions_with_work(
+        f.cfg.clone(),
+        &f.body,
+        f.events.clone(),
+        true,
+        RecoveredBody::Solve,
+        &mut |work| {
+            if work > remaining {
+                return false;
+            }
+            remaining -= work;
+            true
+        },
+    );
+    assert!(stopped.is_none(), "a budget above the index but below the repeated solve must stop");
+}
+
 /// A write followed only by assignments that cannot raise is not on any path into the handler.
 /// A by-reference write followed by a call is: the call can still raise after the write.
 #[test]

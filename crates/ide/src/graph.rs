@@ -382,6 +382,10 @@ pub struct GraphContext {
     pub dispatch: Vec<&'static str>,
     /// The declaration header (collapsed to one line), when available.
     pub signature: Option<String>,
+    /// The module's semantic notify projection stopped at its work budget, so
+    /// `calls` omits notify references. An empty `calls` then does not prove the
+    /// method calls nothing; [`Self::render`] states the gap.
+    pub notify_projection_incomplete: bool,
     /// Names of the user methods this method calls (sorted, deduped by name).
     pub calls: Vec<String>,
     /// Metadata this method touches or reads, as `Тип.Объект[.Реквизит]` (Russian
@@ -417,6 +421,9 @@ impl GraphContext {
             out.push_str(sig);
             out.push('\n');
         }
+        if self.notify_projection_incomplete {
+            out.push_str("Incomplete: notify projection\n");
+        }
         render_capped_list(&mut out, "Calls", &self.calls);
         render_capped_list(&mut out, "Reads", &self.reads);
         out
@@ -427,6 +434,7 @@ impl GraphContext {
     pub fn is_empty(&self) -> bool {
         self.dispatch.is_empty()
             && self.signature.is_none()
+            && !self.notify_projection_incomplete
             && self.calls.is_empty()
             && self.reads.is_empty()
     }
@@ -488,7 +496,13 @@ impl Analysis {
         reads.sort();
         reads.dedup();
 
-        Some(GraphContext { dispatch: dispatch_labels(facts.dispatch), signature, calls, reads })
+        Some(GraphContext {
+            dispatch: dispatch_labels(facts.dispatch),
+            signature,
+            notify_projection_incomplete: facts.notify_projection_incomplete,
+            calls,
+            reads,
+        })
     }
 
     /// Cold-start overview: module/method/edge counts, the most-called methods,
@@ -924,7 +938,15 @@ fn emit_fused_chunks(
                 calls.dedup();
                 reads.sort();
                 reads.dedup();
-                let ctx = GraphContext { dispatch, signature, calls, reads };
+                // The build refuses a module whose notify projection stopped, so the
+                // projected edges were complete when the graph was published.
+                let ctx = GraphContext {
+                    dispatch,
+                    signature,
+                    notify_projection_incomplete: false,
+                    calls,
+                    reads,
+                };
                 ctx_by_name.insert(entry.name.as_str().fold_lower(), ctx.render());
             }
         }
@@ -3578,6 +3600,35 @@ mod tests {
         let neighbors = analysis.graph_neighbors(ROOT, None, &params).expect("method resolves");
         assert!(!neighbors.incomplete);
         assert!(serde_json::to_value(neighbors).unwrap().get("incomplete").is_none());
+    }
+
+    #[test]
+    fn graph_context_for_method_discloses_exhausted_notify_projection() {
+        let analysis = exhausted_notify_projection_workspace();
+        let method = Semantics::new(analysis.database())
+            .find_method(FileId(0), "Тест")
+            .expect("the fixture declares Тест");
+        let facts = hir::method_outbound_facts(analysis.database(), method.id());
+        assert!(
+            facts.notify_projection_incomplete,
+            "the outbound facts must carry the stopped projection"
+        );
+        assert!(facts.callees.is_empty(), "withheld notify edges must not be invented");
+
+        let ctx = analysis.graph_context_for_method(FileId(0), "Тест").expect("method resolves");
+        assert!(ctx.notify_projection_incomplete, "the context must carry the status");
+        assert!(ctx.calls.is_empty(), "withheld notify edges must not become calls");
+        assert!(
+            ctx.render().contains("Incomplete: notify projection"),
+            "consumers must see the gap instead of a complete empty call list: {}",
+            ctx.render()
+        );
+
+        // A context whose only fact is the withheld projection must still render and
+        // must not be dropped as empty by the producer.
+        let withheld = GraphContext { notify_projection_incomplete: true, ..Default::default() };
+        assert!(!withheld.is_empty(), "an incomplete context is not an empty one");
+        assert_eq!(withheld.render(), "Incomplete: notify projection\n");
     }
 
     #[test]

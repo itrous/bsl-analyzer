@@ -1597,8 +1597,15 @@ impl GraphDb {
         reads.sort();
         reads.dedup();
 
-        let ctx =
-            GraphContext { dispatch: dispatch_labels(&node.dispatch), signature, calls, reads };
+        // A persisted graph refuses a module whose notify projection stopped, so the
+        // stored edges were complete when the artifact was published.
+        let ctx = GraphContext {
+            dispatch: dispatch_labels(&node.dispatch),
+            signature,
+            notify_projection_incomplete: false,
+            calls,
+            reads,
+        };
         Ok(Some(ctx.render()))
     }
 

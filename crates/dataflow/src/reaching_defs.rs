@@ -174,12 +174,34 @@ impl DefinitionIndex {
         events: &BodyEvents,
         params: impl IntoIterator<Item = (Name, BindingId)>,
     ) -> Arc<Self> {
+        Self::from_body_with_params_with_work(body, events, params, |_| true)
+            .expect("an unlimited work budget cannot exhaust")
+    }
+
+    /// [`DefinitionIndex::from_body_with_params`] that reports its work to `spend` and
+    /// returns `None` as soon as `spend` refuses more. Every parameter, statement,
+    /// declaration binding, name, root, call and call argument spends one unit; a
+    /// `Выполнить` statement spends one per name it may assign. The argument count
+    /// includes arguments that are not bare names, so no call hides its work behind a
+    /// skipped write event, and every inner loop reaches the cancellation callback.
+    pub fn from_body_with_params_with_work(
+        body: &Body,
+        events: &BodyEvents,
+        params: impl IntoIterator<Item = (Name, BindingId)>,
+        mut spend: impl FnMut(usize) -> bool,
+    ) -> Option<Arc<Self>> {
         let mut index = IndexBuilder::default();
         for (name, binding_id) in params {
+            if !spend(1) {
+                return None;
+            }
             index.add(Definition::parameter(&name, binding_id));
         }
 
         for stmt in events.stmts() {
+            if !spend(1) {
+                return None;
+            }
             if let Some(var_name) =
                 stmt.write.and_then(|write| extract_var_name_from_expr(write.target, body))
             {
@@ -188,6 +210,9 @@ impl DefinitionIndex {
             match body.stmt(stmt.stmt) {
                 Stmt::VarDecl { bindings } => {
                     for &binding_id in bindings.iter() {
+                        if !spend(1) {
+                            return None;
+                        }
                         let binding = body.binding_idx(binding_id);
                         index.add(Definition::var_decl(
                             &binding.name,
@@ -210,21 +235,42 @@ impl DefinitionIndex {
         }
 
         for name in events.names() {
+            if !spend(1) {
+                return None;
+            }
             index.add(Definition::unknown(SmolStr::new(name)));
         }
 
         for stmt in events.stmts() {
+            if !spend(1) {
+                return None;
+            }
             for root in stmt.roots.iter() {
+                if !spend(1) {
+                    return None;
+                }
                 for call in root.calls.iter() {
-                    for arg in call.path_args.iter() {
-                        let Expr::Path(name) = body.expr(arg.expr) else { continue };
+                    if !spend(1) {
+                        return None;
+                    }
+                    let args = match body.expr(call.call) {
+                        Expr::Call { args, .. }
+                        | Expr::MethodCall { args, .. }
+                        | Expr::New { args, .. } => args,
+                        _ => continue,
+                    };
+                    for (position, &arg) in args.iter().enumerate() {
+                        if !spend(1) {
+                            return None;
+                        }
+                        let Expr::Path(name) = body.expr_idx(arg) else { continue };
                         index.add_write(
                             root.point,
                             &name.as_str().fold_lower(),
                             WriteEventKind::Argument {
                                 call: call.call,
-                                arg: arg.expr,
-                                position: arg.position,
+                                arg: ExprId::from_idx(arg),
+                                position: position as u32,
                             },
                         );
                     }
@@ -232,12 +278,15 @@ impl DefinitionIndex {
             }
             if stmt.execute {
                 for name in events.names() {
+                    if !spend(1) {
+                        return None;
+                    }
                     index.add_write(EvalPoint::Stmt(stmt.stmt), name, WriteEventKind::Execute);
                 }
             }
         }
 
-        index.finish()
+        Some(index.finish())
     }
 
     /// The possible-write event `id` stands for.
@@ -407,6 +456,10 @@ impl Lattice for ReachingDefs {
     fn is_more_informative_than(&self, other: &Self) -> bool {
         self.bits.is_subset(&other.bits)
     }
+
+    fn work_weight(&self) -> usize {
+        self.bits.len().div_ceil(usize::BITS as usize)
+    }
 }
 
 pub struct ReachingDefsTransfer;
@@ -480,17 +533,53 @@ pub fn solve_executable_reaching_definitions(
     seed_params: bool,
     recovered: RecoveredBody,
 ) -> Option<Arc<ReachingDefsResult>> {
+    solve_executable_reaching_definitions_with_work(
+        cfg,
+        body_arc,
+        events,
+        seed_params,
+        recovered,
+        &mut |_| true,
+    )
+}
+
+/// [`solve_executable_reaching_definitions`] that reports the work of the whole
+/// solve to `spend`: building the write index (one unit per parameter, statement,
+/// binding, name, root, call, argument and every name a `Выполнить` may assign),
+/// seeding the entry state, every block visit, edge, transfer, state clone and join
+/// of the solver, and publishing the solved states. `None` when `spend` refuses
+/// work, so a budget exhaustion is the same "write set is unknown" answer as a
+/// non-converged or refused solve.
+pub fn solve_executable_reaching_definitions_with_work(
+    cfg: Arc<cfg::ControlFlowGraph>,
+    body_arc: &Arc<Body>,
+    events: Arc<BodyEvents>,
+    seed_params: bool,
+    recovered: RecoveredBody,
+    spend: &mut dyn FnMut(usize) -> bool,
+) -> Option<Arc<ReachingDefsResult>> {
     let body: &Body = body_arc;
     if recovered == RecoveredBody::Refuse && hir_suppressed(body) {
         return None;
     }
     let params = params_of(body, seed_params);
-    let def_index = DefinitionIndex::from_body_with_params(body, &events, params.iter().cloned());
-    let entry = entry_definitions(&def_index, &events, &params);
+    let def_index = DefinitionIndex::from_body_with_params_with_work(
+        body,
+        &events,
+        params.iter().cloned(),
+        &mut *spend,
+    )?;
+    let entry = entry_definitions_with_work(&def_index, &events, &params, spend)?;
     let budget = visit_budget(&cfg);
-    let solved =
-        solve_executable(ExecutableReachingDefsTransfer::new(body), cfg, body, entry, budget)?;
-    publish_executable(&solved, body_arc, events)
+    let solved = solve_executable_with_work(
+        ExecutableReachingDefsTransfer::new(body),
+        cfg,
+        body,
+        entry,
+        budget,
+        spend,
+    )?;
+    publish_executable_with_work(&solved, body_arc, events, spend)
 }
 
 /// Block visits a body's solution may take before it is given up as not converging.
@@ -567,25 +656,43 @@ fn params_of(body: &Body, seed_params: bool) -> Vec<(Name, BindingId)> {
 
 /// A parameter holds its own definition on entry; any other name of the body
 /// holds nothing the body gave it.
+#[cfg(test)]
 fn entry_definitions(
     def_index: &Arc<DefinitionIndex>,
     events: &BodyEvents,
     params: &[(Name, BindingId)],
 ) -> ReachingDefs {
+    entry_definitions_with_work(def_index, events, params, &mut |_| true)
+        .expect("an unlimited work budget cannot exhaust")
+}
+
+fn entry_definitions_with_work(
+    def_index: &Arc<DefinitionIndex>,
+    events: &BodyEvents,
+    params: &[(Name, BindingId)],
+    spend: &mut dyn FnMut(usize) -> bool,
+) -> Option<ReachingDefs> {
     let mut entry = ReachingDefs::new(def_index.clone());
     let mut param_names = FxHashSet::default();
     for (name, binding_id) in params {
+        if !spend(1) {
+            return None;
+        }
         entry.insert(&Definition::parameter(name, *binding_id));
         param_names.insert(name.as_str().fold_lower());
     }
     for name in events.names() {
+        if !spend(1) {
+            return None;
+        }
         if !param_names.contains(name) {
             entry.insert(&Definition::unknown(SmolStr::new(name)));
         }
     }
-    entry
+    Some(entry)
 }
 
+#[cfg(test)]
 fn solve_executable<T: Transfer<ExecutableDefs>>(
     transfer: T,
     cfg: Arc<cfg::ControlFlowGraph>,
@@ -593,22 +700,46 @@ fn solve_executable<T: Transfer<ExecutableDefs>>(
     entry: ReachingDefs,
     max_iterations: usize,
 ) -> Option<DataflowResult<ExecutableDefs>> {
+    solve_executable_with_work(transfer, cfg, body, entry, max_iterations, &mut |_| true)
+}
+
+fn solve_executable_with_work<T: Transfer<ExecutableDefs>>(
+    transfer: T,
+    cfg: Arc<cfg::ControlFlowGraph>,
+    body: &Body,
+    entry: ReachingDefs,
+    max_iterations: usize,
+    spend: &mut dyn FnMut(usize) -> bool,
+) -> Option<DataflowResult<ExecutableDefs>> {
     let mut solver = DataflowSolver::new(cfg, body.clone(), transfer);
     solver.set_max_iterations(max_iterations);
     solver.set_bottom_factory(ExecutableDefs::unreached);
     solver.set_initial_state(ExecutableDefs::entering(Reach::Reached(entry)));
-    solver.solve()
+    solver.solve_with_work(spend)
 }
 
 /// A partial solution proves nothing, so none is published.
+#[cfg(test)]
 fn publish_executable(
     solved: &DataflowResult<ExecutableDefs>,
     body_arc: &Arc<Body>,
     events: Arc<BodyEvents>,
 ) -> Option<Arc<ReachingDefsResult>> {
-    solved.converged().then(|| {
-        Arc::new(ReachingDefsResult::from_executable(solved, Arc::clone(body_arc), events))
-    })
+    publish_executable_with_work(solved, body_arc, events, &mut |_| true)
+}
+
+fn publish_executable_with_work(
+    solved: &DataflowResult<ExecutableDefs>,
+    body_arc: &Arc<Body>,
+    events: Arc<BodyEvents>,
+    spend: &mut dyn FnMut(usize) -> bool,
+) -> Option<Arc<ReachingDefsResult>> {
+    if !solved.converged() {
+        return None;
+    }
+    let result =
+        ReachingDefsResult::from_executable_with_work(solved, Arc::clone(body_arc), events, spend)?;
+    Some(Arc::new(result))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -659,14 +790,29 @@ impl ReachingDefsResult {
 
     /// The normal exit states of an executable solution; a block no executable
     /// path enters has no state at all.
+    #[cfg(test)]
     fn from_executable(
         dataflow: &crate::DataflowResult<ExecutableDefs>,
         body: Arc<Body>,
         events: Arc<BodyEvents>,
     ) -> Self {
+        Self::from_executable_with_work(dataflow, body, events, &mut |_| true)
+            .expect("an unlimited work budget cannot exhaust")
+    }
+
+    fn from_executable_with_work(
+        dataflow: &crate::DataflowResult<ExecutableDefs>,
+        body: Arc<Body>,
+        events: Arc<BodyEvents>,
+        spend: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<Self> {
         let mut block_in = rustc_hash::FxHashMap::default();
         let mut block_out = rustc_hash::FxHashMap::default();
         for (block_idx, in_state, out_state) in dataflow.blocks() {
+            if !crate::spend_for_state(spend, in_state) || !crate::spend_for_state(spend, out_state)
+            {
+                return None;
+            }
             if let Reach::Reached(defs) = &in_state.normal {
                 block_in.insert(block_idx, defs.clone());
             }
@@ -674,7 +820,7 @@ impl ReachingDefsResult {
                 block_out.insert(block_idx, defs.clone());
             }
         }
-        Self::with_states(dataflow.cfg(), block_in, block_out, body, events, true)
+        Self::with_states_with_work(dataflow.cfg(), block_in, block_out, body, events, true, spend)
     }
 
     fn with_states(
@@ -685,6 +831,21 @@ impl ReachingDefsResult {
         events: Arc<BodyEvents>,
         executable: bool,
     ) -> Self {
+        Self::with_states_with_work(cfg, block_in, block_out, body, events, executable, &mut |_| {
+            true
+        })
+        .expect("an unlimited work budget cannot exhaust")
+    }
+
+    fn with_states_with_work(
+        cfg: &cfg::ControlFlowGraph,
+        block_in: rustc_hash::FxHashMap<petgraph::graph::NodeIndex, ReachingDefs>,
+        block_out: rustc_hash::FxHashMap<petgraph::graph::NodeIndex, ReachingDefs>,
+        body: Arc<Body>,
+        events: Arc<BodyEvents>,
+        executable: bool,
+        spend: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<Self> {
         use cfg::CfgVertex;
 
         let mut stmt_to_block = rustc_hash::FxHashMap::default();
@@ -693,39 +854,60 @@ impl ReachingDefsResult {
         let mut earlier_roots = rustc_hash::FxHashMap::default();
 
         for (block_idx, vertex) in cfg.vertices() {
+            if !spend(1) {
+                return None;
+            }
             match vertex {
                 CfgVertex::BasicBlock(basic_block) => {
-                    let stmts: Vec<la_arena::RawIdx> =
-                        basic_block.statements().iter().map(|stmt_id| stmt_id.into_raw()).collect();
+                    let mut stmts = Vec::with_capacity(basic_block.statements().len());
+                    for &stmt_id in basic_block.statements() {
+                        if !spend(1) {
+                            return None;
+                        }
+                        stmts.push(stmt_id.into_raw());
+                    }
 
                     block_stmts.insert(block_idx, stmts);
 
                     for &stmt_id in basic_block.statements() {
+                        if !spend(1) {
+                            return None;
+                        }
                         stmt_to_block.insert(stmt_id, block_idx);
                     }
                 }
                 CfgVertex::Conditional(header) => {
+                    if !spend(1) {
+                        return None;
+                    }
                     root_blocks.insert(header.condition, block_idx);
                 }
                 CfgVertex::WhileHeader(header) => {
+                    if !spend(1) {
+                        return None;
+                    }
                     root_blocks.insert(header.condition, block_idx);
                 }
                 CfgVertex::LoopEntry(entry) => {
                     let roots = entry.roots();
-                    root_blocks.extend(roots.iter().map(|&root| (root, block_idx)));
-                    earlier_roots.extend(
-                        roots
-                            .iter()
-                            .enumerate()
-                            .skip(1)
-                            .map(|(at, &root)| (root, roots[..at].into())),
-                    );
+                    for (at, &root) in roots.iter().enumerate() {
+                        if !spend(1) {
+                            return None;
+                        }
+                        root_blocks.insert(root, block_idx);
+                        if at > 0 {
+                            if !spend(at) {
+                                return None;
+                            }
+                            earlier_roots.insert(root, roots[..at].into());
+                        }
+                    }
                 }
                 _ => {}
             }
         }
 
-        Self {
+        Some(Self {
             block_in,
             block_out,
             stmt_to_block,
@@ -735,7 +917,7 @@ impl ReachingDefsResult {
             body,
             events,
             executable,
-        }
+        })
     }
 
     /// The syntactic events of the body the result was solved over.
@@ -916,6 +1098,13 @@ impl Reach {
             Reach::Reached(defs) => defs.join_in_place(other),
         }
     }
+
+    fn work_weight(&self) -> usize {
+        match self {
+            Reach::Unreached => 1,
+            Reach::Reached(defs) => defs.work_weight(),
+        }
+    }
 }
 
 /// The state of the executable solver: what leaves a point when it completes,
@@ -955,6 +1144,13 @@ impl Lattice for ExecutableDefs {
         self.normal.join_in_place(&other.normal);
         self.exceptional.join_in_place(&other.exceptional);
         self.skipped.join_in_place(&other.skipped);
+    }
+
+    fn work_weight(&self) -> usize {
+        self.normal
+            .work_weight()
+            .saturating_add(self.exceptional.work_weight())
+            .saturating_add(self.skipped.work_weight())
     }
 }
 

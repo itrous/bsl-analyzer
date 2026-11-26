@@ -13,7 +13,7 @@ use hir_def::effective_module::EffectiveModuleId;
 use hir_def::hir::{BinaryOp, Expr, ExprIdx, Literal, Stmt, StmtIdx, UnaryOp};
 use hir_def::module_interface::ModuleInterface;
 use hir_def::resolver::Resolver;
-use hir_def::weaving::WeavingModuleId;
+use hir_def::weaving::{Interception, WeavingModuleId};
 use hir_def::{DefWithBodyId, ExprId, MethodIdInput, Name, StmtId};
 use intern::NormName;
 use once_cell::sync::Lazy;
@@ -7772,7 +7772,7 @@ pub fn effective_method_returns<'db>(
 /// Inference for one effective body with the shared return threading applied. Projections
 /// that need per-body facts [`infer_effective`] folds away read it, so no consumer
 /// re-derives the effective context.
-pub(crate) fn infer_effective_owner(
+pub fn infer_effective_owner(
     db: &dyn HirDatabase,
     eid: EffectiveModuleId<'_>,
     owner: DefWithBodyId,
@@ -7852,6 +7852,7 @@ fn declared_notify_method_env(
 fn weaving_notify_body_env(
     db: &dyn HirDatabase,
     wid: WeavingModuleId<'_>,
+    facts: &WeavingProceedFacts,
     owner: DefWithBodyId,
 ) -> (hir_def::execution_env::EnvFlags, hir_def::execution_env::EnvFlags) {
     use hir_def::execution_env::{self, EnvFlags};
@@ -7870,14 +7871,7 @@ fn weaving_notify_body_env(
     let Some(ext_declaration) = db.interface_method(ext_method) else {
         return (EnvFlags::EMPTY, EnvFlags::ALL);
     };
-    let symbols = db.symbol_tree_ref(ext_module);
-    let parse = db.parse(ext_file);
-    let interception = symbols
-        .methods()
-        .find(|method| method.id.local_id == local_id)
-        .and_then(|method| method.syntax_node(&parse))
-        .and_then(|node| hir_def::weaving::interceptor_target(&node));
-    let Some(interception) = interception else {
+    let Some(interception) = facts.interceptions.get(&local_id) else {
         return declared_notify_method_env(
             &db.module_metadata(ext_module),
             &ext_declaration,
@@ -7896,12 +7890,15 @@ fn weaving_notify_body_env(
 }
 
 /// The `ПродолжитьВызов` facts of a weaving extension module: the base method return and
-/// arity per interceptor. Shared by [`infer_weaving`] and the weaving notification
-/// projection.
+/// arity per interceptor, plus every recognized interception by the extension method's
+/// local id. Built in one pass over the module's methods and shared by [`infer_weaving`]
+/// and the weaving notification projection, whose per-body environment reads the index
+/// instead of rescanning the declarations.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct WeavingProceedFacts {
     pub(crate) returns: FxHashMap<hir_def::MethodKey, TypeId>,
     pub(crate) arities: FxHashMap<hir_def::MethodKey, (usize, usize)>,
+    pub(crate) interceptions: FxHashMap<hir_def::MethodKey, Interception>,
 }
 
 #[salsa::tracked(returns(clone))]
@@ -7923,6 +7920,7 @@ pub(crate) fn weaving_proceed_facts<'db>(
         let Some(interception) = hir_def::weaving::interceptor_target(&node) else {
             continue;
         };
+        facts.interceptions.insert(method.id.local_id, interception.clone());
         if interception.kind != hir_def::weaving::InterceptionKind::Around {
             continue;
         }
@@ -7947,7 +7945,7 @@ pub(crate) fn weaving_proceed_facts<'db>(
 /// Inference for one extension body under weaving, with the shared `ПродолжитьВызов`
 /// facts applied. Read by projections that need the per-body facts `infer_weaving` folds
 /// away.
-pub(crate) fn infer_weaving_owner(
+pub fn infer_weaving_owner(
     db: &dyn HirDatabase,
     wid: WeavingModuleId<'_>,
     owner: DefWithBodyId,
@@ -7958,7 +7956,7 @@ pub(crate) fn infer_weaving_owner(
     let facts = weaving_proceed_facts(db, wid);
     let mut ctx =
         InferenceContext::new_weaving(db, ext_file, base_module, owner, &Arc::new(body.clone()));
-    ctx.notify_body_env = Some(weaving_notify_body_env(db, wid, owner));
+    ctx.notify_body_env = Some(weaving_notify_body_env(db, wid, &facts, owner));
     if let DefWithBodyId::Method(local_id) = owner {
         if let Some(ret) = facts.returns.get(&local_id) {
             ctx.set_proceed_return(*ret);

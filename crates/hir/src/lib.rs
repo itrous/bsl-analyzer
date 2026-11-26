@@ -223,8 +223,8 @@ pub use hir_ty::form_self::{
     is_form_self_property_name, managed_form_platform_type_names, FORM_TYPE_NAME,
 };
 pub use hir_ty::infer::{
-    infer_effective, infer_module_code_query, infer_owner, infer_query, infer_weaving,
-    type_of_expr_query,
+    infer_effective, infer_effective_owner, infer_module_code_query, infer_owner, infer_query,
+    infer_weaving, infer_weaving_owner, type_of_expr_query,
 };
 pub use hir_ty::method_graph::{
     infer_method_query, method_return_type_query, set_infer_method_lru_sweep_mode,
@@ -1080,6 +1080,34 @@ mod tests {
             candidate.analysis_incomplete
                 && candidate.signature_protection() == NotifySignatureProtection::Indeterminate
         }));
+    }
+
+    #[test]
+    fn static_notify_projection_does_not_solve_reaching_definitions() {
+        // The executable solution is only needed to prove a dynamic array's handler.
+        // A static registration in a body whose write index would cost more than this
+        // budget must still complete: an eager solve would exhaust it before the
+        // registration is normalized.
+        let mut source = String::from("Процедура Зарегистрировать()\n");
+        for index in 0..1_000 {
+            source.push_str(&format!("    Перем A{index};\n"));
+        }
+        source.push_str("    Описание = Новый ОписаниеОповещения(\"Обработчик\", ЭтотОбъект);\n");
+        for _ in 0..200 {
+            source.push_str("    Выполнить(\"A0 = 1\");\n");
+        }
+        source.push_str("КонецПроцедуры\n");
+        let (db, file_id) = create_db_with_file(&source);
+        let facts = semantic_notify_facts_with_work_limit(
+            &db,
+            base_db::FileIdInput::new(&db, file_id),
+            100_000,
+        );
+        assert!(
+            !facts.summary.notify_projection_incomplete,
+            "a static-only projection must not spend the budget on an unused executable solve"
+        );
+        assert_eq!(facts.summary.notify_regs.len(), 1);
     }
 
     #[test]
