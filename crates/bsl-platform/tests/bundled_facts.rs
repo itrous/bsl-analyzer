@@ -321,6 +321,31 @@ fn the_curated_overlays_reach_the_built_in_facts() {
             "{name} is attested for its properties and not for its methods"
         );
     }
+    for name in ["ОписаниеТипов", "TypeDescription", "ТабличныйДокумент", "SpreadsheetDocument"] {
+        assert!(surfaces_of(&data, name) == BOTH, "{name} is attested");
+    }
+    // A callback description has no methods, so only its properties are attested.
+    for name in ["ОписаниеОповещения", "CallbackDescription"] {
+        assert!(
+            surfaces_of(&data, name) == FIELDS_ONLY,
+            "{name} is attested for its properties and not for its methods"
+        );
+    }
+    // A value storage has no properties, so only its method is attested.
+    for name in ["ХранилищеЗначения", "ValueStorage"] {
+        assert!(
+            surfaces_of(&data, name) == METHODS_ONLY,
+            "{name} is attested for its methods and not for its properties"
+        );
+    }
+    assert_eq!(data.get_type_methods("TypeDescription").len(), 3);
+    assert_eq!(data.get_type_properties("TypeDescription").len(), 4);
+    assert!(data.get_type_methods("CallbackDescription").is_empty());
+    assert_eq!(data.get_type_properties("CallbackDescription").len(), 5);
+    assert_eq!(data.get_type_methods("ValueStorage").len(), 1);
+    assert!(data.get_type_properties("ValueStorage").is_empty());
+    assert_eq!(data.get_type_methods("SpreadsheetDocument").len(), 45);
+    assert_eq!(data.get_type_properties("SpreadsheetDocument").len(), 63);
     // The collections that address their elements by name are attested for the
     // methods alone: an element name is answered as a property, so the property
     // surface stays open.
@@ -340,7 +365,6 @@ fn the_curated_overlays_reach_the_built_in_facts() {
     assert_eq!(data.get_type_methods("StandardAttributeDescriptions").len(), 1);
     assert!(data.get_type_properties("StandardAttributeDescriptions").is_empty());
     // ...and the types nobody attested stay open, however complete they look.
-    assert!(surfaces_of(&data, "ТабличныйДокумент") == NEITHER);
     assert!(surfaces_of(&data, "ЗаписьXML") == NEITHER);
     assert!(surfaces_of(&data, "ЗаписьJSONНеТакой") == NEITHER);
 

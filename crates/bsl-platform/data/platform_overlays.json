@@ -765,6 +765,32 @@
       "verified_surface": ["fields"],
       "evidence_source": "platform_facts.json holds КвалификаторыДаты / DateQualifiers with 1 property (id 12316) and no method. The installed 8.3.17 platform help (HBK) lists the same one (ЧастиДаты). Its answer carries three further names (КвалификаторыЧисла, КвалификаторыСтроки, КвалификаторыДаты, each typed Unknown) which are the properties of ОписаниеТипов that the help index mis-attributes to the types they return, not members of this type. The type name is unique in the facts in both languages, and no docs-gap overlay of crates/bsl-platform/src/db.rs covers it.",
       "rationale": "A qualifier is a value object whose properties real code reads and writes constantly (1 270 constructions over the measured corpus), and they are not element names, so a mistyped property silently reads Undefined instead of the intended date parts. Only the property surface is attested: a help index that mis-attributes properties is no evidence that the type has no method."
+    },
+    {
+      "type": "TypeDescription",
+      "verified_against_version": "8.3.17",
+      "evidence_source": "platform_facts.json holds ОписаниеТипов / TypeDescription with 3 methods (ids 5979-5981: Типы, СодержитТип, ПривестиЗначение) and 4 properties (ids 12325-12328: КвалификаторыДвоичныхДанных, КвалификаторыДаты, КвалификаторыЧисла, КвалификаторыСтроки), each a contiguous id block with no foreign id inside. The composition was checked by an oracle independent of the help-index MCP server that mis-attributes members: the repository's own extractor (html-parser hbk, crates/bsl-platform/tools/html-parser) reads the platform help archives directly, and the corpora of three installed builds were compared - 8.3.17.1549, 8.3.27.2214 (the pinned build the facts come from) and 8.5.1.1343. The member sets agree across the three builds (3 methods and 4 properties in each).",
+      "rationale": "A type description is built with arguments in real code and its qualifier properties are read constantly, so a mistyped member silently yields Undefined or a runtime error instead of the intended qualifier. Both surfaces are attested because both have members. Types are matched by their Russian name, because the platform renames English names between builds (NotifyDescription in 8.3.17 became CallbackDescription in 8.3.27)."
+    },
+    {
+      "type": "CallbackDescription",
+      "verified_against_version": "8.3.17",
+      "verified_surface": ["fields"],
+      "evidence_source": "platform_facts.json holds ОписаниеОповещения / CallbackDescription with 5 properties (ids 2216-2220: ДополнительныеПараметры, МодульОбработкиОшибки, ИмяПроцедурыОбработкиОшибки, Модуль, ИмяПроцедуры), one contiguous block with no foreign id inside, and no method. The composition was checked by an oracle independent of the help-index MCP server that mis-attributes members: the repository's own extractor (html-parser hbk, crates/bsl-platform/tools/html-parser) reads the platform help archives directly, and the corpora of three installed builds were compared - 8.3.17.1549, 8.3.27.2214 (the pinned build the facts come from) and 8.5.1.1343. The 0 methods and 5 properties agree across the three builds.",
+      "rationale": "Only the property surface is attested: the type has no methods, and an empty surface is left open because closing it buys no misspelling check. Types are matched by their Russian name, because the platform renames English names between builds (NotifyDescription in 8.3.17 became CallbackDescription in 8.3.27)."
+    },
+    {
+      "type": "ValueStorage",
+      "verified_against_version": "8.3.17",
+      "verified_surface": ["methods"],
+      "evidence_source": "platform_facts.json holds ХранилищеЗначения / ValueStorage with 1 method (id 2032: Получить) and no property. The composition was checked by an oracle independent of the help-index MCP server that mis-attributes members: the repository's own extractor (html-parser hbk, crates/bsl-platform/tools/html-parser) reads the platform help archives directly, and the corpora of three installed builds were compared - 8.3.17.1549, 8.3.27.2214 (the pinned build the facts come from) and 8.5.1.1343. The 1 method and 0 properties agree across the three builds.",
+      "rationale": "Only the method surface is attested: the type has no properties, and an empty surface is left open because closing it buys no misspelling check. Types are matched by their Russian name, because the platform renames English names between builds (NotifyDescription in 8.3.17 became CallbackDescription in 8.3.27)."
+    },
+    {
+      "type": "SpreadsheetDocument",
+      "verified_against_version": "8.3.17",
+      "evidence_source": "platform_facts.json holds ТабличныйДокумент / SpreadsheetDocument with 45 methods (ids 6302-6346) and 63 properties (ids 12571-12633), each a contiguous id block with no foreign id inside. The composition was checked by an oracle independent of the help-index MCP server that mis-attributes members: the repository's own extractor (html-parser hbk, crates/bsl-platform/tools/html-parser) reads the platform help archives directly, and the corpora of three installed builds were compared - 8.3.17.1549, 8.3.27.2214 (the pinned build the facts come from) and 8.5.1.1343. The 8.3.17 build lists 44 methods and 55 properties and the 8.5.1 build lists 45 and 63, so the facts are a superset of 8.3.17 and the extra members are confirmed by the newer 8.5.1 build; the attested surface is therefore the pinned one, not the 8.3.17 subset.",
+      "rationale": "A spreadsheet document is the most used output type of print forms, and its surface is large enough that a mistyped member is easy to make and silently wrong. Both surfaces are attested because both have members. Types are matched by their Russian name, because the platform renames English names between builds (NotifyDescription in 8.3.17 became CallbackDescription in 8.3.27)."
     }
   ],
   "parameter_passing_attestations": [

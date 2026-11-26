@@ -1054,13 +1054,93 @@ mod tests {
         assert!(umc.is_empty(), "a receiver not attested for methods stays open: {umc:?}");
     }
 
-    /// THE CONTROL that closedness did not spread: a type nobody attested stays open.
+    /// A value storage is attested for its method, so a call it does not have is reported.
     #[test]
-    fn a_miss_on_an_unattested_value_storage_stays_silent() {
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_a_value_storage_method_is_reported() {
         let umc = platform_umc(
             "Процедура Тест()
     Х = Новый ХранилищеЗначения(1);
     Х.НетТакогоМетода();
+КонецПроцедуры",
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(umc.len(), 1, "expected one UnresolvedMethodCall, got: {umc:?}");
+            assert!(umc[0].contains("НетТакогоМетода"), "message must name the method: {umc:?}");
+            assert!(umc[0].contains("ХранилищеЗначения"), "message must name the receiver type: {umc:?}");
+        } else {
+            assert!(umc.is_empty(), "an unknown platform version keeps the miss silent: {umc:?}");
+        }
+    }
+
+    /// THE CONTROL: the method the value storage really has is no miss.
+    #[test]
+    fn a_real_method_of_a_value_storage_stays_silent() {
+        let umc = platform_umc(
+            "Процедура Тест()
+    Х = Новый ХранилищеЗначения(1);
+    Х.Получить();
+КонецПроцедуры",
+        );
+        assert!(umc.is_empty(), "a method the platform has is no miss: {umc:?}");
+    }
+
+    /// A spreadsheet document is attested for its methods, so a call it does not have is reported.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_a_spreadsheet_document_method_is_reported() {
+        let umc = platform_umc(
+            "Процедура Тест()
+    Т = Новый ТабличныйДокумент;
+    Т.НетТакогоМетода();
+КонецПроцедуры",
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(umc.len(), 1, "expected one UnresolvedMethodCall, got: {umc:?}");
+            assert!(umc[0].contains("НетТакогоМетода"), "message must name the method: {umc:?}");
+            assert!(umc[0].contains("ТабличныйДокумент"), "message must name the receiver type: {umc:?}");
+        } else {
+            assert!(umc.is_empty(), "an unknown platform version keeps the miss silent: {umc:?}");
+        }
+    }
+
+    /// THE CONTROL: a method the spreadsheet document really has is no miss.
+    #[test]
+    fn a_real_method_of_a_spreadsheet_document_stays_silent() {
+        let umc = platform_umc(
+            "Процедура Тест()
+    Т = Новый ТабличныйДокумент;
+    Т.Очистить();
+КонецПроцедуры",
+        );
+        assert!(umc.is_empty(), "a method the platform has is no miss: {umc:?}");
+    }
+
+    /// THE CONTROL for the fields-only attestation: the callback description method surface is deliberately unattested, so an unknown call stays silent.
+    #[test]
+    fn a_miss_on_a_callback_description_method_stays_silent_because_only_fields_are_attested() {
+        let umc = platform_umc(
+            "Процедура Тест()
+    О = Новый ОписаниеОповещения(\"Обработка\", ЭтотОбъект);
+    О.НетТакогоМетода();
+КонецПроцедуры",
+        );
+        assert!(umc.is_empty(), "a receiver not attested for methods stays open: {umc:?}");
+    }
+
+    /// THE CONTROL that closedness did not spread: a type nobody attested stays open.
+    #[test]
+    fn a_miss_on_an_unattested_type_stays_silent() {
+        let umc = platform_umc(
+            "Процедура Тест()
+    З = Новый ЗаписьXML;
+    З.НетТакогоМетода();
 КонецПроцедуры",
         );
         assert!(umc.is_empty(), "a receiver not attested for methods stays open: {umc:?}");
@@ -1100,14 +1180,17 @@ mod tests {
         assert!(umc.is_empty(), "an unknown platform version keeps the miss silent: {umc:?}");
     }
 
-    /// The gate and the existing members: a spreadsheet document is not attested, so the
+    /// The gate and the existing members: an XML writer is not attested, so the
     /// same kind of miss on it stays silent, and the JSON members that do exist never
     /// report. Without the first half a rule phrased as "every platform type is closed"
     /// would be green here too.
     #[test]
     fn a_miss_without_an_attestation_and_known_members_stay_silent() {
         let unattested = platform_umc(
-            "Процедура Тест()\n    ТабДок = Новый ТабличныйДокумент;\n    ТабДок.ЗаписатьНачалоТаблицы();\nКонецПроцедуры",
+            "Процедура Тест()
+    Запись = Новый ЗаписьXML;
+    Запись.НетТакогоМетода();
+КонецПроцедуры",
         );
         assert!(
             unattested.is_empty(),

@@ -3632,7 +3632,7 @@ impl<'db> InferenceContext<'db> {
                 walk.resolved.insert(expr, types.clone());
                 types
             }
-            Expr::New { type_name: Some(_), args } if args.is_empty() => {
+            Expr::New { type_name: Some(_), .. } => {
                 Some(vec![self.expr_types.get(&expr).copied()?])
             }
             _ => None,
