@@ -18,6 +18,7 @@ use hir_def::{DefWithBodyId, ExprId, MethodIdInput, Name, StmtId};
 use intern::NormName;
 use once_cell::sync::Lazy;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::cell::Cell;
 use std::sync::Arc;
 use stdx::case::CaseExt;
 use tracing::{debug, info, trace};
@@ -970,6 +971,17 @@ pub struct InferenceContext<'db> {
     /// over it.
     flow: BodyFlow,
 
+    /// Query facts need a reaching-definitions solve. A reader that must not run
+    /// that solve outside its own budget defers them; `finish` then returns no
+    /// facts and marks them incomplete instead of presenting an empty answer.
+    query_facts_deferred: bool,
+
+    /// The same rule for every reaching-definitions read inference itself makes.
+    /// When deferred, such a read answers unknown and records that the result
+    /// depends on a solve this inference did not run.
+    reaching_defs_deferred: bool,
+    reaching_defs_skipped: Cell<bool>,
+
     return_expr_ids: Vec<ExprId>,
 
     var_types: FxHashMap<NormName, TypeId>,
@@ -1190,6 +1202,12 @@ pub struct BodyInferenceResult {
     /// call diagnostics read it.
     pub dead_stmts: Vec<StmtId>,
     pub query_facts: crate::query_in_loop::BodyQueryFacts,
+    /// True when query facts were deferred instead of solved; the empty facts above
+    /// are then unknown, not a complete answer.
+    pub query_facts_incomplete: bool,
+    /// True when inference needed reaching definitions it was forbidden to solve;
+    /// consumers must treat its dependent facts as unknown, not as a proved absence.
+    pub reaching_defs_incomplete: bool,
 
     pub(crate) return_expr_ids: Vec<ExprId>,
 }
@@ -1211,6 +1229,8 @@ impl BodyInferenceResult {
             uncompiled_stmts: Vec::new(),
             dead_stmts: Vec::new(),
             query_facts: Default::default(),
+            query_facts_incomplete: false,
+            reaching_defs_incomplete: false,
             return_expr_ids: Vec::new(),
         }
     }
@@ -1236,6 +1256,10 @@ pub struct ModuleCodeInferenceResult {
     /// See [`BodyInferenceResult::dead_stmts`].
     pub dead_stmts: Vec<StmtId>,
     pub query_facts: crate::query_in_loop::BodyQueryFacts,
+    /// See [`BodyInferenceResult::query_facts_incomplete`].
+    pub query_facts_incomplete: bool,
+    /// See [`BodyInferenceResult::reaching_defs_incomplete`].
+    pub reaching_defs_incomplete: bool,
 }
 
 impl Default for ModuleCodeInferenceResult {
@@ -1255,6 +1279,8 @@ impl Default for ModuleCodeInferenceResult {
             uncompiled_stmts: Vec::new(),
             dead_stmts: Vec::new(),
             query_facts: Default::default(),
+            query_facts_incomplete: false,
+            reaching_defs_incomplete: false,
         }
     }
 }
@@ -1280,6 +1306,8 @@ impl ModuleCodeInferenceResult {
             uncompiled_stmts: body.uncompiled_stmts,
             dead_stmts: body.dead_stmts,
             query_facts: body.query_facts,
+            query_facts_incomplete: body.query_facts_incomplete,
+            reaching_defs_incomplete: body.reaching_defs_incomplete,
         }
     }
 }
@@ -1413,6 +1441,23 @@ impl InferOwnerResult {
             InferOwnerResult::ModuleCode(r) => &r.dead_stmts,
         }
     }
+
+    /// Whether query facts were deferred. Consumers must not read the empty
+    /// [`BodyQueryFacts`] as complete when this is true.
+    pub fn query_facts_incomplete(&self) -> bool {
+        match self {
+            InferOwnerResult::Method(r) => r.query_facts_incomplete,
+            InferOwnerResult::ModuleCode(r) => r.query_facts_incomplete,
+        }
+    }
+
+    /// Whether inference needed reaching definitions it was forbidden to solve.
+    pub fn reaching_defs_incomplete(&self) -> bool {
+        match self {
+            InferOwnerResult::Method(r) => r.reaching_defs_incomplete,
+            InferOwnerResult::ModuleCode(r) => r.reaching_defs_incomplete,
+        }
+    }
 }
 
 pub fn infer_owner(
@@ -1429,6 +1474,30 @@ pub fn infer_owner(
         }
         DefWithBodyId::ModuleCode => InferOwnerResult::ModuleCode(db.infer_module_code(file_id)),
     }
+}
+
+/// The ordinary body inference a notification projection needs. It is not the
+/// memoised full inference because that would run query facts and other
+/// reaching-definitions reads outside the projection's budget. This context
+/// defers both and marks the result incomplete when either was needed.
+pub(crate) fn infer_owner_for_notify(
+    db: &dyn HirDatabase,
+    file_id: FileId,
+    owner: DefWithBodyId,
+    body: &Body,
+) -> InferOwnerResult {
+    let body = Arc::new(body.clone());
+    let mut ctx = match owner {
+        DefWithBodyId::Method(local_id) => {
+            let method = hir_def::MethodId { module: hir_def::ModuleId { file_id }, local_id };
+            InferenceContext::new_for_method(db, MethodIdInput::new(db, method), &body)
+        }
+        DefWithBodyId::ModuleCode => InferenceContext::new_for_module_code(db, file_id, &body),
+    };
+    ctx.defer_query_facts();
+    ctx.defer_reaching_definitions();
+    ctx.infer_all();
+    finish_owner_inference(owner, ctx.finish())
 }
 
 impl<'db> InferenceContext<'db> {
@@ -1541,6 +1610,9 @@ impl<'db> InferenceContext<'db> {
             owner,
             body: Arc::clone(body),
             flow,
+            query_facts_deferred: false,
+            reaching_defs_deferred: false,
+            reaching_defs_skipped: Cell::new(false),
             var_types: FxHashMap::default(),
             reset_vars: rustc_hash::FxHashSet::default(),
             implicit_locals: FxHashMap::default(),
@@ -2681,7 +2753,10 @@ impl<'db> InferenceContext<'db> {
     pub fn finish(self) -> BodyInferenceResult {
         let notify_receiver_resolutions = self.finish_notify_receiver_resolutions();
         let notify_receiver_indeterminate = self.finish_notify_receiver_indeterminate();
-        let query_facts = self.query_facts();
+        let query_facts_incomplete = self.query_facts_deferred;
+        let reaching_defs_incomplete = self.reaching_defs_skipped.get();
+        let query_facts =
+            if query_facts_incomplete { Default::default() } else { self.query_facts() };
         BodyInferenceResult {
             owner: self.owner,
             // `var_types` is `NormName`-keyed internally (the hot lookup path during
@@ -2701,8 +2776,36 @@ impl<'db> InferenceContext<'db> {
             uncompiled_stmts: self.uncompiled_stmts,
             dead_stmts: self.dead_stmts,
             query_facts,
+            query_facts_incomplete,
+            reaching_defs_incomplete,
             return_expr_ids: self.return_expr_ids,
         }
+    }
+
+    /// Defer query facts to a reader that owns the reaching-definitions budget.
+    /// The finished result marks them incomplete, so no consumer may read the
+    /// empty answer as a complete one.
+    fn defer_query_facts(&mut self) {
+        self.query_facts_deferred = true;
+    }
+
+    /// Forbid inference from starting its own reaching-definitions solve. Every
+    /// read answers unknown and the finished result marks the dependency incomplete.
+    fn defer_reaching_definitions(&mut self) {
+        self.reaching_defs_deferred = true;
+    }
+
+    /// Record that data this inference consumed depended on a deferred solve.
+    fn mark_reaching_defs_incomplete(&mut self) {
+        self.reaching_defs_skipped.set(true);
+    }
+
+    fn executable_reaching_defs(&self) -> Option<Arc<dataflow::reaching_defs::ReachingDefsResult>> {
+        if self.reaching_defs_deferred {
+            self.reaching_defs_skipped.set(true);
+            return None;
+        }
+        self.flow.executable_reaching_defs(self.db)
     }
 
     fn finish_notify_receiver_indeterminate(&self) -> FxHashSet<ExprId> {
@@ -2798,7 +2901,7 @@ impl<'db> InferenceContext<'db> {
         if hir_def::body::events::has_unresolved_jump(&self.body) {
             return None;
         }
-        let own_defs = self.flow.executable_reaching_defs(self.db)?;
+        let own_defs = self.executable_reaching_defs()?;
         let mut walk = PathWalk {
             inferred_leaves: true,
             own_defs: Some(own_defs),
@@ -4002,7 +4105,7 @@ impl<'db> InferenceContext<'db> {
     ) -> Option<Vec<dataflow::reaching_defs::Definition>> {
         use dataflow::reaching_defs::DefSite;
 
-        let executable = self.flow.executable_reaching_defs(self.db)?;
+        let executable = self.executable_reaching_defs()?;
         let defs = executable.defs_for_var_at_stmt(var_key, stmt_id).unwrap_or_default();
         Some(
             defs.into_iter()
@@ -4036,7 +4139,7 @@ impl<'db> InferenceContext<'db> {
         if hir_def::body::events::hir_suppressed(&self.body) {
             return true;
         }
-        let Some(defs) = self.flow.executable_reaching_defs(self.db) else {
+        let Some(defs) = self.executable_reaching_defs() else {
             return true;
         };
         crate::possible_writes::rebinding_write_reaches(
@@ -7742,6 +7845,14 @@ pub fn effective_method_returns<'db>(
     db: &'db dyn HirDatabase,
     eid: EffectiveModuleId<'db>,
 ) -> Arc<FxHashMap<hir_def::MethodKey, TypeId>> {
+    effective_method_returns_with_query_facts(db, eid, false)
+}
+
+fn effective_method_returns_with_query_facts<'db>(
+    db: &'db dyn HirDatabase,
+    eid: EffectiveModuleId<'db>,
+    defer_query_facts: bool,
+) -> Arc<FxHashMap<hir_def::MethodKey, TypeId>> {
     let base_file = eid.base_file(db);
     let ext_file = eid.ext_file(db);
     let bodies = hir_def::effective_module::module_bodies_effective(db, eid);
@@ -7760,6 +7871,10 @@ pub fn effective_method_returns<'db>(
             DefWithBodyId::Method(local_id),
             &Arc::new(body.clone()),
         );
+        if defer_query_facts {
+            ctx.defer_query_facts();
+            ctx.defer_reaching_definitions();
+        }
         ctx.infer_all();
         let ret = body_return_type(db, &ctx.finish());
         if ret != db.unknown() {
@@ -7778,6 +7893,28 @@ pub fn infer_effective_owner(
     owner: DefWithBodyId,
     body: &Body,
 ) -> InferOwnerResult {
+    infer_effective_owner_with_query_facts(db, eid, owner, body, false)
+}
+
+/// The effective body inference a notification projection needs. Query facts are
+/// deferred because they would solve reaching definitions outside the projection's
+/// budget; the result marks them incomplete. Ordinary inference keeps the full path.
+pub(crate) fn infer_effective_owner_for_notify(
+    db: &dyn HirDatabase,
+    eid: EffectiveModuleId<'_>,
+    owner: DefWithBodyId,
+    body: &Body,
+) -> InferOwnerResult {
+    infer_effective_owner_with_query_facts(db, eid, owner, body, true)
+}
+
+fn infer_effective_owner_with_query_facts(
+    db: &dyn HirDatabase,
+    eid: EffectiveModuleId<'_>,
+    owner: DefWithBodyId,
+    body: &Body,
+    defer_query_facts: bool,
+) -> InferOwnerResult {
     let base_file = eid.base_file(db);
     let ext_file = eid.ext_file(db);
     let changed = effective_changed_methods(db, eid);
@@ -7794,8 +7931,16 @@ pub fn infer_effective_owner(
         owner,
         &Arc::new(body.clone()),
     );
-    ctx.set_local_effective_returns(effective_method_returns(db, eid));
+    ctx.set_local_effective_returns(effective_method_returns_with_query_facts(
+        db,
+        eid,
+        defer_query_facts,
+    ));
     ctx.notify_body_env = Some(effective_notify_body_env(db, eid, owner));
+    if defer_query_facts {
+        ctx.defer_query_facts();
+        ctx.defer_reaching_definitions();
+    }
     ctx.infer_all();
     finish_owner_inference(owner, ctx.finish())
 }
@@ -7899,12 +8044,31 @@ pub(crate) struct WeavingProceedFacts {
     pub(crate) returns: FxHashMap<hir_def::MethodKey, TypeId>,
     pub(crate) arities: FxHashMap<hir_def::MethodKey, (usize, usize)>,
     pub(crate) interceptions: FxHashMap<hir_def::MethodKey, Interception>,
+    /// A notify projection computed a base return through deferred inference, so
+    /// the consumer must treat the facts as dependent on a solve it did not run.
+    pub(crate) returns_incomplete: bool,
 }
 
 #[salsa::tracked(returns(clone))]
 pub(crate) fn weaving_proceed_facts<'db>(
     db: &'db dyn HirDatabase,
     wid: WeavingModuleId<'db>,
+) -> Arc<WeavingProceedFacts> {
+    weaving_proceed_facts_impl(db, wid, false)
+}
+
+#[salsa::tracked(returns(clone))]
+pub(crate) fn weaving_proceed_facts_for_notify<'db>(
+    db: &'db dyn HirDatabase,
+    wid: WeavingModuleId<'db>,
+) -> Arc<WeavingProceedFacts> {
+    weaving_proceed_facts_impl(db, wid, true)
+}
+
+fn weaving_proceed_facts_impl<'db>(
+    db: &'db dyn HirDatabase,
+    wid: WeavingModuleId<'db>,
+    defer_inference: bool,
 ) -> Arc<WeavingProceedFacts> {
     let ext_file = wid.ext_file(db);
     let base_module = hir_def::ModuleId::new(wid.base_file(db));
@@ -7934,12 +8098,36 @@ pub(crate) fn weaving_proceed_facts<'db>(
         facts.arities.insert(method.id.local_id, (required, total));
 
         let base_input = hir_def::MethodIdInput::new(db, base_method.id);
-        let ret = crate::method_graph::method_return_type_query(db, base_input);
+        let (ret, incomplete) = if defer_inference {
+            method_return_type_with_deferred_inference(db, base_input)
+        } else {
+            (crate::method_graph::method_return_type_query(db, base_input), false)
+        };
+        if incomplete {
+            facts.returns_incomplete = true;
+        }
         if ret != db.unknown() && ret != db.undefined() {
             facts.returns.insert(method.id.local_id, ret);
         }
     }
     Arc::new(facts)
+}
+
+/// A base method's return type for a notify projection: its ordinary inference
+/// would run the reaching-definitions solve the projection is metering, so this
+/// runs a context that defers both query facts and reaching definitions.
+fn method_return_type_with_deferred_inference(
+    db: &dyn HirDatabase,
+    method: MethodIdInput<'_>,
+) -> (TypeId, bool) {
+    let body = db.method_body_ref(method);
+    let mut ctx = InferenceContext::new_for_method(db, method, body);
+    ctx.defer_query_facts();
+    ctx.defer_reaching_definitions();
+    ctx.infer_all();
+    let result = ctx.finish();
+    let incomplete = result.reaching_defs_incomplete;
+    (body_return_type(db, &result), incomplete)
 }
 
 /// Inference for one extension body under weaving, with the shared `ПродолжитьВызов`
@@ -7951,12 +8139,44 @@ pub fn infer_weaving_owner(
     owner: DefWithBodyId,
     body: &Body,
 ) -> InferOwnerResult {
+    infer_weaving_owner_with_query_facts(db, wid, owner, body, false)
+}
+
+/// The weaving body inference a notification projection needs. See
+/// [`infer_effective_owner_for_notify`] for why query facts are deferred.
+pub(crate) fn infer_weaving_owner_for_notify(
+    db: &dyn HirDatabase,
+    wid: WeavingModuleId<'_>,
+    owner: DefWithBodyId,
+    body: &Body,
+) -> InferOwnerResult {
+    infer_weaving_owner_with_query_facts(db, wid, owner, body, true)
+}
+
+fn infer_weaving_owner_with_query_facts(
+    db: &dyn HirDatabase,
+    wid: WeavingModuleId<'_>,
+    owner: DefWithBodyId,
+    body: &Body,
+    defer_query_facts: bool,
+) -> InferOwnerResult {
     let ext_file = wid.ext_file(db);
     let base_module = hir_def::ModuleId::new(wid.base_file(db));
-    let facts = weaving_proceed_facts(db, wid);
+    let facts = if defer_query_facts {
+        weaving_proceed_facts_for_notify(db, wid)
+    } else {
+        weaving_proceed_facts(db, wid)
+    };
     let mut ctx =
         InferenceContext::new_weaving(db, ext_file, base_module, owner, &Arc::new(body.clone()));
     ctx.notify_body_env = Some(weaving_notify_body_env(db, wid, &facts, owner));
+    if defer_query_facts {
+        ctx.defer_query_facts();
+        ctx.defer_reaching_definitions();
+        if facts.returns_incomplete {
+            ctx.mark_reaching_defs_incomplete();
+        }
+    }
     if let DefWithBodyId::Method(local_id) = owner {
         if let Some(ret) = facts.returns.get(&local_id) {
             ctx.set_proceed_return(*ret);

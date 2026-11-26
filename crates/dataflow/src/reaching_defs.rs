@@ -546,10 +546,11 @@ pub fn solve_executable_reaching_definitions(
 /// [`solve_executable_reaching_definitions`] that reports the work of the whole
 /// solve to `spend`: building the write index (one unit per parameter, statement,
 /// binding, name, root, call, argument and every name a `Выполнить` may assign),
-/// seeding the entry state, every block visit, edge, transfer, state clone and join
-/// of the solver, and publishing the solved states. `None` when `spend` refuses
-/// work, so a budget exhaustion is the same "write set is unknown" answer as a
-/// non-converged or refused solve.
+/// scanning the safe tails that hide writes from exception edges, seeding the entry
+/// state, every block visit, edge, transfer, state clone and join of the solver, and
+/// publishing the solved states. `None` when `spend` refuses work, so a budget
+/// exhaustion is the same "write set is unknown" answer as a non-converged or
+/// refused solve.
 pub fn solve_executable_reaching_definitions_with_work(
     cfg: Arc<cfg::ControlFlowGraph>,
     body_arc: &Arc<Body>,
@@ -558,6 +559,8 @@ pub fn solve_executable_reaching_definitions_with_work(
     recovered: RecoveredBody,
     spend: &mut dyn FnMut(usize) -> bool,
 ) -> Option<Arc<ReachingDefsResult>> {
+    #[cfg(feature = "test-seams")]
+    note_executable_solve();
     let body: &Body = body_arc;
     if recovered == RecoveredBody::Refuse && hir_suppressed(body) {
         return None;
@@ -571,14 +574,8 @@ pub fn solve_executable_reaching_definitions_with_work(
     )?;
     let entry = entry_definitions_with_work(&def_index, &events, &params, spend)?;
     let budget = visit_budget(&cfg);
-    let solved = solve_executable_with_work(
-        ExecutableReachingDefsTransfer::new(body),
-        cfg,
-        body,
-        entry,
-        budget,
-        spend,
-    )?;
+    let transfer = ExecutableReachingDefsTransfer::new_with_work(body, spend)?;
+    let solved = solve_executable_with_work(transfer, cfg, body, entry, budget, spend)?;
     publish_executable_with_work(&solved, body_arc, events, spend)
 }
 
@@ -605,6 +602,42 @@ fn visit_budget(cfg: &cfg::ControlFlowGraph) -> usize {
 pub fn with_visit_budget<R>(visits: usize, run: impl FnOnce() -> R) -> R {
     let _restore = visit_budget_seam::install(visits);
     run()
+}
+
+/// Counts executable solves on this thread for tests that prove a path never
+/// reaches the solver. The closure runs once with the counter reset, and the
+/// returned count is only this thread's solves.
+#[cfg(feature = "test-seams")]
+pub fn with_executable_solve_count<R>(run: impl FnOnce() -> R) -> (R, usize) {
+    executable_solve_seam::reset();
+    let result = run();
+    (result, executable_solve_seam::count())
+}
+
+#[cfg(feature = "test-seams")]
+fn note_executable_solve() {
+    executable_solve_seam::bump();
+}
+
+#[cfg(feature = "test-seams")]
+mod executable_solve_seam {
+    use std::cell::Cell;
+
+    thread_local! {
+        static EXECUTABLE_SOLVES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn reset() {
+        EXECUTABLE_SOLVES.with(|count| count.set(0));
+    }
+
+    pub(super) fn count() -> usize {
+        EXECUTABLE_SOLVES.with(Cell::get)
+    }
+
+    pub(super) fn bump() {
+        EXECUTABLE_SOLVES.with(|count| count.set(count.get() + 1));
+    }
 }
 
 #[cfg(feature = "test-seams")]
@@ -1167,10 +1200,13 @@ struct ExecutableReachingDefsTransfer {
 /// assignments after it then do not run. A statement with nothing after it is not
 /// here — its own failure may come after the write, which the exceptional exit
 /// already records.
-fn writes_hidden_on_exception(body: &Body) -> FxHashSet<StmtId> {
+fn writes_hidden_on_exception_with_work(
+    body: &Body,
+    spend: &mut dyn FnMut(usize) -> bool,
+) -> Option<FxHashSet<StmtId>> {
     let mut hidden = FxHashSet::default();
-    hide_writes_after_safe_tail(body.body_stmts_typed(), body, false, &mut hidden);
-    hidden
+    hide_writes_after_safe_tail(body.body_stmts_typed(), body, false, &mut hidden, spend)?;
+    Some(hidden)
 }
 
 /// `region_ends_safely` means that once `stmts` completes, nothing that can raise remains.
@@ -1182,12 +1218,26 @@ fn hide_writes_after_safe_tail(
     body: &Body,
     region_ends_safely: bool,
     hidden: &mut FxHashSet<StmtId>,
-) {
+    spend: &mut dyn FnMut(usize) -> bool,
+) -> Option<()> {
+    // A suffix table makes every "is the rest non-raising?" question O(1), so a flat
+    // body is scanned linearly instead of rescanning its tail for every statement.
+    let mut safe_suffix = vec![true; stmts.len() + 1];
+    for position in (0..stmts.len()).rev() {
+        if !spend(1) {
+            return None;
+        }
+        safe_suffix[position] =
+            safe_suffix[position + 1] && crate::is_non_raising_assignment(body, stmts[position]);
+    }
+
     for (position, &stmt_id) in stmts.iter().enumerate() {
-        let later = &stmts[position + 1..];
-        let later_cannot_raise =
-            later.iter().all(|&later_id| crate::is_non_raising_assignment(body, later_id));
-        let ends_safely_after = later_cannot_raise && (!later.is_empty() || region_ends_safely);
+        if !spend(1) {
+            return None;
+        }
+        let later_is_empty = position + 1 == stmts.len();
+        let ends_safely_after =
+            safe_suffix[position + 1] && (!later_is_empty || region_ends_safely);
         if ends_safely_after && !crate::is_non_raising_assignment(body, stmt_id) {
             hidden.insert(StmtId::from_idx(stmt_id));
         }
@@ -1195,29 +1245,47 @@ fn hide_writes_after_safe_tail(
             Stmt::For { body: nested, .. }
             | Stmt::ForEach { body: nested, .. }
             | Stmt::While { body: nested, .. } => {
-                hide_writes_after_safe_tail(nested, body, false, hidden);
+                hide_writes_after_safe_tail(nested, body, false, hidden, spend)?;
             }
             Stmt::If(if_stmt) => {
-                hide_writes_after_safe_tail(&if_stmt.then_branch, body, ends_safely_after, hidden);
+                hide_writes_after_safe_tail(
+                    &if_stmt.then_branch,
+                    body,
+                    ends_safely_after,
+                    hidden,
+                    spend,
+                )?;
                 for (_, branch) in if_stmt.elsif_branches.iter() {
-                    hide_writes_after_safe_tail(branch, body, ends_safely_after, hidden);
+                    hide_writes_after_safe_tail(branch, body, ends_safely_after, hidden, spend)?;
                 }
                 if let Some(else_stmts) = &if_stmt.else_branch {
-                    hide_writes_after_safe_tail(else_stmts, body, ends_safely_after, hidden);
+                    hide_writes_after_safe_tail(
+                        else_stmts,
+                        body,
+                        ends_safely_after,
+                        hidden,
+                        spend,
+                    )?;
                 }
             }
             Stmt::Try { body: protected, except, .. } => {
-                hide_writes_after_safe_tail(protected, body, false, hidden);
-                hide_writes_after_safe_tail(except, body, ends_safely_after, hidden);
+                hide_writes_after_safe_tail(protected, body, false, hidden, spend)?;
+                hide_writes_after_safe_tail(except, body, ends_safely_after, hidden, spend)?;
             }
             _ => {}
         }
     }
+    Some(())
 }
 
 impl ExecutableReachingDefsTransfer {
+    #[cfg(test)]
     fn new(body: &Body) -> Self {
-        Self { hidden_on_exception: writes_hidden_on_exception(body) }
+        Self::new_with_work(body, &mut |_| true).expect("an unlimited work budget cannot exhaust")
+    }
+
+    fn new_with_work(body: &Body, spend: &mut dyn FnMut(usize) -> bool) -> Option<Self> {
+        Some(Self { hidden_on_exception: writes_hidden_on_exception_with_work(body, spend)? })
     }
 
     /// Replaying a block's normal exits does not consult [`Self::hidden_on_exception`]:

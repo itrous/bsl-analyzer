@@ -80,26 +80,45 @@ impl BodyFlow {
     }
 
     pub fn events(&self, db: &dyn HirDatabase) -> Arc<BodyEvents> {
+        self.events_with_work(db, &mut |_| true).expect("an unlimited work budget cannot exhaust")
+    }
+
+    /// [`BodyFlow::events`] that charges the build of a body the database does not
+    /// memoise before starting it. The collection itself has no internal
+    /// cancellation point, so the charge is one estimate and the limitation is
+    /// deliberate: a caller that cannot afford the whole build builds none of it.
+    pub fn events_with_work(
+        &self,
+        db: &dyn HirDatabase,
+        spend: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<Arc<BodyEvents>> {
         match self.origin {
-            Origin::Method(method) => db.method_body_events(MethodIdInput::new(db, method)),
-            Origin::ModuleCode(file_id) => {
-                db.module_code_body_events(file_id).unwrap_or_else(|| self.own_events())
-            }
-            Origin::Detached { .. } => self.own_events(),
+            Origin::Method(method) => Some(db.method_body_events(MethodIdInput::new(db, method))),
+            Origin::ModuleCode(file_id) => match db.module_code_body_events(file_id) {
+                Some(events) => Some(events),
+                None => self.own_events_with_work(spend),
+            },
+            Origin::Detached { .. } => self.own_events_with_work(spend),
         }
     }
 
     pub fn cfg(&self, db: &dyn HirDatabase) -> Arc<ControlFlowGraph> {
+        self.cfg_with_work(db, &mut |_| true).expect("an unlimited work budget cannot exhaust")
+    }
+
+    /// [`BodyFlow::cfg`] that charges the build of a body the database does not
+    /// memoise before starting it. The builder has no internal cancellation point,
+    /// so it runs whole once the estimate is affordable; see
+    /// [`BodyFlow::events_with_work`].
+    pub fn cfg_with_work(
+        &self,
+        db: &dyn HirDatabase,
+        spend: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<Arc<ControlFlowGraph>> {
         match self.origin {
-            Origin::Method(method) => db.method_cfg(MethodIdInput::new(db, method)),
-            Origin::ModuleCode(file_id) => db.module_code_cfg(file_id),
-            Origin::Detached { .. } => Arc::clone(self.cfg.get_or_init(|| {
-                let _span = tracing::info_span!("body_flow_cfg").entered();
-                Arc::new(
-                    cfg::CfgBuilder::new()
-                        .build_graph_from_hir(self.body.body_stmts_typed(), &self.body),
-                )
-            })),
+            Origin::Method(method) => Some(db.method_cfg(MethodIdInput::new(db, method))),
+            Origin::ModuleCode(file_id) => Some(db.module_code_cfg(file_id)),
+            Origin::Detached { .. } => self.own_cfg_with_work(spend),
         }
     }
 
@@ -157,21 +176,29 @@ impl BodyFlow {
         }
 
         let mut refused = false;
-        let solved = dataflow::reaching_defs::solve_executable_reaching_definitions_with_work(
-            self.cfg(db),
-            &self.body,
-            self.events(db),
-            self.seeds_params(),
-            dataflow::reaching_defs::RecoveredBody::Solve,
-            &mut |work| {
-                if spend(work) {
-                    true
-                } else {
-                    refused = true;
-                    false
-                }
-            },
-        );
+        let mut metered = |work: usize| {
+            if spend(work) {
+                true
+            } else {
+                refused = true;
+                false
+            }
+        };
+        let cfg = self.cfg_with_work(db, &mut metered);
+        let events = if cfg.is_some() { self.events_with_work(db, &mut metered) } else { None };
+        let solved = match (cfg, events) {
+            (Some(cfg), Some(events)) => {
+                dataflow::reaching_defs::solve_executable_reaching_definitions_with_work(
+                    cfg,
+                    &self.body,
+                    events,
+                    self.seeds_params(),
+                    dataflow::reaching_defs::RecoveredBody::Solve,
+                    &mut metered,
+                )
+            }
+            _ => None,
+        };
         if refused {
             return solved;
         }
@@ -190,7 +217,43 @@ impl BodyFlow {
         }
     }
 
-    fn own_events(&self) -> Arc<BodyEvents> {
-        Arc::clone(self.events.get_or_init(|| Arc::new(BodyEvents::collect(&self.body))))
+    fn own_events_with_work(
+        &self,
+        spend: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<Arc<BodyEvents>> {
+        if let Some(cached) = self.events.get() {
+            return Some(Arc::clone(cached));
+        }
+        if !spend(body_build_work(&self.body)) {
+            return None;
+        }
+        let events = Arc::new(BodyEvents::collect(&self.body));
+        let _ = self.events.set(Arc::clone(&events));
+        Some(events)
     }
+
+    fn own_cfg_with_work(
+        &self,
+        spend: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<Arc<ControlFlowGraph>> {
+        if let Some(cached) = self.cfg.get() {
+            return Some(Arc::clone(cached));
+        }
+        if !spend(body_build_work(&self.body)) {
+            return None;
+        }
+        let _span = tracing::info_span!("body_flow_cfg").entered();
+        let cfg = Arc::new(
+            cfg::CfgBuilder::new().build_graph_from_hir(self.body.body_stmts_typed(), &self.body),
+        );
+        let _ = self.cfg.set(Arc::clone(&cfg));
+        Some(cfg)
+    }
+}
+
+/// A conservative one-shot estimate for building a detached body's events or CFG.
+/// The database-memoised bodies read their memo instead; only the uncached build
+/// this flow owns is charged, because its builders expose no progress callback.
+fn body_build_work(body: &Body) -> usize {
+    body.expr_count().saturating_add(body.stmt_count()).saturating_add(body.binding_count()).max(1)
 }

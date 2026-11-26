@@ -25,8 +25,8 @@ use vfs::FileId;
 use crate::body_flow::BodyFlow;
 use crate::db::HirDatabase;
 use crate::infer::{
-    infer_effective_owner, infer_owner, infer_weaving_owner, BareNameOrigin, CallArgBinding,
-    InferOwnerResult,
+    infer_effective_owner_for_notify, infer_owner_for_notify, infer_weaving_owner_for_notify,
+    BareNameOrigin, CallArgBinding, InferOwnerResult,
 };
 use crate::notify_array::{
     callback_arguments_for_binding_with_budget, CallbackArguments, NotifyArrayRegistration,
@@ -411,7 +411,7 @@ impl<'db> NotifyModuleProjection<'db> {
             bodies: db.module_bodies_ref(module_id).clone(),
             conditional_tree: db.conditional_tree_ref(file_id).clone(),
             current_common_module: common_module_name(db, module_id),
-            infer: Box::new(move |owner, _body| infer_owner(db, file_id, owner)),
+            infer: Box::new(move |owner, body| infer_owner_for_notify(db, file_id, owner, body)),
             flow: Box::new(move |db, owner, body| ordinary_flow(db, file_id, owner, body)),
         }
     }
@@ -427,7 +427,9 @@ impl<'db> NotifyModuleProjection<'db> {
                 &parse.syntax_node(),
             )),
             current_common_module: common_module_name(db, ModuleId::new(base_file)),
-            infer: Box::new(move |owner, body| infer_effective_owner(db, eid, owner, body)),
+            infer: Box::new(move |owner, body| {
+                infer_effective_owner_for_notify(db, eid, owner, body)
+            }),
             // The effective bodies are a splice, not the memoised bodies under either
             // file, so their flow is their own; params seed a method exactly as in
             // `InferenceContext::new_effective`.
@@ -448,7 +450,9 @@ impl<'db> NotifyModuleProjection<'db> {
             bodies: db.module_bodies_ref(module_id).clone(),
             conditional_tree: db.conditional_tree_ref(file_id).clone(),
             current_common_module: common_module_name(db, module_id),
-            infer: Box::new(move |owner, body| infer_weaving_owner(db, wid, owner, body)),
+            infer: Box::new(move |owner, body| {
+                infer_weaving_owner_for_notify(db, wid, owner, body)
+            }),
             // Weaving has no splice: the extension keeps its own memoised bodies.
             flow: Box::new(move |db, owner, body| ordinary_flow(db, file_id, owner, body)),
         }
@@ -1167,6 +1171,10 @@ fn normalize_owner_candidates(
         return;
     }
     let inference = (projection.infer)(owner, body);
+    if inference.reaching_defs_incomplete() {
+        budget.mark_incomplete();
+        return;
+    }
     let mut dead_stmts: FxHashSet<StmtId> = FxHashSet::default();
     for &stmt in inference.dead_stmts() {
         if !budget.spend() {

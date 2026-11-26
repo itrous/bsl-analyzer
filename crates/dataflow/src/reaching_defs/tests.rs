@@ -1359,6 +1359,47 @@ fn executable_solver_charges_its_write_index_and_execute_writes() {
     );
 }
 
+/// The hidden-write scan used to rescan every statement's tail, doing quadratic work
+/// before the solve's first budget spend. It is linear now and refuses work through
+/// the caller's budget, so a large flat body cannot bypass cancellation.
+#[test]
+fn hidden_write_scan_is_linear_and_budgeted() {
+    const STATEMENTS: usize = 512;
+    let mut source = String::from("Процедура Т()\n");
+    for _ in 0..STATEMENTS {
+        source.push_str("    А = 1;\n");
+    }
+    source.push_str("КонецПроцедуры\n");
+    let body = lower(&source);
+    let statements = body.body_stmts_typed().len();
+    assert!(statements >= STATEMENTS, "the fixture declares the body: {statements}");
+
+    let mut charges = 0usize;
+    let hidden = writes_hidden_on_exception_with_work(&body, &mut |_| {
+        charges += 1;
+        true
+    })
+    .expect("an unlimited budget scans the body");
+    assert!(hidden.is_empty(), "every assignment after every statement is safe");
+    assert!(
+        charges <= 4 * statements,
+        "the scan visits each statement a constant number of times: {charges} charges for {statements} statements"
+    );
+
+    let mut remaining = statements / 2;
+    let stopped = writes_hidden_on_exception_with_work(&body, &mut |_| {
+        if remaining == 0 {
+            return false;
+        }
+        remaining -= 1;
+        true
+    });
+    assert!(
+        stopped.is_none(),
+        "a budget below the linear scan must stop it instead of running to completion"
+    );
+}
+
 /// The write index charges every root, call and argument it visits, including an
 /// argument that is not a bare name and so yields no write event.
 #[test]
