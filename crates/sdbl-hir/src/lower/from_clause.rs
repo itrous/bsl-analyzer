@@ -1373,43 +1373,7 @@ impl LoweringContext<'_> {
         &self,
         attr_type: &bsl_metadata::AttributeType,
     ) -> SdblType {
-        let mut visited = std::collections::HashSet::new();
-        self.resolve_attribute_type_inner(attr_type, &mut visited)
-    }
-
-    fn resolve_attribute_type_inner(
-        &self,
-        attr_type: &bsl_metadata::AttributeType,
-        visited: &mut std::collections::HashSet<String>,
-    ) -> SdblType {
-        use bsl_metadata::AttributeType;
-
-        match attr_type {
-            AttributeType::DefinedType { name } => {
-                let key = name.fold_lower();
-                if !visited.insert(key.clone()) {
-                    return SdblType::DefinedType { name: name.clone(), underlying_type: None };
-                }
-                let underlying_type =
-                    self.resolver.and_then(|r| r.resolve_defined_type(name)).map(|underlying| {
-                        Box::new(self.resolve_attribute_type_inner(&underlying, visited))
-                    });
-                visited.remove(&key);
-                SdblType::DefinedType { name: name.clone(), underlying_type }
-            }
-            AttributeType::Composite { types } => {
-                let arms: Vec<SdblType> =
-                    types.iter().map(|t| self.resolve_attribute_type_inner(t, visited)).collect();
-                if arms.is_empty() {
-                    SdblType::Unknown
-                } else if arms.len() == 1 {
-                    arms.into_iter().next().unwrap()
-                } else {
-                    SdblType::Composite { types: arms }
-                }
-            }
-            _ => SdblType::from_attribute_type(attr_type),
-        }
+        SdblType::from_attribute_type_resolved(attr_type, self.resolver)
     }
 
     fn check_virtual_table_params(

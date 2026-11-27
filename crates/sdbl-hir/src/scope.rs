@@ -466,7 +466,9 @@ impl<'a> Scope<'a> {
             return SdblType::Error;
         }
         match self.resolve_ref_fields(target) {
-            Some(fields) => self.walk_field_chain(fields, field_chain),
+            Some(fields) => self
+                .walk_field_chain(fields, field_chain)
+                .resolve_defined_types(self.metadata.as_ref().map(|m| m.resolver())),
             None => SdblType::Unknown,
         }
     }

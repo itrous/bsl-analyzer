@@ -3,8 +3,10 @@
 
 use std::sync::Arc;
 
-use bsl_metadata::{Attribute, AttributeType, Configuration, MdoType, MetadataObject};
-use sdbl_hir::{lower_sdbl_to_hir, ExprHir, FunctionKind, MdoRef, SdblType};
+use bsl_metadata::{
+    Attribute, AttributeType, Configuration, DefinedType, MdoType, MetadataObject, Uuid,
+};
+use sdbl_hir::{lower_sdbl_to_hir, ExprHir, FunctionKind, MdoRef, SdblDiagnostic, SdblType};
 
 fn attribute(name: &str, attr_type: AttributeType) -> Attribute {
     Attribute { name: name.into(), name_en: None, attr_type }
@@ -185,4 +187,46 @@ fn virtual_query_fields_after_cast_keep_their_types() {
         "ВЫРАЗИТЬ(Т.Регистратор КАК Документ.Заказ).Представление.Длина",
     );
     assert_eq!(ty, SdblType::Unknown, "cannot traverse past a primitive virtual field");
+}
+
+#[test]
+fn defined_type_field_after_cast_preserves_its_underlying_type() {
+    let mut config = configuration();
+    config.add_defined_type(
+        DefinedType::builder()
+            .uuid(Uuid::new_v4())
+            .name("БольшойТекст")
+            .underlying_type(AttributeType::String { length: Some(0) })
+            .build(),
+    );
+    config.add_metadata_object(object(
+        MdoType::Document,
+        "Заявка",
+        vec![("Текст", AttributeType::DefinedType { name: "БольшойТекст".into() })],
+    ));
+
+    let query =
+        "ВЫБРАТЬ РАЗЛИЧНЫЕ ВЫРАЗИТЬ(Т.Регистратор КАК Документ.Заявка).Текст КАК Р ИЗ Справочник.Страны КАК Т";
+    let parse = parser::parse_sdbl(query);
+    assert!(parse.errors().is_empty(), "{query}: {:?}", parse.errors());
+    let package = lower_sdbl_to_hir(&parse, Some(Arc::new(config)));
+    let sdbl_query = &package.queries()[0];
+    let ty = sdbl_query.hir.select.fields[0].expr.ty();
+    assert_eq!(
+        ty,
+        &SdblType::DefinedType {
+            name: "БольшойТекст".into(),
+            underlying_type: Some(Box::new(SdblType::String { length: Some(0) })),
+        }
+    );
+    assert!(ty.is_unlimited_string());
+    assert!(
+        sdbl_query
+            .hir
+            .diagnostics
+            .iter()
+            .any(|diag| matches!(diag, SdblDiagnostic::UnlimitedStringUsage { .. })),
+        "unlimited string inside DefinedType must reach DISTINCT check: {:?}",
+        sdbl_query.hir.diagnostics
+    );
 }
