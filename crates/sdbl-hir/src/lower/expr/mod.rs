@@ -245,8 +245,8 @@ impl LoweringContext<'_> {
     /// hop points at, or `None` whenever absence cannot be proven.
     ///
     /// The field set is built the way a FROM-clause table of that object is built, NOT with
-    /// `Scope::resolve_ref_fields`: that one omits the virtual query fields (`Представление`,
-    /// `МоментВремени`) and has no notion of completeness, so it would flag valid code.
+    /// `Scope::resolve_ref_fields`: that one has no notion of completeness, so it would flag
+    /// valid code on objects with open common attributes or missing metadata.
     fn check_nested_hops(
         &self,
         first_hop_ty: &SdblType,

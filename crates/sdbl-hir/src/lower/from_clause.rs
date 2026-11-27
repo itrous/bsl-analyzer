@@ -36,24 +36,6 @@ pub(super) fn declared_source_aliases(
     aliases
 }
 
-const POINT_IN_TIME: &str = "МоментВремени";
-
-/// Query-only fields of a reference table that `StandardAttributeKind` does not list: present
-/// on every reference table (ITS ch.18 / §8.3), and `МоментВремени` (date + ref) on documents
-/// only, with no BSL object-model counterpart.
-const DOCUMENT_VIRTUAL_QUERY_FIELDS: [(&str, &str); 3] = [
-    ("Представление", "Presentation"),
-    ("ВерсияДанных", "DataVersion"),
-    (POINT_IN_TIME, "PointInTime"),
-];
-
-/// Whether `name` is one of the query-only virtual fields of a reference table, in either language.
-pub(super) fn is_document_virtual_query_field(name: &str) -> bool {
-    DOCUMENT_VIRTUAL_QUERY_FIELDS.iter().any(|(ru, en)| {
-        stdx::case::eq_ignore_case(ru, name) || stdx::case::eq_ignore_case(en, name)
-    })
-}
-
 impl LoweringContext<'_> {
     pub(super) fn lower_from_clause(
         &mut self,
@@ -1131,15 +1113,7 @@ impl LoweringContext<'_> {
                         ));
                     }
 
-                    for (name, name_en) in DOCUMENT_VIRTUAL_QUERY_FIELDS {
-                        let is_point_in_time = name == POINT_IN_TIME;
-                        if is_point_in_time && mdo_type != MdoType::Document {
-                            continue;
-                        }
-                        let ty =
-                            if is_point_in_time { SdblType::DateTime } else { SdblType::string() };
-                        fields.push(FieldDef::standard(name, name_en, ty));
-                    }
+                    crate::standard_fields::push_reference_virtual_query_fields(mdo_type, fields);
 
                     for common in &obj.common_attributes {
                         fields.push(FieldDef::new_with_names(

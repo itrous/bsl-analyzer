@@ -619,6 +619,8 @@ impl<'a> Scope<'a> {
             ));
         }
 
+        crate::standard_fields::push_reference_virtual_query_fields(mdo_ref.mdo_type, &mut fields);
+
         for common in &mdo_object.common_attributes {
             fields.push(FieldDef::new_with_names(
                 common.name.clone(),

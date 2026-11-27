@@ -152,3 +152,37 @@ fn a_target_without_metadata_gives_unknown_not_a_confident_type() {
     let (ty, _) = cast_call(Some(configuration()), "ВЫРАЗИТЬ(Т.Номер КАК Строка(10)).Длина");
     assert_eq!(ty, SdblType::Unknown, "a primitive target has no fields");
 }
+
+#[test]
+fn virtual_query_fields_after_cast_keep_their_types() {
+    for expression in [
+        "ВЫРАЗИТЬ(Т.Регистратор КАК Документ.Заказ).Представление",
+        "ВЫРАЗИТЬ(Т.Регистратор КАК Документ.Заказ).Presentation",
+        "ВЫРАЗИТЬ(Т.Регистратор КАК Документ.Заказ).ВерсияДанных",
+        "ВЫРАЗИТЬ(Т.Регистратор КАК Документ.Заказ).DataVersion",
+        "ВЫРАЗИТЬ(Т.Регистратор КАК Документ.Заказ).Контрагент.Представление",
+    ] {
+        let (ty, _) = cast_call(Some(configuration()), expression);
+        assert_eq!(ty, SdblType::string(), "{expression}");
+    }
+
+    for expression in [
+        "ВЫРАЗИТЬ(Т.Регистратор КАК Документ.Заказ).МоментВремени",
+        "ВЫРАЗИТЬ(Т.Регистратор КАК Документ.Заказ).PointInTime",
+    ] {
+        let (ty, _) = cast_call(Some(configuration()), expression);
+        assert_eq!(ty, SdblType::DateTime, "{expression}");
+    }
+
+    let (ty, _) = cast_call(
+        Some(configuration()),
+        "ВЫРАЗИТЬ(Т.Регистратор КАК Справочник.Контрагенты).МоментВремени",
+    );
+    assert_eq!(ty, SdblType::Unknown, "PointInTime belongs to documents only");
+
+    let (ty, _) = cast_call(
+        Some(configuration()),
+        "ВЫРАЗИТЬ(Т.Регистратор КАК Документ.Заказ).Представление.Длина",
+    );
+    assert_eq!(ty, SdblType::Unknown, "cannot traverse past a primitive virtual field");
+}
