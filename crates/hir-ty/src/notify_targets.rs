@@ -23,6 +23,7 @@ use syntax::{TextRange, TextSize};
 use vfs::FileId;
 
 use crate::body_flow::BodyFlow;
+use crate::call_resolution::{CallRejection, CallSelection};
 use crate::db::HirDatabase;
 use crate::infer::{
     infer_effective_owner_for_notify, infer_owner_for_notify, infer_weaving_owner_for_notify,
@@ -1377,8 +1378,7 @@ fn normalize_owner_candidates(
 
         let binding = bindings_by_call.get(&candidate.constructor).copied();
         let arguments = match binding {
-            Some(binding) => callback_arguments_for_binding_with_budget(binding, budget)
-                .or_else(|| partial_callback_facts.then(bundled_callback_arguments)),
+            Some(binding) => partial_callback_arguments(binding, budget, partial_callback_facts),
             None if partial_callback_facts => Some(bundled_callback_arguments()),
             None => None,
         };
@@ -1563,6 +1563,30 @@ fn receiver_syntax(body: &Body, receiver: Option<ExprId>) -> NotifyReceiverSynta
         Some(Expr::Path(name)) => NotifyReceiverSyntax::for_bare_name(name),
         _ => NotifyReceiverSyntax::Other,
     }
+}
+
+/// The served snapshot's own projection of the callback slots, falling back to the
+/// bundled compatibility slots only while the snapshot cannot project them itself.
+/// A resolver verdict that the served signature rejects the call's arity is final:
+/// the platform never executes such a constructor, so the fallback must not turn a
+/// proven-invalid call into a projected registration. `Rejected(NoCandidates)` and a
+/// missing binding mean the snapshot offered no usable facts, which is exactly the
+/// case the bundled protection exists for.
+fn partial_callback_arguments(
+    binding: &CallArgBinding,
+    budget: &mut NotifyWorkBudget<'_>,
+    partial_callback_facts: bool,
+) -> Option<CallbackArguments> {
+    let proven_arity_rejection = matches!(
+        binding.candidate.resolution.selection,
+        CallSelection::Rejected(CallRejection::Arity { .. })
+    );
+    let projected = callback_arguments_for_binding_with_budget(binding, budget);
+    if projected.is_some() || proven_arity_rejection || !partial_callback_facts {
+        return projected;
+    }
+    // A stopped projection is not "no facts"; the caller reports exhaustion.
+    (!budget.exhausted()).then(bundled_callback_arguments)
 }
 
 /// The bundled compatibility projection of callback argument positions. A served
