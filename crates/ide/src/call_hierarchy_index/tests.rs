@@ -1,16 +1,17 @@
 use std::{cell::Cell, rc::Rc};
 
-use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
+use ide_db::base_db::{FileIdInput, SourceDatabase, SourceRoot, SourceRootId};
 use vfs::{file_set::FileSet, FileId, VfsPath};
 
 use super::{
-    build_call_hierarchy_index_with_observer, BatchObserver, CallHierarchyBatchEvent,
-    CallHierarchyBatchEventKind, CallHierarchyBatchPhase, CallHierarchyIndexBuildRequest,
-    CallHierarchyIndexBuildResult,
+    build_call_hierarchy_index, build_call_hierarchy_index_with_observer,
+    reject_incomplete_notify_projection, reproject_call_hierarchy_index_modules, BatchObserver,
+    CallHierarchyBatchEvent, CallHierarchyBatchEventKind, CallHierarchyBatchPhase,
+    CallHierarchyIndexBuildError, CallHierarchyIndexBuildRequest, CallHierarchyIndexBuildResult,
 };
 use crate::graph::{run_batch_db, BatchDbRelease};
 use crate::RootDatabaseImpl;
-use hir::{MethodId, ModuleId};
+use hir::{semantic_notify_facts_with_work_limit, DefDatabase, MethodId, ModuleId};
 
 const ROOT: SourceRootId = SourceRootId(0);
 
@@ -81,17 +82,18 @@ fn fixture() -> [FixtureFile; 3] {
     ]
 }
 
-fn batch_database(files: &[FixtureFile], batch: &[ModuleId]) -> RootDatabaseImpl {
+fn batch_database(files: &[FixtureFile]) -> RootDatabaseImpl {
     let mut db = RootDatabaseImpl::new();
     let mut file_set = FileSet::new();
     for (index, file) in files.iter().enumerate() {
         file_set.insert(FileId(index as u32), VfsPath::new(file.path));
     }
     db.set_source_root(ROOT, SourceRoot::new_local(file_set));
-    for module in batch {
-        let file = files[module.file_id.0 as usize];
-        db.set_file_source_root(module.file_id, ROOT);
-        db.set_file_text(module.file_id, file.text);
+    // Inference can read a cross-module target before the index projects the call.
+    for (index, file) in files.iter().enumerate() {
+        let file_id = FileId(index as u32);
+        db.set_file_source_root(file_id, ROOT);
+        db.set_file_text(file_id, file.text);
     }
     db
 }
@@ -113,12 +115,12 @@ fn build_with_concurrency(
     let max_live = concurrency.max(1);
     let open_events = Rc::clone(&events);
     let open_live = Rc::clone(&live);
-    let mut open_batch = move |batch: &[ModuleId]| {
+    let mut open_batch = move |_batch: &[ModuleId]| {
         let live = open_live.get() + 1;
         assert!(live <= max_live, "at most {max_live} batch databases may be live, saw {live}");
         open_live.set(live);
         open_events.borrow_mut().push(ProbeEvent::Opened);
-        batch_database(&files, batch)
+        batch_database(&files)
     };
     let mut probe = Probe { events: Rc::clone(&events), live: Rc::clone(&live), cache_clears: 0 };
 
@@ -164,6 +166,129 @@ fn digest(result: &CallHierarchyIndexBuildResult) -> IndexDigest {
             .map(|method| (method, result.index.callers(method).to_vec()))
             .collect(),
     }
+}
+
+#[test]
+fn budget_truncated_notify_projection_rejects_publication_of_the_incoming_index() {
+    // Given: the same module projected twice — once under the production budget,
+    // once with the budget exhausted through the production work-limit hook, so
+    // the truncated summary is produced by the projection itself, not assembled
+    // by hand.
+    let files = fixture();
+    let db = batch_database(&files);
+    let module = ModuleId::new(FileId(0));
+
+    let complete = db.module_call_summary(module).method_pair_subset();
+    assert!(!complete.notify_projection_incomplete);
+    let truncated =
+        semantic_notify_facts_with_work_limit(&db, FileIdInput::new(&db, module.file_id), 0)
+            .summary
+            .method_pair_subset();
+    assert!(truncated.notify_projection_incomplete);
+
+    // A completed projection publishes.
+    assert!(reject_incomplete_notify_projection(&[(module, complete)]).is_ok());
+
+    // When: pass 1 retains the truncated subset.
+    let result = reject_incomplete_notify_projection(&[(module, truncated)]);
+
+    // Then: the build fails naming the module instead of serving a reverse index
+    // whose registrations were only partly read.
+    assert!(matches!(
+        result,
+        Err(CallHierarchyIndexBuildError::IncompleteNotifyProjection(found)) if found == module
+    ));
+}
+
+#[test]
+fn named_unknown_array_gaps_publish_while_only_budget_truncation_rejects() {
+    // Given: a projection whose alias analysis stops at the intentional
+    // unknown-array boundary — an array whose value depends on a branch the
+    // analysis must not guess.
+    let files = [FixtureFile {
+        path: "/src/CommonModules/Первый/Ext/Module.bsl",
+        text: "Процедура Зарегистрировать(А, Флаг)\nА.Добавить(\"Завершить\");\nА.Добавить(ЭтотОбъект);\nЕсли Флаг Тогда\nА = Новый Массив;\nА.Добавить(\"Другое\");\nА.Добавить(ЭтотОбъект);\nКонецЕсли;\nО = Новый(\"CallbackDescription\", А);\nКонецПроцедуры\n\nПроцедура Завершить(Параметр) Экспорт\nКонецПроцедуры",
+    }];
+    let db = batch_database(&files);
+    let module = ModuleId::new(FileId(0));
+    let source_summary = db.module_call_summary(module);
+    assert!(!source_summary.notify_dynamic_signature_analysis_incomplete.is_empty());
+    let summary = source_summary.method_pair_subset();
+
+    assert!(!summary.notify_projection_incomplete);
+    assert!(summary.notify_dynamic_signature_analysis_incomplete.is_empty());
+
+    // When/Then: the conservative boundary publishes; the budget marker is the
+    // only rejection trigger.
+    assert!(reject_incomplete_notify_projection(&[(module, summary)]).is_ok());
+}
+
+/// A module whose dynamic callback constructors alone drive the semantic notify
+/// projection past its capped production work budget, so `module_call_summary`
+/// reports it incomplete through the real budgeted query, with no test hook.
+fn budget_exhausting_files() -> [FixtureFile; 1] {
+    let mut text = String::from("Процедура Начать(А)\n");
+    for i in 0..20_000 {
+        text.push_str(&format!("О{i} = Новый(\"CallbackDescription\", А);\n"));
+    }
+    text.push_str("КонецПроцедуры\n\nПроцедура Завершить(Параметр) Экспорт\nКонецПроцедуры\n");
+    [FixtureFile {
+        path: "/src/CommonModules/Первый/Ext/Module.bsl",
+        text: Box::leak(text.into_boxed_str()),
+    }]
+}
+
+#[test]
+fn budget_exhausted_module_stops_the_whole_build_before_publication() {
+    // Given: a module whose dynamic callback constructors exhaust even the
+    // production budget's hard cap, so its projection is incomplete.
+    let files = budget_exhausting_files();
+    let module = ModuleId::new(FileId(0));
+
+    // When: the full build projects the module for publication.
+    let modules = [module];
+    let mut open_batch = |_batch: &[ModuleId]| batch_database(&files);
+    let result = build_call_hierarchy_index(
+        CallHierarchyIndexBuildRequest::new(&modules, 1),
+        &mut open_batch,
+    );
+
+    // Then: the build fails naming the module instead of publishing a reverse
+    // index built from partly read registrations.
+    assert!(matches!(
+        result,
+        Err(CallHierarchyIndexBuildError::IncompleteNotifyProjection(found)) if found == module
+    ));
+}
+
+#[test]
+fn budget_exhausted_module_refuses_catch_up_publication() {
+    // Given: an index built while the module stayed well inside the budget, and
+    // the same module edited until its constructors exhaust the production
+    // notify work budget's hard cap — the real catch-up shape for an edit that
+    // turns a module pathological.
+    let module = ModuleId::new(FileId(0));
+    let base_files = [FixtureFile {
+        path: "/src/CommonModules/Первый/Ext/Module.bsl",
+        text: "Процедура Начать(А)\nО = Новый(\"CallbackDescription\", А);\nКонецПроцедуры\n\nПроцедура Завершить(Параметр) Экспорт\nКонецПроцедуры",
+    }];
+    let base_db = batch_database(&base_files);
+    let mut graph_index = hir::graph_index::GraphIndex::new();
+    graph_index.add_module(&base_db, module);
+
+    let edited_files = budget_exhausting_files();
+    let mut open_batch = |_batch: &[ModuleId]| batch_database(&edited_files);
+
+    // When: catch-up reprojects the edited module.
+    let result =
+        reproject_call_hierarchy_index_modules(&graph_index, 1, &[module], &mut open_batch);
+
+    // Then: the projection is refused naming the module, so the published index
+    // is superseded instead of gaining partly read entries.
+    assert!(matches!(
+        result,
+        Err(CallHierarchyIndexBuildError::IncompleteNotifyProjection(found)) if found == module
+    ));
 }
 
 #[test]

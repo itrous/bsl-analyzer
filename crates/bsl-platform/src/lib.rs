@@ -1,4 +1,5 @@
 mod call_effects;
+pub mod callback_description;
 pub mod capability;
 mod db;
 pub mod deprecation;
@@ -25,6 +26,11 @@ pub use standard_mdo_attributes::{
 };
 
 pub use call_effects::{CallValueEffect, CallValueEffectTarget};
+pub use callback_description::{
+    bundled_callback_description_slots, callback_description_slots_for_parameters,
+    has_callback_description_constructor_facts, is_callback_description_compatibility_type_name,
+    is_callback_description_type_name, CallbackDescriptionSlots,
+};
 pub use db::{
     docs_gap_synthesized_member_types, find_prefixed_method, find_prefixed_methods,
     global_function_query, global_member_method_query, global_property_query,

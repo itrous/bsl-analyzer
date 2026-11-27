@@ -103,6 +103,7 @@ DIAGNOSTICS=(
     MissingCodeTryCatchEx
     MissingCommonModuleMethod
     MissingEventSubscriptionHandler
+    MissingNotifyHandler
     MissingParameterDescription
     MissingReturnedValueDescription
     MissingSpace

@@ -93,6 +93,10 @@ pub struct CallHierarchyIndexBuildResult {
 pub enum CallHierarchyIndexBuildError {
     #[error("failed to build the call-hierarchy rayon pool: {0}")]
     ThreadPool(#[from] rayon::ThreadPoolBuildError),
+    #[error(
+        "notify projection for module {0:?} was incomplete; refusing to publish call hierarchy"
+    )]
+    IncompleteNotifyProjection(ModuleId),
     #[error("missing layout hash for indexed module {0:?}")]
     MissingLayoutHash(ModuleId),
 }
@@ -249,6 +253,7 @@ fn build_call_hierarchy_index_with_observer(
                 &pool,
                 &mut lifecycle,
             )?;
+        reject_incomplete_notify_projection(&intents)?;
         let index = pairs::resolve_and_fold_method_pairs(
             request,
             open_batch,
@@ -279,6 +284,27 @@ fn build_call_hierarchy_index_with_observer(
         elapsed: started.elapsed(),
         estimated_heap_bytes,
     })
+}
+
+/// The incoming index is published atomically only if every module's semantic
+/// notify projection completed. A projection that stopped at its work budget
+/// (`notify_projection_incomplete`) read only part of its registrations, so no
+/// reverse index may be built from it. Returning an error lets the service mark
+/// the generation Failed, and incoming requests then remain `null` instead of
+/// serving a partial reverse index as Ready. Named unknown-array gaps
+/// (`notify_dynamic_signature_analysis_incomplete`) are an intentional
+/// conservative boundary and do not reject; the catch-up path screens
+/// reprojected modules through the same contract (see
+/// [`reproject_call_hierarchy_index_modules`]).
+fn reject_incomplete_notify_projection(
+    intents: &[(ModuleId, hir::call_graph::ModuleCallSummary)],
+) -> Result<(), CallHierarchyIndexBuildError> {
+    if let Some((module, _)) =
+        intents.iter().find(|(_, summary)| summary.notify_projection_incomplete)
+    {
+        return Err(CallHierarchyIndexBuildError::IncompleteNotifyProjection(*module));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

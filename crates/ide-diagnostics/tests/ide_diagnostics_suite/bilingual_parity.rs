@@ -21,6 +21,7 @@ const IDENTIFIER_AWARE_CODES: &[DiagnosticCode] = &[
     DiagnosticCode::IsInRoleMethod,
     DiagnosticCode::IteratorCollidesCollection,
     DiagnosticCode::MissingTempStorageDeletion,
+    DiagnosticCode::MissingNotifyHandler,
     DiagnosticCode::MissingTemporaryFileDeletion,
     DiagnosticCode::NestedConstructorsInStructureDeclaration,
     DiagnosticCode::NumberOfValuesInStructureConstructor,
@@ -828,12 +829,27 @@ EndProcedure"#,
     RollbackTransaction();
 EndProcedure"#,
     ),
+    (
+        DiagnosticCode::MissingNotifyHandler,
+        // Two registrations on each side: the English side spells the type both ways the
+        // platform accepts (`NotifyDescription`, `CallbackDescription`), so a missed spelling
+        // shows as one finding against two. The handler name is the same Latin string on both
+        // sides because the message quotes it.
+        r#"Процедура Тест()
+    Оповещение = Новый ОписаниеОповещения("Handler", ЭтотОбъект);
+    Второе = Новый ОписаниеОповещения("Handler", ЭтотОбъект);
+КонецПроцедуры"#,
+        r#"Procedure Test()
+    Notification = New NotifyDescription("Handler", ThisObject);
+    Second = New CallbackDescription("Handler", ThisObject);
+EndProcedure"#,
+    ),
 ];
 
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 230, "update the bilingual inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 231, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]

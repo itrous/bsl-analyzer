@@ -572,7 +572,11 @@ pub fn resolve_summary_via_index(
         &global_modules,
     ));
 
-    ResolvedModuleSummary { module, edges }
+    ResolvedModuleSummary {
+        module,
+        edges,
+        notify_projection_incomplete: summary.notify_projection_incomplete,
+    }
 }
 
 /// Projects a batch's resolved semantic calls to deterministic method-only pairs.
@@ -605,6 +609,41 @@ pub fn project_batch_method_call_pairs<DB: ConfigsDatabase + Clone + Send>(
     }
 
     pairs
+}
+
+/// Batch pair projection for the bounded incoming-call index (catch-up): refuse
+/// the whole batch when any module's semantic notify projection stopped at its
+/// work budget (`notify_projection_incomplete`). A partly read summary resolves
+/// to edges indistinguishable from a complete projection, so the rejection
+/// happens before any pair work. Named unknown-array gaps are an intentional
+/// conservative boundary and stay publishable, and modules unchanged since the
+/// base build were already screened by the build gate, so screening the
+/// reprojected batch is sufficient. The error names the offending module.
+pub fn project_batch_method_call_pairs_checked<DB: ConfigsDatabase + Clone + Send>(
+    pool: &rayon::ThreadPool,
+    db: &DB,
+    index: &GraphIndex,
+    batch: &[ModuleId],
+) -> Result<Vec<MethodCallPair>, ModuleId> {
+    let per_module = parallel_per_module(pool, db, batch, |db, module| {
+        let summary = db.module_call_summary(module);
+        if summary.notify_projection_incomplete {
+            return (module, true, Vec::new());
+        }
+        let resolved = resolve_summary_via_index(db, module, &summary, index);
+        (module, false, resolved_summary_method_pairs(&resolved))
+    });
+
+    if let Some((module, _, _)) = per_module.iter().find(|(_, incomplete, _)| *incomplete) {
+        return Err(*module);
+    }
+
+    let mut pairs = Vec::new();
+    let mut seen = FxHashSet::default();
+    for (_, _, module_pairs) in per_module {
+        pairs.extend(module_pairs.into_iter().filter(|pair| seen.insert(*pair)));
+    }
+    Ok(pairs)
 }
 
 /// One module's read-only extraction for the fused call-hierarchy build: its
@@ -738,6 +777,7 @@ mod method_only_call_pair_tests {
                     ResolvedTarget::Unresolved(CallTarget::Unresolved),
                 ),
             ],
+            notify_projection_incomplete: false,
         };
 
         // When: the resolved summary is projected to hierarchy pairs.
@@ -779,6 +819,7 @@ pub fn workspace_call_graph_via_index(
 
     // Pass 2: resolved call/manager edges via the index.
     for &module in modules {
+        graph.incomplete |= db.module_call_summary(module).notify_projection_incomplete;
         let summary = resolve_module_summary_via_index(db, module, index);
         let edges = {
             let dispatch = |node: &GraphNode| graph.dispatch(node);
@@ -919,6 +960,9 @@ fn reference_targets(
 /// refs gathered in the same pass (caller, target module, lowercased method).
 pub struct BatchCallProjection {
     pub edges: Vec<WorkspaceCallEdge>,
+    /// Modules whose notify edges were only partially projected because the
+    /// semantic alias walk exhausted its budget. Such a batch is not safe to persist.
+    pub notify_projection_incomplete: Vec<ModuleId>,
     pub unresolved: Vec<(ModuleId, ModuleId, String)>,
     /// Calls to a metadata-declared common module whose body file is not present in
     /// the current graph. The module name is retained so adding its BSL body can
@@ -1036,16 +1080,22 @@ pub fn project_batch_call_edges<DB: ConfigsDatabase + Clone + Send>(
     // no extra body lowering; edge projection is unchanged → edge output is identical.
     let results: Vec<_> = parallel_per_module(pool, db, batch, |db, module| {
         let summary = resolve_module_summary_via_index(db, module, index);
+        let notify_projection_incomplete =
+            db.module_call_summary(module).notify_projection_incomplete;
         let unresolved = extract_unresolved_refs(db, module, index);
         let unresolved_declared_common = extract_missing_common_module_refs(db, module);
-        (summary, unresolved, unresolved_declared_common)
+        (summary, notify_projection_incomplete, unresolved, unresolved_declared_common)
     });
 
     let mut edges = Vec::new();
+    let mut notify_projection_incomplete = Vec::new();
     let mut unresolved = Vec::new();
     let mut unresolved_declared_common = Vec::new();
     let dispatch = |node: &GraphNode| index.dispatch(node);
-    for (summary, unres, declared) in &results {
+    for (summary, incomplete, unres, declared) in &results {
+        if *incomplete {
+            notify_projection_incomplete.push(summary.module);
+        }
         edges.extend(crate::queries::project_module_call_edges(
             summary,
             &dispatch,
@@ -1056,7 +1106,12 @@ pub fn project_batch_call_edges<DB: ConfigsDatabase + Clone + Send>(
         }
         unresolved_declared_common.extend(declared.iter().cloned());
     }
-    BatchCallProjection { edges, unresolved, unresolved_declared_common }
+    BatchCallProjection {
+        edges,
+        notify_projection_incomplete,
+        unresolved,
+        unresolved_declared_common,
+    }
 }
 
 /// Keep a reverse reference for a qualified call only when its common-module

@@ -997,6 +997,36 @@ fn dataflow_writes_i09_same_point_order() {
 }
 
 #[test]
+fn dataflow_writes_point_scan_answers_what_per_name_queries_ask() {
+    // The point scan and the per-name query must partition the same events: every
+    // write either answers, under its folded key, and nothing else.
+    let f = fixture(
+        "Процедура Т(Х, У)\n    Р = F(Х, У, \"м0\");\n    Выполнить(\"м1\");\nКонецПроцедуры\n",
+    );
+    let result = f.solve();
+
+    for point in [f.point("м0"), f.point("м1")] {
+        let mut scanned: Vec<String> =
+            result.writes_at_point(point).map(|def| def.var_name.to_string()).collect();
+        let mut asked = Vec::new();
+        for name in result.events().names() {
+            for def in result.possible_writes_at(point, name) {
+                asked.push(def.var_name.to_string());
+            }
+        }
+        scanned.sort();
+        asked.sort();
+        assert_eq!(scanned, asked, "the point scan and the per-name queries agree");
+        assert!(
+            scanned.iter().all(|var| var.as_str() == var.fold_lower()),
+            "the scan hands out folded keys"
+        );
+    }
+
+    assert_eq!(result.writes_at_point(f.point("м0")).count(), 2, "F's two path arguments");
+}
+
+#[test]
 fn dataflow_writes_i10_exceptional_sources() {
     let f = fixture(
         "Процедура Т()\n    x = \"A\";\n    Попытка\n        x = F(x);\n    Исключение\n        Если x = \"м1\" Тогда КонецЕсли;\n    КонецПопытки;\n    Если x = \"м2\" Тогда КонецЕсли;\nКонецПроцедуры\n",
@@ -1096,6 +1126,29 @@ fn dataflow_writes_i05_i11_argument_events_and_names() {
 }
 
 #[test]
+fn no_executable_path_still_solves_to_a_complete_result() {
+    // `None` is the stop of the iteration, not an empty graph: a body without any
+    // executable path publishes a complete result whose states are simply unreached.
+    for source in [
+        "Процедура Т()\nКонецПроцедуры\n",
+        "Процедура Т()\n    Возврат;\n    x = \"A\";\n    Если x = \"м1\" Тогда КонецЕсли;\nКонецПроцедуры\n",
+    ] {
+        let f = fixture(source);
+        assert!(
+            solve_executable_reaching_definitions(
+                f.cfg.clone(),
+                &f.body,
+                f.events.clone(),
+                true,
+                RecoveredBody::Solve,
+            )
+            .is_some(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
 fn dataflow_writes_i12_unavailable_is_not_proof() {
     let source = "Процедура Т(Усл)\n    x = \"A\";\n    Пока Усл Цикл\n        Если x = \"м1\" Тогда КонецЕсли;\n        W(x);\n    КонецЦикла;\n    Возврат;\n    Если x = \"м2\" Тогда КонецЕсли;\nКонецПроцедуры\n";
     let f = fixture(source);
@@ -1130,7 +1183,9 @@ fn dataflow_writes_i12_unavailable_is_not_proof() {
     let Stmt::Assign { value, .. } = f.body.stmt(not_a_header) else { unreachable!() };
     assert!(published.defs_for_var_at_header("x", ExprId::from_idx(*value)).is_none());
 
-    let f = fixture("Процедура Т(Усл)\n    Если Усл Тогда\n        x = \"A\";\n    КонецЕсли;\n    Если x = \"м1\" Тогда КонецЕсли;\nКонецПроцедуры\n");
+    let f = fixture(
+        "Процедура Т(Усл)\n    Если Усл Тогда\n        x = \"A\";\n    КонецЕсли;\n    Если x = \"м1\" Тогда КонецЕсли;\nКонецПроцедуры\n",
+    );
     let published = solve_executable_reaching_definitions(
         f.cfg.clone(),
         &f.body,
@@ -1171,7 +1226,8 @@ fn dataflow_writes_i12_unavailable_is_not_proof() {
             )
         };
         assert!(solve(RecoveredBody::Refuse).is_none(), "{why} publishes nothing");
-        let kept = solve(RecoveredBody::Solve).unwrap_or_else(|| panic!("{why}: solved on request"));
+        let kept =
+            solve(RecoveredBody::Solve).unwrap_or_else(|| panic!("{why}: solved on request"));
         assert_eq!(
             f.read(&kept, "м1", "x"),
             strings(&["A"]),
@@ -1243,6 +1299,352 @@ fn dataflow_writes_i12_long_method_converges() {
         *published,
         ReachingDefsResult::from_executable(&unbounded, f.body.clone(), f.events.clone())
     );
+}
+
+/// The executable solve charges its whole work: a `Выполнить` statement's write index
+/// spends one unit per name it may assign, so a caller's budget bounds the solver even
+/// when the body itself is small.
+#[test]
+fn executable_solver_charges_its_write_index_and_execute_writes() {
+    const NAMES: usize = 8;
+    const EXECUTES: usize = 4;
+    let mut source = String::from("Процедура Т()\n");
+    for index in 0..NAMES {
+        source.push_str(&format!("    Перем A{index};\n"));
+    }
+    for _ in 0..EXECUTES {
+        source.push_str("    Выполнить(\"A0 = 1\");\n");
+    }
+    source.push_str("КонецПроцедуры\n");
+    let f = fixture(&source);
+    let names = f.events.names().len();
+    assert!(names >= NAMES, "the fixture declares its names: {names}");
+
+    let mut spent = 0usize;
+    let solved = solve_executable_reaching_definitions_with_work(
+        f.cfg.clone(),
+        &f.body,
+        f.events.clone(),
+        true,
+        RecoveredBody::Solve,
+        &mut |work| {
+            spent += work;
+            true
+        },
+    );
+    assert!(solved.is_some(), "an unlimited budget publishes the solution");
+    assert!(
+        spent >= names * EXECUTES,
+        "every Выполнить charges each name its write index may assign: spent {spent}, names {names}"
+    );
+
+    let mut remaining = spent - 1;
+    let stopped = solve_executable_reaching_definitions_with_work(
+        f.cfg.clone(),
+        &f.body,
+        f.events.clone(),
+        true,
+        RecoveredBody::Solve,
+        &mut |work| {
+            if work > remaining {
+                return false;
+            }
+            remaining -= work;
+            true
+        },
+    );
+    assert!(
+        stopped.is_none(),
+        "a budget one unit short must not publish a partial index or solution"
+    );
+}
+
+/// The hidden-write scan used to rescan every statement's tail, doing quadratic work
+/// before the solve's first budget spend. It is linear now and refuses work through
+/// the caller's budget, so a large flat body cannot bypass cancellation.
+#[test]
+fn hidden_write_scan_is_linear_and_budgeted() {
+    const STATEMENTS: usize = 512;
+    let mut source = String::from("Процедура Т()\n");
+    for _ in 0..STATEMENTS {
+        source.push_str("    А = 1;\n");
+    }
+    source.push_str("КонецПроцедуры\n");
+    let body = lower(&source);
+    let statements = body.body_stmts_typed().len();
+    assert!(statements >= STATEMENTS, "the fixture declares the body: {statements}");
+
+    let mut charges = 0usize;
+    let mut spent = 0usize;
+    let hidden = writes_hidden_on_exception_with_work(&body, &mut |work| {
+        charges += 1;
+        spent += work;
+        true
+    })
+    .expect("an unlimited budget scans the body");
+    assert!(hidden.is_empty(), "every assignment after every statement is safe");
+    assert!(
+        charges <= 4 * statements,
+        "the scan visits each statement a constant number of times: {charges} charges for {statements} statements"
+    );
+    assert!(
+        (3 * statements..=4 * statements).contains(&spent),
+        "the suffix allocation is paid before it exists and each statement costs a constant amount: {spent} work for {statements} statements"
+    );
+
+    let mut remaining = statements / 2;
+    let stopped = writes_hidden_on_exception_with_work(&body, &mut |_| {
+        if remaining == 0 {
+            return false;
+        }
+        remaining -= 1;
+        true
+    });
+    assert!(
+        stopped.is_none(),
+        "a budget below the linear scan must stop it instead of running to completion"
+    );
+}
+
+/// The full reaching-definitions solve used by a deferred notify inference charges
+/// its index, entry state and visits, so a small budget stops it instead of running
+/// the whole ordinary solve outside the projection.
+#[test]
+fn full_reaching_definitions_solve_is_budgeted() {
+    let f = fixture(&nested_loops(4, 8));
+    let mut spent = 0usize;
+    let solved = solve_reaching_definitions_with_work(
+        f.cfg.clone(),
+        &f.body,
+        f.events.clone(),
+        true,
+        &mut |work| {
+            spent += work;
+            true
+        },
+    );
+    assert!(solved.is_some(), "an unlimited budget solves the body");
+    assert!(spent > 0, "the full solve reports its work");
+
+    let mut remaining = spent / 2;
+    let stopped = solve_reaching_definitions_with_work(
+        f.cfg.clone(),
+        &f.body,
+        f.events.clone(),
+        true,
+        &mut |work| {
+            if work > remaining {
+                return false;
+            }
+            remaining -= work;
+            true
+        },
+    );
+    assert!(
+        stopped.is_none(),
+        "a budget below the full solve must stop it instead of publishing a partial result"
+    );
+}
+
+/// The bottom states of every block are charged before they are built: a budget
+/// that ends right after the entry state stops the solve before any of them is
+/// allocated, instead of letting the seeding run outside the meter.
+#[test]
+fn bottom_seeding_is_charged_before_allocation() {
+    const DECLARATIONS: usize = 300;
+    let mut source = String::from("Процедура Т(Усл)\n");
+    for index in 0..DECLARATIONS {
+        source.push_str(&format!("    Перем A{index};\n"));
+    }
+    source.push_str("    Если Усл Тогда\n        A0 = 1;\n    КонецЕсли;\nКонецПроцедуры\n");
+    let f = fixture(&source);
+    let blocks = f.cfg.vertex_count();
+    let params = params_of(&f.body, true).len();
+    let bottom_words = f.index.len().div_ceil(usize::BITS as usize);
+    assert!(blocks >= 2, "the fixture declares a branching body: {blocks}");
+    assert!(bottom_words > 1, "the fixture declares enough definitions: {bottom_words}");
+
+    let mut index_work = 0usize;
+    DefinitionIndex::from_body_with_params_with_work(
+        &f.body,
+        &f.events,
+        params_of(&f.body, true),
+        &mut |work| {
+            index_work += work;
+            true
+        },
+    );
+
+    let mut spent = 0usize;
+    let solved = solve_reaching_definitions_with_work(
+        f.cfg.clone(),
+        &f.body,
+        f.events.clone(),
+        true,
+        &mut |work| {
+            spent += work;
+            true
+        },
+    );
+    assert!(solved.is_some(), "an unlimited budget solves the body");
+    assert!(
+        spent >= index_work + params + 2 * blocks * bottom_words,
+        "the unlimited solve pays for both bottom states of every block: spent {spent}"
+    );
+
+    // The budget ends exactly where the entry state ends: the next charge is
+    // the first bottom state, so the solve refuses and charges nothing more.
+    let before_seeding = index_work + params;
+    let (stopped, accepted) = solve_within(before_seeding, &f);
+    assert!(stopped.is_none(), "a budget that ends with the entry state must stop the solve");
+    assert_eq!(accepted, before_seeding, "nothing past the entry state was charged");
+
+    // One more unit bought the first block visit before the metering; a bottom
+    // state of a wide index costs more than one, so it still buys nothing.
+    let (stopped, accepted) = solve_within(before_seeding + 1, &f);
+    assert!(stopped.is_none(), "a budget inside the seeding must stop the solve");
+    assert_eq!(accepted, before_seeding, "the extra unit must not buy a bottom state");
+}
+
+/// Runs the metered solve with a budget of exactly `budget` units and reports
+/// the published result (if any) with the work it accepted.
+fn solve_within(budget: usize, f: &Fixture) -> (Option<Arc<ReachingDefsResult>>, usize) {
+    let mut remaining = budget;
+    let mut accepted = 0usize;
+    let stopped = solve_reaching_definitions_with_work(
+        f.cfg.clone(),
+        &f.body,
+        f.events.clone(),
+        true,
+        &mut |work| {
+            if work > remaining {
+                return false;
+            }
+            remaining -= work;
+            accepted += work;
+            true
+        },
+    );
+    (stopped, accepted)
+}
+
+/// The write index charges every root, call and argument it visits, including an
+/// argument that is not a bare name and so yields no write event.
+#[test]
+fn definition_index_charges_every_root_call_and_argument() {
+    let source = "Процедура Т()\n    Ф(1, 2, 3);\nКонецПроцедуры\n";
+    let body = lower(source);
+    let events = Arc::new(BodyEvents::collect(&body));
+    let mut charges = 0usize;
+    let index = DefinitionIndex::from_body_with_params_with_work(
+        &body,
+        &events,
+        params_of(&body, true),
+        &mut |_| {
+            charges += 1;
+            true
+        },
+    )
+    .expect("an unlimited budget indexes the body");
+    assert_eq!(index.len(), 1, "the call itself contributes no definition");
+    assert!(
+        charges >= 1 + 1 + 1 + 3,
+        "statement, root, call and all three literal arguments are charged: {charges}"
+    );
+}
+
+/// `Выполнить` may assign every name of the body; each assigned name reaches the
+/// budget separately, so a large name set checks cancellation throughout the loop
+/// instead of once before it.
+#[test]
+fn execute_write_index_spends_for_each_name() {
+    const NAMES: usize = 32;
+    let mut source = String::from("Процедура Т()\n");
+    for index in 0..NAMES {
+        source.push_str(&format!("    Перем A{index};\n"));
+    }
+    source.push_str("    Выполнить(\"A0 = 1\");\nКонецПроцедуры\n");
+    let body = lower(&source);
+    let events = Arc::new(BodyEvents::collect(&body));
+    let mut charges = 0usize;
+    DefinitionIndex::from_body_with_params_with_work(
+        &body,
+        &events,
+        params_of(&body, true),
+        &mut |_| {
+            charges += 1;
+            true
+        },
+    )
+    .expect("an unlimited budget indexes the body");
+    assert!(
+        charges >= 2 * NAMES,
+        "the execute loop charges each assigned name: {charges} charges for {NAMES} names"
+    );
+}
+
+/// Repeated visits of loop blocks and the state merges between them are charged
+/// beyond the one-time index and entry state, so a budget that covers the index
+/// cannot buy an unbounded solve.
+#[test]
+fn executable_solver_charges_repeated_transfers_and_merges() {
+    let f = fixture(&nested_loops(4, 8));
+    let params = params_of(&f.body, true);
+    let mut index_work = 0usize;
+    let index = DefinitionIndex::from_body_with_params_with_work(
+        &f.body,
+        &f.events,
+        params.iter().cloned(),
+        &mut |work| {
+            index_work += work;
+            true
+        },
+    )
+    .expect("an unlimited budget indexes the body");
+    let mut entry_work = 0usize;
+    entry_definitions_with_work(&index, &f.events, &params, &mut |work| {
+        entry_work += work;
+        true
+    })
+    .expect("an unlimited budget seeds the entry state");
+    let pre_solve = index_work + entry_work;
+
+    let mut spent = 0usize;
+    solve_executable_reaching_definitions_with_work(
+        f.cfg.clone(),
+        &f.body,
+        f.events.clone(),
+        true,
+        RecoveredBody::Solve,
+        &mut |work| {
+            spent += work;
+            true
+        },
+    )
+    .expect("an unlimited budget solves the loop body");
+    let statements = f.body.body_stmts_typed().len();
+    assert!(
+        spent - pre_solve >= statements,
+        "each transferred statement is charged: {} solver work for {statements} statements",
+        spent - pre_solve
+    );
+
+    let mut remaining = pre_solve + (spent - pre_solve) / 2;
+    let stopped = solve_executable_reaching_definitions_with_work(
+        f.cfg.clone(),
+        &f.body,
+        f.events.clone(),
+        true,
+        RecoveredBody::Solve,
+        &mut |work| {
+            if work > remaining {
+                return false;
+            }
+            remaining -= work;
+            true
+        },
+    );
+    assert!(stopped.is_none(), "a budget above the index but below the repeated solve must stop");
 }
 
 /// A write followed only by assignments that cannot raise is not on any path into the handler.

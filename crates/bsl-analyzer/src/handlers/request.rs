@@ -24,6 +24,7 @@ use lsp_types::{
 };
 use rustc_hash::FxHashMap;
 use salsa::Database as _;
+use std::fmt;
 use vfs::FileId;
 
 use crate::call_hierarchy_index_state::{
@@ -34,6 +35,30 @@ use crate::global_state::{GlobalStateSnapshot, Task};
 
 const CALL_HIERARCHY_CANCELLATION_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(10);
+
+#[derive(Debug)]
+pub(crate) struct IncompleteDiagnosticsError(ide::DiagnosticsIncompleteReason);
+
+impl IncompleteDiagnosticsError {
+    pub(crate) fn new(reason: ide::DiagnosticsIncompleteReason) -> Self {
+        Self(reason)
+    }
+}
+
+impl fmt::Display for IncompleteDiagnosticsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "diagnostics are incomplete: {:?}", self.0)
+    }
+}
+
+impl std::error::Error for IncompleteDiagnosticsError {}
+
+fn require_complete_diagnostics(result: &ide::DiagnosticsResult) -> Result<()> {
+    if let Some(reason) = result.completeness.incomplete_reason() {
+        return Err(anyhow::Error::new(IncompleteDiagnosticsError::new(reason)));
+    }
+    Ok(())
+}
 
 pub fn handle_goto_definition(
     ctx: &LatencyRequestContext,
@@ -684,7 +709,17 @@ pub fn handle_call_hierarchy_outgoing(
         ctx.position_encoding,
     )?;
 
-    let calls = ctx.analysis.call_hierarchy_outgoing(file_id, offset.into());
+    // `None` from the analysis means the anchor module's semantic notify projection
+    // stopped at its work budget: the answer is withheld rather than served as
+    // complete, mirroring the incoming handler's null-over-partial contract.
+    let Some(calls) = ctx.analysis.call_hierarchy_outgoing(file_id, offset.into()) else {
+        tracing::debug!(
+            uri = %item.uri,
+            null_reason = "notify_projection_incomplete",
+            "call hierarchy outgoing returned null"
+        );
+        return Ok(None);
+    };
     if calls.is_empty() {
         return Ok(None);
     }
@@ -1584,7 +1619,9 @@ pub fn handle_document_diagnostic(
             && crate::diagnostics_baseline::defers_scope_line_gate(&ctx.diagnostics_baseline, true)
     });
     config.defer_scope_line_gate = late_scope.is_some();
-    let ide_diagnostics = ctx.analysis.file_diagnostics_cached(file_id, config);
+    let result = ctx.analysis.file_diagnostics_result_cached(file_id, config);
+    require_complete_diagnostics(&result)?;
+    let ide_diagnostics = &result.diagnostics;
     let text = match ctx.mem_docs.get(&uri) {
         Some(doc) => std::borrow::Cow::Borrowed(doc.text()),
         None => std::borrow::Cow::Owned(ctx.analysis.file_text(file_id).to_string()),
@@ -1596,7 +1633,7 @@ pub fn handle_document_diagnostic(
         ctx.workspace_root.as_deref(),
         path.as_deref(),
         &text,
-        ide_diagnostics.iter().cloned().collect(),
+        ide_diagnostics.to_vec(),
         late_scope.as_deref(),
     );
     let result_id = crate::lsp::diagnostics_result_id(&ide_diagnostics);
@@ -1866,13 +1903,24 @@ pub fn handle_workspace_diagnostic(
             computed.extend(ctx.analysis.workspace_diagnostics(&dirty, unscoped));
             computed
         };
+        if let Some((_, result)) =
+            computed.iter().find(|(_, result)| result.completeness.incomplete_reason().is_some())
+        {
+            require_complete_diagnostics(result)?;
+        }
         let chunk_items: Vec<_> = computed
             .into_iter()
-            .filter_map(|(file_id, diagnostics)| {
+            .filter_map(|(file_id, result)| {
                 // Each file is projected through the scope it was computed under: a dirty
                 // one has none, so the shared scope must not reach it here either.
                 let late_scope = late_scope.filter(|_| !dirty_ids.contains(&file_id));
-                workspace_report_item(ctx, file_id, diagnostics.to_vec(), &previous, late_scope)
+                workspace_report_item(
+                    ctx,
+                    file_id,
+                    result.diagnostics.clone(),
+                    &previous,
+                    late_scope,
+                )
             })
             .collect();
         done += chunk.len();

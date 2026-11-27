@@ -91,8 +91,33 @@ fn different_local_and_explicit_binding_remain_locals_and_renameable() {
         assert!(mismatches(&db, file).is_empty());
         let analysis = Analysis::from_database(db);
         let offset = source.find(&format!("{name} =")).unwrap() as u32;
-        let hover = analysis.hover(file, offset, ide::Locale::Ru).expect("local hover");
-        assert!(hover.markup.contains("ЭлементСпискаЗначений"), "{}", hover.markup);
+        let read =
+            source.find(&format!("Сообщить({name})")).unwrap() as u32 + "Сообщить(".len() as u32;
+        if declaration.is_empty() {
+            // A managed form's implicit member surface is never attested complete, even
+            // with bundled facts, so an undeclared write target may still be a form
+            // member. The write token therefore stays an indeterminate bare name by
+            // design — the verdict the accepted corpus numbers were measured with — and
+            // not a lost check: the read side below still proves what the assignment
+            // holds, and the name stays renameable.
+            assert!(
+                analysis.hover(file, offset, ide::Locale::Ru).is_none(),
+                "an unattested form surface cannot prove a local whose write may be a member"
+            );
+        } else {
+            // An explicitly declared local is a local at its write token, but the write
+            // itself carries no flow type: inference types the read off the assignment.
+            // The read assertion below is what proves the assigned type.
+            let hover =
+                analysis.hover(file, offset, ide::Locale::Ru).expect("declared local hover");
+            assert!(
+                hover.markup.contains("Локальная переменная ТекущийЭлемент"),
+                "{}",
+                hover.markup
+            );
+        }
+        let read_hover = analysis.hover(file, read, ide::Locale::Ru).expect("local read hover");
+        assert!(read_hover.markup.contains("ЭлементСпискаЗначений"), "{}", read_hover.markup);
         assert!(analysis.prepare_rename(file, offset).is_some());
         assert_eq!(
             analysis.rename(file, offset, "Выбор").unwrap().len(),

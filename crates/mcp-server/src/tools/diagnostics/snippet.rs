@@ -360,7 +360,11 @@ pub(crate) fn findings(
     // changed lines of real files, and the snippet's lines are in none of them.
     let mut config = resident.config().clone();
     config.scope = None;
-    let diagnostics = analysis.diagnostics(file_id, &config);
+    let result = analysis.diagnostics_result(file_id, &config);
+    // A bounded rule projection that hit its work limit yields a subset of the host's
+    // findings; the answer must not read as a complete verdict on the code.
+    let analysis_incomplete = result.completeness.incomplete_reason().is_some();
+    let diagnostics = result.diagnostics;
 
     let snippet = prepared.snippet;
     let explicitly_asked = |code: DiagnosticCode| filters.codes.iter().any(|c| c == code.as_str());
@@ -423,6 +427,11 @@ pub(crate) fn findings(
         fit_diagnostics_response_budget(&mut body, filters.max_output_tokens, "findings")
             || budget_exhausted;
     let completeness = loc::Completeness::complete()
+        .when(
+            analysis_incomplete,
+            loc::ReasonCode::ModalityDegraded,
+            "the notify projection hit its work limit; some rules did not contribute",
+        )
         .when(
             budget_exhausted,
             loc::ReasonCode::OutputBudget,

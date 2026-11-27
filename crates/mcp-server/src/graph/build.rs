@@ -713,8 +713,17 @@ impl GraphState {
         // A topology change re-shapes visibility for ANY module even when only
         // `.bsl` bodies drifted on disk — never body-patch across it.
         match self.store.read(Some(base), wait, |snapshot| snapshot.graph.freshness_token()) {
-            Ok(Ok((_, stored_token, _))) if stored_token.topology == project.portable_topology => {}
+            Ok(Ok((_, stored_token, _)))
+                if stored_token.topology == project.portable_topology
+                    && stored_token.platform_help
+                        == bsl_platform::PlatformDataInner::instance().snapshot_fingerprint() => {}
             Err(_) => return self.note_incremental("published_graph_moved"),
+            Ok(Ok((_, stored_token, _)))
+                if stored_token.platform_help
+                    != bsl_platform::PlatformDataInner::instance().snapshot_fingerprint() =>
+            {
+                return self.note_incremental("platform_help_changed");
+            }
             _ => return self.note_incremental("topology_moved"),
         }
         let pre = crate::graph::universe::ScannedUniverse::scan_project(&project);
@@ -1395,6 +1404,14 @@ impl GraphState {
             );
             return PublishAttemptOutcome::FallBack;
         }
+        if fingerprint.platform_help != fp_now.platform_help {
+            tracing::warn!(
+                stored = fingerprint.platform_help,
+                current = fp_now.platform_help,
+                "cached graph database was built for a different platform-help snapshot; rebuilding"
+            );
+            return PublishAttemptOutcome::FallBack;
+        }
         if fingerprint.files != fp_now.files {
             tracing::warn!(
                 stored = fingerprint.files,
@@ -1494,16 +1511,32 @@ impl GraphState {
         // One look at the file answers the token, the topology and the size together.
         let Ok(inspected) = self.inspect_unpublished(|graph| {
             graph.freshness_token().map(|token| {
-                (token, super::scan::graph_matches_live_project(graph, &project), graph.files())
+                (
+                    token,
+                    super::scan::graph_matches_live_project(graph, &project),
+                    super::scan::graph_matches_platform_help(graph),
+                    graph.files(),
+                )
             })
         }) else {
             return PublishAttemptOutcome::FallBack; // missing, truncated, or stale-schema → full rebuild
         };
-        let Ok(((revision, fingerprint, force_stale), matches_live_project, files)) = inspected
+        let Ok((
+            (revision, fingerprint, force_stale),
+            matches_live_project,
+            matches_platform_help,
+            files,
+        )) = inspected
         else {
             return PublishAttemptOutcome::FallBack;
         };
         if force_stale {
+            return PublishAttemptOutcome::FallBack;
+        }
+        if !matches_platform_help {
+            tracing::info!(
+                "cached graph database was built for another platform-help snapshot; rebuilding instead of serving it stale"
+            );
             return PublishAttemptOutcome::FallBack;
         }
         // Stale on FILES is what this path exists to serve — stale on TOPOLOGY is not. A build
@@ -2242,6 +2275,11 @@ fn build_candidate(
         )
         .map_err(LoadFailure::operation)?;
         conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('platform_help_fp', ?1)",
+            rusqlite::params![fp_publish.platform_help.to_string()],
+        )
+        .map_err(LoadFailure::operation)?;
+        conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('files', ?1)",
             rusqlite::params![summary.modules.to_string()],
         )
@@ -2415,6 +2453,7 @@ fn resume_pending_full_candidate(
                 ("revision", generation.to_string()),
                 ("fingerprint", fingerprint.files.to_string()),
                 ("topology_fp", fingerprint.topology.to_string()),
+                ("platform_help_fp", fingerprint.platform_help.to_string()),
                 ("force_stale", "0".to_owned()),
                 ("publication_id", graph.next_publication_id()),
             ] {
@@ -3268,6 +3307,7 @@ fn apply_patch_candidate_inner(
                             ("revision", meta.revision.to_string()),
                             ("fingerprint", caught_up_fingerprint.files.to_string()),
                             ("topology_fp", caught_up_fingerprint.topology.to_string()),
+                            ("platform_help_fp", caught_up_fingerprint.platform_help.to_string()),
                             ("force_stale", "0".to_owned()),
                             ("publication_id", graph.next_publication_id()),
                         ] {
@@ -9167,6 +9207,170 @@ extensions = [
         );
     }
 
+    /// Child-process half of the none → auto persistence test. The first process writes a
+    /// graph with the disabled help snapshot; the second process starts with auto's bundled
+    /// fallback and must reject that graph for a full projection.
+    #[test]
+    fn platform_help_cache_probe() {
+        let Ok(mode) = std::env::var("BSL_TEST_PLATFORM_HELP_CACHE_MODE") else { return };
+        let root = std::path::PathBuf::from(
+            std::env::var_os("BSL_TEST_PLATFORM_HELP_CACHE_ROOT").expect("test root is set"),
+        );
+        let help = match mode.as_str() {
+            "none" => bsl_platform::PlatformHelp::missing(
+                bsl_platform::PlatformHelpRequest::None,
+                "test disabled source",
+            ),
+            "auto" => {
+                bsl_platform::PlatformHelp::bundled(bsl_platform::PlatformHelpRequest::Auto, None)
+            }
+            _ => panic!("unknown test mode: {mode}"),
+        };
+        bsl_platform::install_platform_help(help).expect("first help snapshot installs");
+
+        match mode.as_str() {
+            "none" => {
+                fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+                write_common_module(
+                    &root,
+                    "Обработчики",
+                    false,
+                    r#"&НаКлиенте
+Процедура ПослеЗакрытия(Результат, Параметры) Экспорт
+КонецПроцедуры"#,
+                );
+                write_common_module(
+                    &root,
+                    "Регистрация",
+                    false,
+                    r#"&НаКлиенте
+Процедура Создать() Экспорт
+Описание = Новый ОписаниеОповещения("ПослеЗакрытия", Обработчики);
+КонецПроцедуры"#,
+                );
+                let fingerprint = workspace_fingerprint(&root);
+                seed_cache(&root, fingerprint);
+                // Make the cache stale on source files without changing project topology.
+                write_common_module(
+                    &root,
+                    "Регистрация",
+                    false,
+                    r#"&НаКлиенте
+Процедура Создать() Экспорт
+Описание = Новый ОписаниеОповещения("ПослеЗакрытия", Обработчики);
+Переменная = 1;
+КонецПроцедуры"#,
+                );
+                let (_, edges, _, _) = dump_data(&graph_db_path(&root));
+                assert!(
+                    edges.iter().all(|edge| !edge.contains("Text(\"notify_ref\")")),
+                    "none should preserve the no-help NotifyRef behavior: {edges:?}"
+                );
+            }
+            "auto" => {
+                let active = bsl_platform::PlatformDataInner::instance().snapshot_fingerprint();
+                let none = bsl_platform::PlatformDataInner::from_help(
+                    bsl_platform::PlatformHelp::missing(
+                        bsl_platform::PlatformHelpRequest::None,
+                        "test disabled source",
+                    ),
+                )
+                .snapshot_fingerprint();
+                assert_ne!(none, active, "auto's served facts differ from none");
+                let stale_graph = GraphState::for_workspace(root.clone());
+                assert!(
+                    matches!(
+                        stale_graph.try_publish_stale_and_catch_up(&root),
+                        PublishAttemptOutcome::FallBack
+                    ),
+                    "the stale path must reject a none-built graph under auto"
+                );
+                assert!(
+                    stale_graph.snapshot().is_none(),
+                    "the incompatible stale graph was served"
+                );
+
+                let graph = GraphState::for_workspace(root.clone());
+                assert!(
+                    matches!(graph.try_publish_cached(&root, 0), PublishAttemptOutcome::FallBack),
+                    "a none-built cache must not be reused by an auto snapshot"
+                );
+
+                // A source-stale cache built with the current help snapshot remains eligible.
+                let compatible_root = root.join("compatible-stale");
+                fs::create_dir_all(&compatible_root).unwrap();
+                fs::write(compatible_root.join("Configuration.xml"), "<Configuration/>").unwrap();
+                write_common_module(
+                    &compatible_root,
+                    "Module",
+                    false,
+                    "Процедура A()\nКонецПроцедуры",
+                );
+                seed_cache(&compatible_root, workspace_fingerprint(&compatible_root));
+                write_common_module(
+                    &compatible_root,
+                    "Module",
+                    false,
+                    "Процедура A()\nПеременная = 1;\nКонецПроцедуры",
+                );
+                let compatible_graph = GraphState::for_workspace(compatible_root.clone());
+                assert!(
+                    matches!(
+                        compatible_graph.try_publish_stale_and_catch_up(&compatible_root),
+                        PublishAttemptOutcome::Published
+                    ),
+                    "a file-stale graph with a matching platform-help snapshot remains servable"
+                );
+
+                // Exercise the real graph projector after cache rejection, using exactly the
+                // same source files. The newly published projection must now contain the edge.
+                let out = graph_db_path(&root);
+                fs::remove_file(&out).unwrap();
+                let fingerprint = workspace_fingerprint(&root);
+                let meta = crate::graph_db::GraphMeta {
+                    revision: 8,
+                    fingerprint,
+                    files: 2,
+                    built_at: "none-to-auto-rebuild".to_owned(),
+                    publication_id: "none-to-auto-rebuild".to_owned(),
+                };
+                build_whole_graph(&root, &out, 1, &meta).expect("the full rebuild succeeds");
+                let token = GraphDb::open(&out).unwrap().freshness_token().unwrap().1;
+                assert_eq!(token.platform_help, active);
+                let (_, edges, _, _) = dump_data(&out);
+                assert!(
+                    edges.iter().any(|edge| edge.contains("Text(\"notify_ref\")")),
+                    "auto's rebuilt graph contains the notification reference: {edges:?}"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// A help-source switch across process restarts changes the persisted content fingerprint
+    /// even when project files and extension topology are identical, so the old graph is rebuilt.
+    #[test]
+    fn none_to_auto_invalidates_cached_graph_across_process_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let executable = std::env::current_exe().unwrap();
+        for mode in ["none", "auto"] {
+            let output = std::process::Command::new(&executable)
+                .arg("platform_help_cache_probe")
+                .arg("--nocapture")
+                .env("BSL_TEST_PLATFORM_HELP_CACHE_MODE", mode)
+                .env("BSL_TEST_PLATFORM_HELP_CACHE_ROOT", root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode} child failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
     /// A cached on-disk graph built under one dependency graph is dead the moment the
     /// declared topology changes, even though not one indexed file moved.
     #[test]
@@ -9645,6 +9849,57 @@ extensions = [
             completeness.is_complete(),
             "an uncut answer is complete: {}",
             completeness.to_value()
+        );
+    }
+
+    #[test]
+    fn a_cross_batch_callback_registration_resolves_its_external_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        write_common_module(
+            root,
+            "Обработчики",
+            false,
+            "&НаКлиенте\nПроцедура ПослеЗакрытия(Результат, Параметры) Экспорт\nКонецПроцедуры",
+        );
+        write_common_module(
+            root,
+            "Регистрация",
+            false,
+            "&НаКлиенте\nПроцедура Создать() Экспорт\n\
+             Описание = Новый ОписаниеОповещения(\"ПослеЗакрытия\", Обработчики);\n\
+             КонецПроцедуры",
+        );
+
+        let project = crate::graph::ProjectSnapshot::load(root);
+        let universe = crate::graph::universe::ScannedUniverse::scan_project(&project);
+        assert_eq!(universe.files.len(), 2, "the stand has exactly two BSL modules");
+        let out = root.join(".build/cross-batch-callback.db");
+        fs::create_dir_all(out.parent().unwrap()).unwrap();
+        crate::graph_db::build_graph_database(
+            &project,
+            &universe,
+            &out,
+            stdx::batch::BatchBudget::files(1),
+            &crate::graph_db::GraphMeta {
+                revision: 1,
+                fingerprint: crate::graph_db::GraphFp::default(),
+                files: 0,
+                built_at: "t".to_owned(),
+                publication_id: "cross-batch-callback".to_owned(),
+            },
+        )
+        .expect("the callback registration builds in a separate batch from its target");
+
+        let (_, edges, _, _) = dump_data(&out);
+        assert!(
+            edges.iter().any(|edge| {
+                edge.contains("method/common/Регистрация/Создать")
+                    && edge.contains("method/common/Обработчики/ПослеЗакрытия")
+                    && edge.contains("Text(\"notify_ref\")")
+            }),
+            "the actual callback registration resolves its cross-batch handler: {edges:?}",
         );
     }
 
@@ -11952,6 +12207,7 @@ mod form_twin_tests {
         .expect("existing catalog attribute edit is a local owner delta");
         let semantic_hash = crate::graph::scan::xml_semantic_hash_file(&metadata_path)
             .map(|hash| u64::from_le_bytes(hash[..8].try_into().expect("blake3 hash >= 8 bytes")));
+        // Separate the form modules from the representative to exercise frozen cross-batch reads.
         let patch = crate::graph_db::compute_body_patch_with_metadata(
             &project,
             &universe,
@@ -11961,7 +12217,7 @@ mod form_twin_tests {
             &owners,
             &forms,
             &[(metadata_path.clone(), semantic_hash)],
-            GRAPH_BUILD_BATCH,
+            stdx::batch::BatchBudget::files(1),
         )
         .unwrap();
         assert!(
@@ -12758,22 +13014,27 @@ mod cache_refusal_tests {
     }
 
     #[test]
-    fn an_older_schema_names_found_and_expected_and_is_rebuilt() {
+    fn a_b0_schema_cache_is_rebuilt_before_serving() {
+        const B0_SCHEMA_VERSION: u32 = 25;
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let db = seeded(root);
         let expected = crate::graph_db::SCHEMA_VERSION;
-        let found = expected - 1;
-        edit_meta(&db, &format!("UPDATE meta SET value = '{found}' WHERE key = 'schema_version'"));
+        assert!(expected > B0_SCHEMA_VERSION);
+        edit_meta(
+            &db,
+            &format!("UPDATE meta SET value = '{B0_SCHEMA_VERSION}' WHERE key = 'schema_version'"),
+        );
 
         let (graph, lines) = load(root);
 
         let refusal = refusal(&lines);
         assert!(
-            refusal.contains(&format!("schema_version {found} != expected {expected}")),
+            refusal.contains(&format!("schema_version {B0_SCHEMA_VERSION} != expected {expected}")),
             "{refusal}"
         );
-        assert_eq!(served_generation(&graph), Some(1), "the old format was not rebuilt");
+        assert_eq!(served_generation(&graph), Some(1), "the B0 cache was not rebuilt");
         assert_eq!(meta_string(&db, "schema_version"), expected.to_string());
     }
 

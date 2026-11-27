@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use base_db::{SourceDatabase, SourceRoot, SourceRootId};
+use base_db::{FrozenFileContentSnapshot, SourceDatabase, SourceRoot, SourceRootId};
 use ide::{GraphConfigCache, ModuleId, RootDatabaseImpl};
 use lsp_types::Url;
 use rustc_hash::FxHashMap;
@@ -22,6 +22,7 @@ pub struct CallHierarchyIndexFrozenSnapshot {
     pub configs: Arc<ide::WorkspaceConfigsSnapshot>,
     pub creation_generation: u64,
     source_root: SourceRoot,
+    file_content: Arc<FrozenFileContentSnapshot>,
     config_cache: Arc<GraphConfigCache>,
 }
 
@@ -45,10 +46,14 @@ impl CallHierarchyIndexFrozenSnapshot {
             })
             .collect();
         let open_texts = Self::open_texts(&file_set, mem_docs);
-        let disk_revisions = file_set
+        let disk_revisions: FxHashMap<_, _> = file_set
             .keys()
             .map(|&file_id| (file_id, db.file_revision_input(file_id).revision(db)))
             .collect();
+        let file_content = Arc::new(FrozenFileContentSnapshot::new(
+            Arc::new(disk_revisions.clone()),
+            Arc::new(open_texts.clone()),
+        ));
         Self {
             disk_read,
             source_root_id,
@@ -58,6 +63,7 @@ impl CallHierarchyIndexFrozenSnapshot {
             configs: db.workspace_configs_snapshot(),
             creation_generation,
             source_root,
+            file_content,
             config_cache: Arc::new(GraphConfigCache::default()),
         }
     }
@@ -71,6 +77,10 @@ impl CallHierarchyIndexFrozenSnapshot {
     }
 
     fn materialize_with_open_texts(&self, open_texts: Arc<FxHashMap<FileId, Arc<str>>>) -> Self {
+        let file_content = Arc::new(FrozenFileContentSnapshot::new(
+            Arc::clone(&self.disk_revisions),
+            Arc::clone(&open_texts),
+        ));
         Self {
             disk_read: self.disk_read.clone(),
             source_root_id: self.source_root_id,
@@ -80,6 +90,7 @@ impl CallHierarchyIndexFrozenSnapshot {
             configs: Arc::clone(&self.configs),
             creation_generation: self.creation_generation,
             source_root: self.source_root.clone(),
+            file_content,
             config_cache: Arc::clone(&self.config_cache),
         }
     }
@@ -109,31 +120,36 @@ impl CallHierarchyIndexFrozenSnapshot {
         self.disk_read.register_cancel(db.cancellation_token());
         db.set_graph_config_cache(Arc::clone(&self.config_cache));
         db.set_source_root(self.source_root_id, self.source_root.clone());
+        db.set_file_source_root_fallback(self.source_root_id);
+        db.set_frozen_file_content(Arc::clone(&self.file_content));
+        db.set_workspace_configs_snapshot((*self.configs).clone());
 
-        let mut batch_files = Vec::with_capacity(batch.len());
-        for module in batch {
-            let file_id = module.file_id;
-            let Some(path) = self.file_set.get(&file_id) else {
-                continue;
-            };
+        let batch_files = self.register_files(&mut db, batch.iter().map(|module| module.file_id));
+        ide::warm_batch_config_roots(&db, &batch_files);
+        db
+    }
+
+    fn register_files(
+        &self,
+        db: &mut RootDatabaseImpl,
+        file_ids: impl IntoIterator<Item = FileId>,
+    ) -> Vec<(FileId, PathBuf)> {
+        let mut files = Vec::new();
+        for file_id in file_ids {
+            let Some(path) = self.file_set.get(&file_id) else { continue };
             db.set_file_source_root(file_id, self.source_root_id);
             if let Some(text) = self.open_texts.get(&file_id) {
                 db.set_file_text(file_id, text.as_ref());
             } else if let Some(revision) = self.disk_revisions.get(&file_id) {
                 db.set_file_revision_from_disk(file_id, *revision);
             } else {
-                // Not a read failure: the overlay simply holds neither an open buffer
-                // nor a disk revision for this file, so its content is unknown rather
-                // than unreadable. Marking it unread would assert a cause nobody
-                // established.
+                // The snapshot has neither an open buffer nor a disk revision for
+                // this file, so its content is unknown rather than unreadable.
                 db.set_file_text(file_id, "");
             }
-            batch_files.push((file_id, path.clone()));
+            files.push((file_id, path.clone()));
         }
-
-        db.set_workspace_configs_snapshot((*self.configs).clone());
-        ide::warm_batch_config_roots(&db, &batch_files);
-        db
+        files
     }
 
     pub fn freeze_config_inputs(&self) {

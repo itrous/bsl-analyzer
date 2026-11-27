@@ -322,6 +322,62 @@ fn bench_validate_no_change(c: &mut Criterion) {
     group.finish();
 }
 
+fn setup_notify_summary_db(num_registrations: u32) -> RootDatabaseImpl {
+    use std::fmt::Write;
+
+    let mut db = RootDatabaseImpl::new();
+    let file_id = FileId(0);
+    let mut file_set = FileSet::new();
+    file_set.insert(file_id, VfsPath::new("/test/CommonModules/Caller/Ext/Module.bsl"));
+    db.set_source_root(
+        ide_db::base_db::SourceRootId(0),
+        ide_db::base_db::SourceRoot::new_local(file_set),
+    );
+    db.set_file_source_root(file_id, ide_db::base_db::SourceRootId(0));
+
+    let mut source = String::with_capacity(num_registrations as usize * 88);
+    source.push_str("Процедура Тест()");
+    source.push('\n');
+    for index in 0..num_registrations {
+        writeln!(
+            source,
+            r#"    Оповещение{index} = Новый ОписаниеОповещения("Обработать{index}", ЭтотОбъект);"#
+        )
+        .expect("write registration source");
+    }
+    source.push_str("КонецПроцедуры");
+    source.push('\n');
+    db.set_file_text(file_id, &source);
+    db
+}
+
+fn bench_notify_summary_4800(c: &mut Criterion) {
+    use criterion::BatchSize;
+
+    const FILE: FileId = FileId(0);
+    let module = hir::ModuleId::new(FILE);
+
+    c.bench_function("notify_summary_4800_cold", |b| {
+        b.iter_batched(
+            || setup_notify_summary_db(4_800),
+            |db| {
+                let summary = db.module_call_summary(module);
+                black_box(summary);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    let db = setup_notify_summary_db(4_800);
+    let _ = db.module_call_summary(module);
+    c.bench_function("notify_summary_4800_warm", |b| {
+        b.iter(|| {
+            let summary = db.module_call_summary(black_box(module));
+            black_box(summary);
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_cache_hit,
@@ -333,6 +389,7 @@ criterion_group!(
     bench_symbol_tree_ref_cache_hit,
     bench_large_file_set,
     bench_metadata_revalidation_after_bsl_edit,
-    bench_validate_no_change
+    bench_validate_no_change,
+    bench_notify_summary_4800
 );
 criterion_main!(benches);

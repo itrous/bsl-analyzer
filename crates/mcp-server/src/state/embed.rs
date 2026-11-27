@@ -4278,7 +4278,7 @@ mod tests {
             let (revision, fingerprint) = if crate::cache::graph_db_path(&workspace).exists() {
                 built_graph_token(&workspace)
             } else {
-                (0, crate::graph_db::GraphFp { files: 0, topology })
+                (0, crate::graph_db::GraphFp { files: 0, topology, platform_help: 0 })
             };
             SharedState::refresh_search_contexts_after_graph(
                 &engine_arc,

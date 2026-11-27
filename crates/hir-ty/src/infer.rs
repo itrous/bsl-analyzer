@@ -14,10 +14,12 @@ use hir_def::effective_module::EffectiveModuleId;
 use hir_def::hir::{BinaryOp, Expr, ExprIdx, Literal, Stmt, StmtIdx, UnaryOp};
 use hir_def::module_interface::ModuleInterface;
 use hir_def::resolver::Resolver;
+use hir_def::weaving::{Interception, WeavingModuleId};
 use hir_def::{DefWithBodyId, ExprId, MethodIdInput, Name, StmtId};
 use intern::NormName;
 use once_cell::sync::Lazy;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::cell::Cell;
 use std::sync::Arc;
 use stdx::case::CaseExt;
 use tracing::{debug, info, trace};
@@ -145,6 +147,13 @@ pub(crate) mod heap_estimate {
                 r.call_arg_bindings.len(),
             )
             + vec_bytes::<ExprId>(r.return_expr_ids.len())
+            + map_table_bytes::<ExprId, NotifyConstructorEnvironment>(
+                r.notify_constructor_environments.len(),
+            )
+            + map_table_bytes::<ExprId, (BareNameOrigin, TypeId)>(
+                r.notify_receiver_resolutions.len(),
+            )
+            + map_table_bytes::<ExprId, ()>(r.notify_receiver_indeterminate.len())
             + query_facts_heap(&r.query_facts)
     }
 
@@ -159,6 +168,13 @@ pub(crate) mod heap_estimate {
                 r.diagnostics.len(),
                 r.call_arg_bindings.len(),
             )
+            + map_table_bytes::<ExprId, NotifyConstructorEnvironment>(
+                r.notify_constructor_environments.len(),
+            )
+            + map_table_bytes::<ExprId, (BareNameOrigin, TypeId)>(
+                r.notify_receiver_resolutions.len(),
+            )
+            + map_table_bytes::<ExprId, ()>(r.notify_receiver_indeterminate.len())
             + query_facts_heap(&r.query_facts)
     }
 }
@@ -206,6 +222,7 @@ pub struct ImplicitLocalAssignment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReachingDef {
     stmt: Option<StmtId>,
+    binding: Option<BindingId>,
     ty: Option<TypeId>,
     /// A call taking the name bare or a `Выполнить` may have rebound it to a
     /// value this body does not show, or may have left it as it was.
@@ -291,6 +308,7 @@ pub enum BareNameGap {
     MissingPlatformCatalog,
     UnverifiedPlatformCatalog,
     UnsupportedTargetPlatform,
+    MissingImplicitReceiverSurface,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -305,6 +323,205 @@ enum BareNameVerdict {
     Resolved,
     Absent,
     Indeterminate,
+}
+
+#[derive(Clone, Copy)]
+struct CompileEnvScope {
+    // This compact projection records which environments compile a statement, not
+    // the identity of the preprocessor branch that selected them. Consequently,
+    // separate branches with the same environment mask may overlap here; retaining
+    // branch provenance would need a richer (and more expensive) scope key.
+    definite: hir_def::execution_env::EnvFlags,
+    possible: Option<hir_def::execution_env::EnvFlags>,
+}
+
+impl CompileEnvScope {
+    fn may_overlap(self, other: Self) -> bool {
+        self.definite.intersects(other.definite)
+            || match (self.possible, other.possible) {
+                (Some(left), Some(right)) => left.intersects(right),
+                _ => true,
+            }
+    }
+
+    fn unknown() -> Self {
+        Self { definite: hir_def::execution_env::EnvFlags::EMPTY, possible: None }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BodyNameOwnership {
+    body_binding_shadows: bool,
+    scope_sensitive: bool,
+    assigned_in_body: bool,
+    bodywide_local: bool,
+}
+
+#[derive(Default)]
+struct BodyCompileScopes {
+    assignments: FxHashMap<NormName, Vec<StmtId>>,
+    bindings: FxHashMap<NormName, Vec<StmtId>>,
+    statements: FxHashMap<StmtId, CompileEnvScope>,
+    impossible_statements: rustc_hash::FxHashSet<StmtId>,
+}
+
+fn collect_body_compile_scopes(
+    body: &Body,
+    stmts: &[StmtIdx],
+    definite: hir_def::execution_env::EnvFlags,
+    possible: hir_def::execution_env::EnvFlags,
+    in_dead_branch: bool,
+    scopes: &mut BodyCompileScopes,
+) {
+    use hir_def::execution_env::EnvFlags;
+
+    for &stmt_idx in stmts {
+        let stmt_id = StmtId::from_idx(stmt_idx);
+        if in_dead_branch {
+            scopes.impossible_statements.insert(stmt_id);
+        } else {
+            scopes.statements.insert(
+                stmt_id,
+                CompileEnvScope { definite, possible: (!possible.is_empty()).then_some(possible) },
+            );
+        }
+
+        match body.stmt_idx(stmt_idx) {
+            Stmt::Assign { target, .. } => {
+                if let Expr::Path(name) = body.expr_idx(*target) {
+                    let key = NormName::intern(name.as_str());
+                    scopes.assignments.entry(key).or_default().push(stmt_id);
+                }
+            }
+            Stmt::VarDecl { bindings } => {
+                for &binding in bindings.iter() {
+                    let name = &body.binding_idx(binding).name;
+                    scopes
+                        .bindings
+                        .entry(NormName::intern(name.as_str()))
+                        .or_default()
+                        .push(stmt_id);
+                }
+            }
+            Stmt::If(if_stmt) => {
+                collect_body_compile_scopes(
+                    body,
+                    &if_stmt.then_branch,
+                    definite,
+                    possible,
+                    in_dead_branch,
+                    scopes,
+                );
+                for (_, branch) in if_stmt.elsif_branches.iter() {
+                    collect_body_compile_scopes(
+                        body,
+                        branch,
+                        definite,
+                        possible,
+                        in_dead_branch,
+                        scopes,
+                    );
+                }
+                if let Some(branch) = &if_stmt.else_branch {
+                    collect_body_compile_scopes(
+                        body,
+                        branch,
+                        definite,
+                        possible,
+                        in_dead_branch,
+                        scopes,
+                    );
+                }
+            }
+            Stmt::PreprocIf(preproc) => {
+                let parent_possible = possible;
+                let mut definite_remaining = definite;
+                let mut possible_remaining = possible;
+                let definite = preproc.condition.narrow_branch(&mut definite_remaining);
+                let possible = preproc.condition.possible_branch(&mut possible_remaining);
+                collect_body_compile_scopes(
+                    body,
+                    &preproc.then_branch,
+                    definite,
+                    possible,
+                    in_dead_branch || (!parent_possible.is_empty() && possible.is_empty()),
+                    scopes,
+                );
+                for (idx, (_, _, branch)) in preproc.elsif_branches.iter().enumerate() {
+                    let (definite, possible) = match preproc.elsif_conditions.get(idx) {
+                        Some(condition) => (
+                            condition.narrow_branch(&mut definite_remaining),
+                            condition.possible_branch(&mut possible_remaining),
+                        ),
+                        None => {
+                            definite_remaining = EnvFlags::EMPTY;
+                            (EnvFlags::EMPTY, possible_remaining)
+                        }
+                    };
+                    collect_body_compile_scopes(
+                        body,
+                        branch,
+                        definite,
+                        possible,
+                        in_dead_branch || (!parent_possible.is_empty() && possible.is_empty()),
+                        scopes,
+                    );
+                }
+                if let Some(branch) = &preproc.else_branch {
+                    collect_body_compile_scopes(
+                        body,
+                        branch,
+                        definite_remaining,
+                        possible_remaining,
+                        in_dead_branch
+                            || (!parent_possible.is_empty() && possible_remaining.is_empty()),
+                        scopes,
+                    );
+                }
+            }
+            Stmt::While { body: nested, .. } => {
+                collect_body_compile_scopes(
+                    body,
+                    nested,
+                    definite,
+                    possible,
+                    in_dead_branch,
+                    scopes,
+                );
+            }
+            Stmt::For { var, body: nested, .. } | Stmt::ForEach { var, body: nested, .. } => {
+                let name = &body.binding_idx(*var).name;
+                scopes.bindings.entry(NormName::intern(name.as_str())).or_default().push(stmt_id);
+                collect_body_compile_scopes(
+                    body,
+                    nested,
+                    definite,
+                    possible,
+                    in_dead_branch,
+                    scopes,
+                );
+            }
+            Stmt::Try { body: protected, except } => {
+                collect_body_compile_scopes(
+                    body,
+                    protected,
+                    definite,
+                    possible,
+                    in_dead_branch,
+                    scopes,
+                );
+                collect_body_compile_scopes(
+                    body,
+                    except,
+                    definite,
+                    possible,
+                    in_dead_branch,
+                    scopes,
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The receiver a bare name implicitly hangs off in the module being inferred.
@@ -356,6 +573,31 @@ const UNDOCUMENTED_PLATFORM_GLOBALS: &[&str] = &[
 
 fn is_undocumented_platform_global(name: &str) -> bool {
     UNDOCUMENTED_PLATFORM_GLOBALS.iter().any(|global| global.to_lowercase() == name.to_lowercase())
+}
+
+fn implicit_receiver_platform_type_name(db: &dyn TypeKernelDb, ty: TypeId) -> Option<String> {
+    let name = match db.lookup_type(ty) {
+        TypeKind::ThisObject { owner, .. } => {
+            hir_def::ty::MetadataKind::object_kind_for(owner.mdo_type)
+                .and_then(|kind| kind.platform_prefix().or_else(|| kind.bare_platform_type()))?
+        }
+        TypeKind::ThisManager { owner, .. } => owner.mdo_type.manager_type_prefix()?,
+        TypeKind::MetadataRef(facet) => {
+            facet.kind.platform_prefix().or_else(|| facet.kind.bare_platform_type())?
+        }
+        TypeKind::MetadataObject(facet) => {
+            facet.kind.platform_prefix().or_else(|| facet.kind.bare_platform_type())?
+        }
+        TypeKind::ObjectManager(facet) => facet.mdo.manager_type_prefix()?,
+        TypeKind::PlatformObject(facet) => return Some(facet.name.clone()),
+        _ => return None,
+    };
+    Some(name.to_owned())
+}
+
+fn platform_member_surfaces_are_complete(data: &bsl_platform::PlatformData, name: &str) -> bool {
+    data.platform_type_member_surface_verified(name, MemberSurface::Methods)
+        && data.platform_type_member_surface_verified(name, MemberSurface::Fields)
 }
 
 fn classify_bare_name_miss(
@@ -747,6 +989,20 @@ pub struct InferenceContext<'db> {
     /// over it.
     flow: BodyFlow,
 
+    /// Query facts need a reaching-definitions solve. A reader that must not run
+    /// that solve outside its own budget defers them; `finish` then returns no
+    /// facts and marks them incomplete instead of presenting an empty answer.
+    query_facts_deferred: bool,
+
+    /// The same rule for every reaching-definitions read inference itself makes.
+    /// When deferred, such a read answers unknown and records that the result
+    /// depends on a solve this inference did not run.
+    reaching_defs_deferred: bool,
+    reaching_defs_skipped: Cell<bool>,
+    reaching_defs_work_remaining: Cell<usize>,
+    reaching_defs_work_spent: Cell<usize>,
+    reaching_defs_since_cancel: Cell<usize>,
+
     return_expr_ids: Vec<ExprId>,
 
     var_types: FxHashMap<NormName, TypeId>,
@@ -776,6 +1032,13 @@ pub struct InferenceContext<'db> {
 
     expr_types: FxHashMap<ExprId, TypeId>,
 
+    /// Sparse environment facts for notify-description constructors.
+    notify_constructor_environments: FxHashMap<ExprId, NotifyConstructorEnvironment>,
+
+    /// Effective/weaving bodies use source declarations whose runtime environment
+    /// differs from the inference context's deliberately disabled availability checks.
+    notify_body_env: Option<(hir_def::execution_env::EnvFlags, hir_def::execution_env::EnvFlags)>,
+
     diagnostics: Vec<InferenceDiagnostic>,
 
     loop_depth: u32,
@@ -789,6 +1052,22 @@ pub struct InferenceContext<'db> {
     /// dispatch consumes the same verdict so an absent root is not also reported
     /// as `UnresolvedMethodCall::ReceiverNotResolved`.
     bare_name_verdicts: FxHashMap<ExprId, BareNameVerdict>,
+
+    /// Every bare assignment and body binding, with the compile environments of its statement.
+    body_assignment_stmts: FxHashMap<NormName, Vec<StmtId>>,
+    body_binding_stmts: FxHashMap<NormName, Vec<StmtId>>,
+    body_binding_scope_stmts: FxHashMap<BindingId, StmtId>,
+    body_stmt_scopes: FxHashMap<StmtId, CompileEnvScope>,
+    /// Statements excluded by a known-impossible conditional-compilation path.
+    impossible_body_stmts: rustc_hash::FxHashSet<StmtId>,
+
+    /// Bare path answers are recorded once for all consumers that receive an ExprId.
+    bare_name_resolutions: FxHashMap<ExprId, (BareNameOrigin, TypeId)>,
+    /// Bare reads whose resolution stopped on an incomplete surface. A consumer that
+    /// would otherwise report a proven-foreign verdict must read this uncertainty.
+    indeterminate_bare_reads: FxHashSet<ExprId>,
+    /// Semantic ownership verdicts for assignment targets, including surface gaps.
+    assignment_target_resolutions: FxHashMap<ExprId, BareNameResolution>,
 
     /// Bare reads the cascade resolved as a local of this body; only these are
     /// judged by the definite-initialization check.
@@ -887,6 +1166,36 @@ pub struct InferenceContext<'db> {
     reading_bare_call_callee: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NotifyConstructorEnvironment {
+    definite: hir_def::execution_env::EnvFlags,
+    possible: hir_def::execution_env::EnvFlags,
+    available: hir_def::execution_env::EnvFlags,
+}
+
+impl NotifyConstructorEnvironment {
+    pub(crate) fn registration_envs(
+        self,
+    ) -> (hir_def::execution_env::EnvFlags, hir_def::execution_env::EnvFlags) {
+        let definite = self.definite & self.available;
+        let possible = if self.definite.is_empty() && self.possible.is_empty() {
+            self.available
+        } else {
+            self.possible & self.available
+        };
+        (definite, possible)
+    }
+
+    pub(crate) fn may_be_available(self) -> bool {
+        self.definite.intersects(self.available)
+            || self.possible.intersects(self.available)
+            // Empty body masks mean unknown, unless the constructor itself is unavailable.
+            || self.definite.is_empty()
+                && self.possible.is_empty()
+                && !self.available.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BodyInferenceResult {
     pub owner: DefWithBodyId,
@@ -894,6 +1203,14 @@ pub struct BodyInferenceResult {
     pub implicit_locals: FxHashMap<String, ImplicitLocalInfo>,
     pub binding_types: FxHashMap<BindingId, TypeId>,
     pub expr_types: FxHashMap<ExprId, TypeId>,
+    pub(crate) notify_constructor_environments: FxHashMap<ExprId, NotifyConstructorEnvironment>,
+    /// Bare-path read answers keyed by `ExprId`, so later consumers can project the same
+    /// inference result onto any selected notification receiver.
+    pub(crate) notify_receiver_resolutions: FxHashMap<ExprId, (BareNameOrigin, TypeId)>,
+    /// Bare reads keyed by `ExprId` that stopped on an incomplete surface; the same
+    /// consumers must not read such a receiver as proven foreign.
+    pub(crate) notify_receiver_indeterminate: FxHashSet<ExprId>,
+    pub assignment_target_resolutions: FxHashMap<ExprId, BareNameResolution>,
     pub diagnostics: Vec<InferenceDiagnostic>,
     pub call_arg_bindings: Vec<CallArgBinding>,
     /// Statements walked inside a `#Если` branch nothing proves compiled (see
@@ -906,6 +1223,14 @@ pub struct BodyInferenceResult {
     /// call diagnostics read it.
     pub dead_stmts: Vec<StmtId>,
     pub query_facts: crate::query_in_loop::BodyQueryFacts,
+    /// True when query facts were deferred instead of solved; the empty facts above
+    /// are then unknown, not a complete answer.
+    pub query_facts_incomplete: bool,
+    /// True when inference needed reaching definitions it was forbidden to solve;
+    /// consumers must treat its dependent facts as unknown, not as a proved absence.
+    pub reaching_defs_incomplete: bool,
+    /// Work the deferred reaching-definitions solve actually used.
+    pub reaching_defs_work_spent: usize,
 
     pub(crate) return_expr_ids: Vec<ExprId>,
 }
@@ -918,11 +1243,18 @@ impl BodyInferenceResult {
             implicit_locals: FxHashMap::default(),
             binding_types: FxHashMap::default(),
             expr_types: FxHashMap::default(),
+            notify_constructor_environments: FxHashMap::default(),
+            notify_receiver_resolutions: FxHashMap::default(),
+            notify_receiver_indeterminate: FxHashSet::default(),
+            assignment_target_resolutions: FxHashMap::default(),
             diagnostics: Vec::new(),
             call_arg_bindings: Vec::new(),
             uncompiled_stmts: Vec::new(),
             dead_stmts: Vec::new(),
             query_facts: Default::default(),
+            query_facts_incomplete: false,
+            reaching_defs_incomplete: false,
+            reaching_defs_work_spent: 0,
             return_expr_ids: Vec::new(),
         }
     }
@@ -935,6 +1267,12 @@ pub struct ModuleCodeInferenceResult {
     pub implicit_locals: FxHashMap<String, ImplicitLocalInfo>,
     pub binding_types: FxHashMap<BindingId, TypeId>,
     pub expr_types: FxHashMap<ExprId, TypeId>,
+    pub(crate) notify_constructor_environments: FxHashMap<ExprId, NotifyConstructorEnvironment>,
+    /// Bare-path read answers keyed by `ExprId`, shared with the method-body projection.
+    pub(crate) notify_receiver_resolutions: FxHashMap<ExprId, (BareNameOrigin, TypeId)>,
+    /// See [`BodyInferenceResult::notify_receiver_indeterminate`].
+    pub(crate) notify_receiver_indeterminate: FxHashSet<ExprId>,
+    pub assignment_target_resolutions: FxHashMap<ExprId, BareNameResolution>,
     pub diagnostics: Vec<InferenceDiagnostic>,
     pub call_arg_bindings: Vec<CallArgBinding>,
     /// See [`BodyInferenceResult::uncompiled_stmts`].
@@ -942,6 +1280,12 @@ pub struct ModuleCodeInferenceResult {
     /// See [`BodyInferenceResult::dead_stmts`].
     pub dead_stmts: Vec<StmtId>,
     pub query_facts: crate::query_in_loop::BodyQueryFacts,
+    /// See [`BodyInferenceResult::query_facts_incomplete`].
+    pub query_facts_incomplete: bool,
+    /// See [`BodyInferenceResult::reaching_defs_incomplete`].
+    pub reaching_defs_incomplete: bool,
+    /// See [`BodyInferenceResult::reaching_defs_work_spent`].
+    pub reaching_defs_work_spent: usize,
 }
 
 impl Default for ModuleCodeInferenceResult {
@@ -952,11 +1296,18 @@ impl Default for ModuleCodeInferenceResult {
             implicit_locals: FxHashMap::default(),
             binding_types: FxHashMap::default(),
             expr_types: FxHashMap::default(),
+            notify_constructor_environments: FxHashMap::default(),
+            notify_receiver_resolutions: FxHashMap::default(),
+            notify_receiver_indeterminate: FxHashSet::default(),
+            assignment_target_resolutions: FxHashMap::default(),
             diagnostics: Vec::new(),
             call_arg_bindings: Vec::new(),
             uncompiled_stmts: Vec::new(),
             dead_stmts: Vec::new(),
             query_facts: Default::default(),
+            query_facts_incomplete: false,
+            reaching_defs_incomplete: false,
+            reaching_defs_work_spent: 0,
         }
     }
 }
@@ -973,11 +1324,18 @@ impl ModuleCodeInferenceResult {
             implicit_locals: body.implicit_locals,
             binding_types: body.binding_types,
             expr_types: body.expr_types,
+            notify_constructor_environments: body.notify_constructor_environments,
+            notify_receiver_resolutions: body.notify_receiver_resolutions,
+            notify_receiver_indeterminate: body.notify_receiver_indeterminate,
+            assignment_target_resolutions: body.assignment_target_resolutions,
             diagnostics: body.diagnostics,
             call_arg_bindings: body.call_arg_bindings,
             uncompiled_stmts: body.uncompiled_stmts,
             dead_stmts: body.dead_stmts,
             query_facts: body.query_facts,
+            query_facts_incomplete: body.query_facts_incomplete,
+            reaching_defs_incomplete: body.reaching_defs_incomplete,
+            reaching_defs_work_spent: body.reaching_defs_work_spent,
         }
     }
 }
@@ -1001,6 +1359,52 @@ impl InferOwnerResult {
             InferOwnerResult::Method(r) => r.expr_types.get(&expr).copied(),
             InferOwnerResult::ModuleCode(r) => r.expr_types.get(&expr).copied(),
         }
+    }
+
+    pub fn assignment_target_resolution(&self, expr: ExprId) -> Option<&BareNameResolution> {
+        match self {
+            InferOwnerResult::Method(r) => r.assignment_target_resolutions.get(&expr),
+            InferOwnerResult::ModuleCode(r) => r.assignment_target_resolutions.get(&expr),
+        }
+    }
+
+    pub(crate) fn notify_receiver_resolution(
+        &self,
+        expr: ExprId,
+    ) -> Option<(BareNameOrigin, TypeId)> {
+        match self {
+            InferOwnerResult::Method(r) => r.notify_receiver_resolutions.get(&expr).copied(),
+            InferOwnerResult::ModuleCode(r) => r.notify_receiver_resolutions.get(&expr).copied(),
+        }
+    }
+
+    /// `true` when the bare read stopped on an incomplete surface instead of being
+    /// absent: a consumer must not read it as a proven non-local value.
+    pub(crate) fn notify_receiver_is_indeterminate(&self, expr: ExprId) -> bool {
+        match self {
+            InferOwnerResult::Method(r) => r.notify_receiver_indeterminate.contains(&expr),
+            InferOwnerResult::ModuleCode(r) => r.notify_receiver_indeterminate.contains(&expr),
+        }
+    }
+
+    pub(crate) fn notify_constructor_environment(
+        &self,
+        expr: ExprId,
+    ) -> Option<NotifyConstructorEnvironment> {
+        match self {
+            InferOwnerResult::Method(r) => r.notify_constructor_environments.get(&expr).copied(),
+            InferOwnerResult::ModuleCode(r) => {
+                r.notify_constructor_environments.get(&expr).copied()
+            }
+        }
+    }
+
+    pub(crate) fn notify_constructor_registration_envs(
+        &self,
+        expr: ExprId,
+    ) -> Option<(hir_def::execution_env::EnvFlags, hir_def::execution_env::EnvFlags)> {
+        self.notify_constructor_environment(expr)
+            .map(NotifyConstructorEnvironment::registration_envs)
     }
 
     pub fn expr_types(&self) -> &FxHashMap<ExprId, TypeId> {
@@ -1065,6 +1469,31 @@ impl InferOwnerResult {
             InferOwnerResult::ModuleCode(r) => &r.dead_stmts,
         }
     }
+
+    /// Whether query facts were deferred. Consumers must not read the empty
+    /// [`BodyQueryFacts`] as complete when this is true.
+    pub fn query_facts_incomplete(&self) -> bool {
+        match self {
+            InferOwnerResult::Method(r) => r.query_facts_incomplete,
+            InferOwnerResult::ModuleCode(r) => r.query_facts_incomplete,
+        }
+    }
+
+    /// Whether inference needed reaching definitions it was forbidden to solve.
+    pub fn reaching_defs_incomplete(&self) -> bool {
+        match self {
+            InferOwnerResult::Method(r) => r.reaching_defs_incomplete,
+            InferOwnerResult::ModuleCode(r) => r.reaching_defs_incomplete,
+        }
+    }
+
+    /// Work the deferred reaching-definitions solve actually used.
+    pub fn reaching_defs_work_spent(&self) -> usize {
+        match self {
+            InferOwnerResult::Method(r) => r.reaching_defs_work_spent,
+            InferOwnerResult::ModuleCode(r) => r.reaching_defs_work_spent,
+        }
+    }
 }
 
 pub fn infer_owner(
@@ -1081,6 +1510,58 @@ pub fn infer_owner(
         }
         DefWithBodyId::ModuleCode => InferOwnerResult::ModuleCode(db.infer_module_code(file_id)),
     }
+}
+
+/// The ordinary body inference a notification projection needs. Query facts are
+/// deferred because this projection does not consume them; reaching-definitions
+/// reads run only when their complete solve fits the projection's shared budget.
+pub(crate) fn infer_owner_for_notify(
+    db: &dyn HirDatabase,
+    file_id: FileId,
+    owner: DefWithBodyId,
+    body: &Body,
+    work_limit: usize,
+) -> InferOwnerResult {
+    let body = Arc::new(body.clone());
+    let mut ctx = match owner {
+        DefWithBodyId::Method(local_id) => {
+            let method = hir_def::MethodId { module: hir_def::ModuleId { file_id }, local_id };
+            InferenceContext::new_for_method(db, MethodIdInput::new(db, method), &body)
+        }
+        DefWithBodyId::ModuleCode => InferenceContext::new_for_module_code(db, file_id, &body),
+    };
+    ctx.defer_query_facts();
+    ctx.defer_reaching_definitions_with_limit(work_limit);
+    ctx.infer_all();
+    finish_owner_inference(owner, ctx.finish())
+}
+
+/// How often a deferred reaching-definitions solve checks for cancellation.
+const DEFERRED_REACHING_DEFS_CANCEL_INTERVAL: usize = 128;
+
+/// Charges one deferred-solve payment. A payment larger than the remaining
+/// allowance is refused without spending anything; accepted work reaches the
+/// cancellation check as soon as the interval is crossed, including a large
+/// prepayment for an index or suffix-table allocation.
+fn charge_deferred_reaching_defs(
+    remaining: &Cell<usize>,
+    spent: &Cell<usize>,
+    since_cancel: &Cell<usize>,
+    work: usize,
+    cancel: &mut dyn FnMut(),
+) -> bool {
+    let available = remaining.get();
+    if work > available {
+        return false;
+    }
+    remaining.set(available - work);
+    spent.set(spent.get().saturating_add(work));
+    let since = since_cancel.get().saturating_add(work);
+    since_cancel.set(since % DEFERRED_REACHING_DEFS_CANCEL_INTERVAL);
+    if since >= DEFERRED_REACHING_DEFS_CANCEL_INTERVAL {
+        cancel();
+    }
+    true
 }
 
 /// Callee identities whose bare calls resolve to the platform's global callable surface.
@@ -1343,6 +1824,40 @@ impl<'db> InferenceContext<'db> {
                 }
             }
         };
+        let mut scopes = BodyCompileScopes::default();
+        collect_body_compile_scopes(
+            body,
+            body.body_stmts_typed(),
+            body_env,
+            possible_env.unwrap_or(hir_def::execution_env::EnvFlags::EMPTY),
+            possible_env.is_some_and(|possible| possible.is_empty()),
+            &mut scopes,
+        );
+        let BodyCompileScopes {
+            assignments: body_assignment_stmts,
+            bindings: body_binding_stmts,
+            statements: body_stmt_scopes,
+            impossible_statements: impossible_body_stmts,
+        } = scopes;
+        let body_binding_scope_stmts = body
+            .stmts_iter()
+            .flat_map(|(stmt_idx, stmt)| {
+                let stmt_id = stmt_idx;
+                if !body_stmt_scopes.contains_key(&stmt_id) {
+                    return Vec::new();
+                }
+                let bindings: Vec<_> = match stmt {
+                    Stmt::VarDecl { bindings } => {
+                        bindings.iter().copied().map(BindingId::from_idx).collect()
+                    }
+                    Stmt::For { var, .. } | Stmt::ForEach { var, .. } => {
+                        vec![BindingId::from_idx(*var)]
+                    }
+                    _ => Vec::new(),
+                };
+                bindings.into_iter().map(|binding| (binding, stmt_id)).collect()
+            })
+            .collect();
         Self {
             db,
             context_file_id: file_id,
@@ -1355,6 +1870,12 @@ impl<'db> InferenceContext<'db> {
             owner,
             body: Arc::clone(body),
             flow,
+            query_facts_deferred: false,
+            reaching_defs_deferred: false,
+            reaching_defs_skipped: Cell::new(false),
+            reaching_defs_work_remaining: Cell::new(0),
+            reaching_defs_work_spent: Cell::new(0),
+            reaching_defs_since_cancel: Cell::new(0),
             var_types: FxHashMap::default(),
             reset_vars: rustc_hash::FxHashSet::default(),
             implicit_locals: FxHashMap::default(),
@@ -1363,11 +1884,21 @@ impl<'db> InferenceContext<'db> {
             shadowed_root_names: FxHashMap::default(),
             binding_types: FxHashMap::default(),
             expr_types: FxHashMap::default(),
+            notify_constructor_environments: FxHashMap::default(),
+            notify_body_env: None,
             diagnostics: Vec::new(),
             loop_depth: 0,
             implicit_database_reads: rustc_hash::FxHashSet::default(),
             assignment_targets: rustc_hash::FxHashSet::default(),
             bare_name_verdicts: FxHashMap::default(),
+            body_assignment_stmts,
+            body_binding_stmts,
+            body_binding_scope_stmts,
+            body_stmt_scopes,
+            impossible_body_stmts,
+            bare_name_resolutions: FxHashMap::default(),
+            indeterminate_bare_reads: FxHashSet::default(),
+            assignment_target_resolutions: FxHashMap::default(),
             local_reads: FxHashSet::default(),
             calls_with_unread_target: rustc_hash::FxHashSet::default(),
             call_arg_bindings: Vec::new(),
@@ -2464,6 +2995,25 @@ impl<'db> InferenceContext<'db> {
         self.global_export_map().contains_key(&key)
     }
 
+    fn record_notify_constructor_environment(
+        &mut self,
+        expr: ExprId,
+        name: &str,
+        available: hir_def::execution_env::EnvFlags,
+    ) {
+        if bsl_platform::PlatformDataInner::instance().is_notify_description_type_name(name) {
+            self.notify_constructor_environments.entry(expr).or_insert(
+                NotifyConstructorEnvironment {
+                    definite: self.notify_body_env.map_or(self.body_env, |(definite, _)| definite),
+                    possible: self
+                        .notify_body_env
+                        .map_or(self.possible_env, |(_, possible)| possible),
+                    available,
+                },
+            );
+        }
+    }
+
     /// The same type-availability check as the syntactic `Новый X`, for a name
     /// that arrived as a string value (`Новый("X")`, `Новый(Тип("X"))`). A
     /// qualified name denotes a configuration object rather than a platform
@@ -2481,6 +3031,7 @@ impl<'db> InferenceContext<'db> {
         }
         let environment =
             hir_def::execution_env::EnvFlags::from_platform_context(platform_type.context.as_ref());
+        self.record_notify_constructor_environment(expr, name, environment);
         let type_name = Name::new(name);
         self.check_member_env(expr, &type_name, environment, EnvMemberKind::Type);
         self.check_min_platform(expr, &type_name, || crate::min_platform::constructed_type(name));
@@ -2686,7 +3237,13 @@ impl<'db> InferenceContext<'db> {
     }
 
     pub fn finish(self) -> BodyInferenceResult {
-        let query_facts = self.query_facts();
+        let notify_receiver_resolutions = self.finish_notify_receiver_resolutions();
+        let notify_receiver_indeterminate = self.finish_notify_receiver_indeterminate();
+        let query_facts_incomplete = self.query_facts_deferred;
+        let reaching_defs_incomplete = self.reaching_defs_skipped.get();
+        let reaching_defs_work_spent = self.reaching_defs_work_spent.get();
+        let query_facts =
+            if query_facts_incomplete { Default::default() } else { self.query_facts() };
         BodyInferenceResult {
             owner: self.owner,
             // `var_types` is `NormName`-keyed internally (the hot lookup path during
@@ -2697,13 +3254,113 @@ impl<'db> InferenceContext<'db> {
             implicit_locals: self.implicit_locals,
             binding_types: self.binding_types,
             expr_types: self.expr_types,
+            notify_constructor_environments: self.notify_constructor_environments,
+            notify_receiver_resolutions,
+            notify_receiver_indeterminate,
+            assignment_target_resolutions: self.assignment_target_resolutions,
             diagnostics: self.diagnostics,
             call_arg_bindings: self.call_arg_bindings,
             uncompiled_stmts: self.uncompiled_stmts,
             dead_stmts: self.dead_stmts,
             query_facts,
+            query_facts_incomplete,
+            reaching_defs_incomplete,
+            reaching_defs_work_spent,
             return_expr_ids: self.return_expr_ids,
         }
+    }
+
+    /// Defer query facts to a reader that owns the reaching-definitions budget.
+    /// The finished result marks them incomplete, so no consumer may read the
+    /// empty answer as a complete one.
+    fn defer_query_facts(&mut self) {
+        self.query_facts_deferred = true;
+    }
+
+    /// Bound inference's reaching-definitions solves by the projection's shared
+    /// allowance; the finished result records the work used and whether a solve stopped.
+    fn defer_reaching_definitions_with_limit(&mut self, work_limit: usize) {
+        self.reaching_defs_deferred = true;
+        self.reaching_defs_work_remaining.set(work_limit);
+    }
+
+    fn account_reaching_defs_work(&mut self, spent: usize, incomplete: bool) {
+        self.reaching_defs_work_spent
+            .set(self.reaching_defs_work_spent.get().saturating_add(spent));
+        if incomplete {
+            self.reaching_defs_skipped.set(true);
+        }
+    }
+
+    fn executable_reaching_defs(&self) -> Option<Arc<dataflow::reaching_defs::ReachingDefsResult>> {
+        if !self.reaching_defs_deferred {
+            return self.flow.executable_reaching_defs(self.db);
+        }
+
+        let mut cancel = || self.db.unwind_if_revision_cancelled();
+        let result = self.flow.executable_reaching_defs_with_work(self.db, &mut |work| {
+            let accepted = charge_deferred_reaching_defs(
+                &self.reaching_defs_work_remaining,
+                &self.reaching_defs_work_spent,
+                &self.reaching_defs_since_cancel,
+                work,
+                &mut cancel,
+            );
+            if !accepted {
+                self.reaching_defs_skipped.set(true);
+            }
+            accepted
+        });
+        if result.is_none() {
+            self.reaching_defs_skipped.set(true);
+        }
+        result
+    }
+
+    fn reaching_defs(&self) -> Option<Arc<dataflow::reaching_defs::ReachingDefsResult>> {
+        if !self.reaching_defs_deferred {
+            // The spliced body's IDs belong to neither physical file's memoised
+            // flow, so an effective module solves over its own detached flow.
+            if self.local_symbols.is_some() {
+                return self.flow.reaching_defs(self.db);
+            }
+            let module = hir_def::ModuleId::new(self.context_file_id);
+            return match self.owner {
+                DefWithBodyId::Method(local_id) => self.db.method_reaching_definitions(
+                    MethodIdInput::new(self.db, hir_def::MethodId { module, local_id }),
+                ),
+                DefWithBodyId::ModuleCode => {
+                    self.db.module_code_reaching_definitions(self.context_file_id)
+                }
+            };
+        }
+
+        let mut cancel = || self.db.unwind_if_revision_cancelled();
+        let result = self.flow.reaching_defs_with_work(self.db, &mut |work| {
+            let accepted = charge_deferred_reaching_defs(
+                &self.reaching_defs_work_remaining,
+                &self.reaching_defs_work_spent,
+                &self.reaching_defs_since_cancel,
+                work,
+                &mut cancel,
+            );
+            if !accepted {
+                self.reaching_defs_skipped.set(true);
+            }
+            accepted
+        });
+        if result.is_none() {
+            self.reaching_defs_skipped.set(true);
+        }
+        result
+    }
+
+    fn finish_notify_receiver_indeterminate(&self) -> FxHashSet<ExprId> {
+        self.indeterminate_bare_reads.clone()
+    }
+
+    fn finish_notify_receiver_resolutions(&self) -> FxHashMap<ExprId, (BareNameOrigin, TypeId)> {
+        self.bare_name_resolutions.clone()
     }
 
     /// The query executions of the finished body. Judged only now: a local's type at a
@@ -2794,7 +3451,7 @@ impl<'db> InferenceContext<'db> {
         if hir_def::body::events::has_unresolved_jump(&self.body) {
             return None;
         }
-        let own_defs = self.flow.executable_reaching_defs(self.db)?;
+        let own_defs = self.executable_reaching_defs()?;
         let mut walk = PathWalk {
             inferred_leaves: true,
             own_defs: Some(own_defs),
@@ -2932,13 +3589,110 @@ impl<'db> InferenceContext<'db> {
 
     fn body_declares_binding(&self, name: &hir_def::Name) -> bool {
         let target = NormName::intern(name.as_str());
-        self.body.bindings_iter().any(|(_, b)| NormName::intern(b.name.as_str()) == target)
+        self.body
+            .bindings_iter()
+            .any(|(_, binding)| NormName::intern(binding.name.as_str()) == target)
+    }
+
+    fn compile_scope_at_expr(&self, expr: ExprId) -> CompileEnvScope {
+        self.body
+            .enclosing_stmt(expr)
+            .and_then(|stmt| self.body_stmt_scopes.get(&stmt).copied())
+            .unwrap_or_else(CompileEnvScope::unknown)
+    }
+
+    fn body_binding_applies_at(&self, name: &Name, expr: ExprId) -> bool {
+        if self.body.params().any(|binding| {
+            NormName::intern(self.body.binding(binding).name.as_str())
+                == NormName::intern(name.as_str())
+        }) {
+            return true;
+        }
+        let target = NormName::intern(name.as_str());
+        let read_scope = self.compile_scope_at_expr(expr);
+        self.body_binding_stmts.get(&target).is_some_and(|stmts| {
+            stmts.iter().any(|stmt| {
+                self.body_stmt_scopes.get(stmt).is_some_and(|scope| scope.may_overlap(read_scope))
+            })
+        })
+    }
+
+    fn body_assignment_overlaps_at(&self, name: &Name, expr: ExprId) -> bool {
+        let target = NormName::intern(name.as_str());
+        let read_scope = self.compile_scope_at_expr(expr);
+        self.body_assignment_stmts.get(&target).is_some_and(|stmts| {
+            stmts.iter().any(|stmt| {
+                self.body_stmt_scopes.get(stmt).is_some_and(|scope| scope.may_overlap(read_scope))
+            })
+        })
+    }
+
+    fn body_local_assignment_applies_at(&mut self, name: &Name, expr: ExprId) -> bool {
+        self.body_assignment_overlaps_at(name, expr)
+            && (is_self_name(&name.as_str().fold_lower())
+                || self.assignment_can_declare_implicit_local_at(name, expr))
+    }
+
+    /// Whether a body binding or assignment owns this bare name at this read.
+    /// Both value reads and method-call receivers use this verdict so a later
+    /// assignment in a disjoint compile environment cannot shadow a global only
+    /// for one inference path.
+    fn body_owns_bare_name_at(
+        &mut self,
+        name: &Name,
+        expr: ExprId,
+        usage: BareNameUse,
+    ) -> BodyNameOwnership {
+        let resolver = self.get_resolver();
+        let name_lower = name.as_str().fold_lower();
+        let flow_key = NormName::intern(name.as_str());
+        let body_binding_shadows = self.body_binding_applies_at(name, expr);
+        let read_scope = self.compile_scope_at_expr(expr);
+        let scope_sensitive = self.body_assignment_stmts.get(&flow_key).is_some_and(|stmts| {
+            stmts.iter().any(|stmt| {
+                !self.body_stmt_scopes.get(stmt).is_some_and(|scope| scope.may_overlap(read_scope))
+            })
+        });
+        let local_assignment_applies = self.body_local_assignment_applies_at(name, expr);
+        let bodywide_local = local_assignment_applies
+            && (is_self_name(&name_lower) || resolver.user_common_module_exists(self.db, name));
+        let mut body_local_assignment_shadows = bodywide_local
+            || (self.assigned_var_names.contains(&flow_key) && local_assignment_applies);
+        if scope_sensitive
+            && usage == BareNameUse::ReadValue
+            && body_local_assignment_shadows
+            && !bodywide_local
+        {
+            body_local_assignment_shadows = self.implicit_local_reaches(expr, name);
+        }
+        let assigned_in_body = body_binding_shadows || body_local_assignment_shadows;
+
+        BodyNameOwnership {
+            body_binding_shadows,
+            scope_sensitive,
+            assigned_in_body,
+            bodywide_local,
+        }
     }
 
     /// Whether assignment syntax for `name` may introduce an implicit local.
     /// Mirrors the exclusions in assignment inference so reaching definitions
     /// cannot turn a rejected write to a module/global property into a local.
     fn assignment_can_declare_implicit_local(&mut self, name: &Name) -> bool {
+        let body_binding = self.body_declares_binding(name);
+        self.assignment_can_declare_implicit_local_with_binding(name, body_binding)
+    }
+
+    fn assignment_can_declare_implicit_local_at(&mut self, name: &Name, expr: ExprId) -> bool {
+        let body_binding = self.body_binding_applies_at(name, expr);
+        self.assignment_can_declare_implicit_local_with_binding(name, body_binding)
+    }
+
+    fn assignment_can_declare_implicit_local_with_binding(
+        &mut self,
+        name: &Name,
+        body_binding: bool,
+    ) -> bool {
         use hir_def::resolver::Resolution;
 
         let resolver = self.get_resolver();
@@ -2948,7 +3702,7 @@ impl<'db> InferenceContext<'db> {
         }
         let declared_owner =
             matches!(resolved, Some(Resolution::Method(_) | Resolution::Variable(_)))
-                || self.body_declares_binding(name);
+                || body_binding;
         if !declared_owner
             && !self.in_method_without_form_context()
             && crate::form_self::resolve_form_self_property(self.db, &resolver, name).is_some()
@@ -2958,6 +3712,107 @@ impl<'db> InferenceContext<'db> {
         let is_manager_collection = bsl_metadata::MdoType::from_plural(name.as_str())
             .is_some_and(|mdo| mdo.manager_type_prefix().is_some());
         !is_manager_collection || self.manager_collection_shadowed(name)
+    }
+
+    fn flow_local_type_at(&mut self, name: &Name, expr: ExprId) -> TypeId {
+        let name_key = name.as_str().fold_lower();
+        let read_scope = self.compile_scope_at_expr(expr);
+        let Some(definitions) = self.reaching_assignment_types(expr, &name_key) else {
+            let target = NormName::intern(name.as_str());
+            if let Some(ty) = self.body.params().find_map(|binding| {
+                (NormName::intern(self.body.binding(binding).name.as_str()) == target)
+                    .then(|| self.binding_types.get(&binding).copied())
+                    .flatten()
+            }) {
+                return ty;
+            }
+            if let Some(ty) = self.body.bindings_iter().find_map(|(binding, local)| {
+                (NormName::intern(local.name.as_str()) == target)
+                    .then(|| {
+                        let stmt = self.body_binding_scope_stmts.get(&binding)?;
+                        self.body_stmt_scopes
+                            .get(stmt)
+                            .filter(|scope| scope.may_overlap(read_scope))?;
+                        self.binding_types.get(&binding).copied()
+                    })
+                    .flatten()
+            }) {
+                return ty;
+            }
+            let assignments_are_compatible =
+                self.body_assignment_stmts.get(&target).is_some_and(|stmts| {
+                    !stmts.is_empty()
+                        && stmts.iter().all(|stmt| {
+                            self.body_stmt_scopes
+                                .get(stmt)
+                                .is_some_and(|scope| scope.may_overlap(read_scope))
+                        })
+                });
+            return if assignments_are_compatible {
+                self.var_types.get(&target).copied().unwrap_or_else(|| self.db.unknown())
+            } else {
+                self.db.unknown()
+            };
+        };
+        let mut types = Vec::new();
+        for definition in definitions {
+            if definition.possible_write {
+                types.push(self.db.unknown());
+                continue;
+            }
+            if let Some(stmt) = definition.stmt {
+                let Some(scope) = self.body_stmt_scopes.get(&stmt).copied() else {
+                    continue;
+                };
+                if !scope.may_overlap(read_scope) {
+                    continue;
+                }
+            }
+            if let Some(binding) = definition.binding {
+                match self.body_binding_scope_stmts.get(&binding) {
+                    Some(stmt) => {
+                        let Some(scope) = self.body_stmt_scopes.get(stmt).copied() else {
+                            continue;
+                        };
+                        if !scope.may_overlap(read_scope) {
+                            continue;
+                        }
+                    }
+                    None if self.body.params().any(|param| param == binding) => {}
+                    None => continue,
+                }
+            }
+            types.push(definition.ty.unwrap_or_else(|| self.db.unknown()));
+        }
+        if types.is_empty() {
+            self.db.unknown()
+        } else {
+            self.db.union(types)
+        }
+    }
+
+    fn refine_flow_local_type(&mut self, name: &Name, expr: ExprId, ty: TypeId) -> TypeId {
+        if matches!(self.db.lookup_type(ty), TypeKind::Structure(_)) {
+            let key = name.as_str().fold_lower();
+            if let Some(rich) =
+                crate::structure_keys::materialize(self.db, &self.structure_shapes, &key)
+            {
+                return rich;
+            }
+        }
+        if crate::method_lookup::receiver_needs_refinement_id(self.db, ty) {
+            if let Some(projections) = crate::query_text_dataflow::refine_query_at_use_site(
+                self.db,
+                self.context_file_id,
+                self.owner,
+                expr,
+                name,
+                &self.body,
+            ) {
+                return self.db.query(projections.iter().cloned().collect());
+            }
+        }
+        ty
     }
 
     /// A name with an owner outside the body: a write to it does not create a
@@ -3029,28 +3884,39 @@ impl<'db> InferenceContext<'db> {
         }
     }
 
-    /// Whether an implicit assignment actually reaches this read. The assignment
-    /// may carry `Unknown` and therefore be absent from `var_types`, but still
-    /// declares the local on every path represented by reaching definitions.
+    /// Whether a compatible implicit assignment actually reaches this read.
+    /// The assignment may carry `Unknown` and still establish local ownership.
     fn implicit_local_reaches(&mut self, use_expr: ExprId, name: &Name) -> bool {
-        if !self.assignment_can_declare_implicit_local(name) {
+        if !self.assignment_can_declare_implicit_local_at(name, use_expr) {
             return false;
         }
         let key = name.as_str().fold_lower();
+        let read_scope = self.compile_scope_at_expr(use_expr);
         if let Some(definitions) = self.reaching_assignment_types(use_expr, &key) {
-            return !definitions.is_empty();
+            return definitions.into_iter().any(|definition| {
+                definition.stmt.is_some_and(|stmt| {
+                    self.body_stmt_scopes
+                        .get(&stmt)
+                        .is_some_and(|scope| scope.may_overlap(read_scope))
+                })
+            });
         }
 
         // Recovery/effective bodies may lack dataflow. Keep the sequential
-        // fallback there without allowing an ordinary later assignment to
-        // declare an earlier read.
+        // fallback without allowing a write from a disjoint environment or a
+        // later assignment to declare this read.
         let Some(info) = self.implicit_locals.get(&key) else {
             return false;
         };
         let use_index = use_expr.into_raw().into_u32();
-        info.assignments
-            .iter()
-            .any(|assignment| assignment.target.into_raw().into_u32() < use_index)
+        info.assignments.iter().any(|assignment| {
+            assignment.target.into_raw().into_u32() < use_index
+                && self
+                    .body
+                    .enclosing_stmt(assignment.target)
+                    .and_then(|stmt| self.body_stmt_scopes.get(&stmt))
+                    .is_some_and(|scope| scope.may_overlap(read_scope))
+        })
     }
 
     /// True when the receiver is a reassigned local variable and the definitions
@@ -3803,7 +4669,7 @@ impl<'db> InferenceContext<'db> {
     ) -> Option<Vec<dataflow::reaching_defs::Definition>> {
         use dataflow::reaching_defs::DefSite;
 
-        let executable = self.flow.executable_reaching_defs(self.db)?;
+        let executable = self.executable_reaching_defs()?;
         let defs = executable.defs_for_var_at_stmt(var_key, stmt_id).unwrap_or_default();
         Some(
             defs.into_iter()
@@ -3819,21 +4685,7 @@ impl<'db> InferenceContext<'db> {
         stmt_id: StmtId,
         var_key: &str,
     ) -> Option<Vec<dataflow::reaching_defs::Definition>> {
-        let module = hir_def::ModuleId::new(self.context_file_id);
-        // The spliced body's IDs belong to neither physical file's memoised
-        // flow, so an effective module solves over its own detached flow.
-        let body_defs = if self.local_symbols.is_some() {
-            self.flow.reaching_defs(self.db)?
-        } else {
-            match self.owner {
-                DefWithBodyId::Method(local_id) => self.db.method_reaching_definitions(
-                    MethodIdInput::new(self.db, hir_def::MethodId { module, local_id }),
-                )?,
-                DefWithBodyId::ModuleCode => {
-                    self.db.module_code_reaching_definitions(self.context_file_id)?
-                }
-            }
-        };
+        let body_defs = self.reaching_defs()?;
         body_defs.defs_for_var_at_stmt(var_key, stmt_id)
     }
 
@@ -3843,7 +4695,7 @@ impl<'db> InferenceContext<'db> {
         if hir_def::body::events::hir_suppressed(&self.body) {
             return true;
         }
-        let Some(defs) = self.flow.executable_reaching_defs(self.db) else {
+        let Some(defs) = self.executable_reaching_defs() else {
             return true;
         };
         crate::possible_writes::rebinding_write_reaches(
@@ -3872,7 +4724,7 @@ impl<'db> InferenceContext<'db> {
                         }
                         _ => None,
                     };
-                    ReachingDef { stmt: Some(stmt), ty, possible_write: false }
+                    ReachingDef { stmt: Some(stmt), binding: None, ty, possible_write: false }
                 }
                 // A binding is not a statement, but inference does record a
                 // type for it when it could work one out — a `Для` counter
@@ -3882,14 +4734,15 @@ impl<'db> InferenceContext<'db> {
                 | dataflow::reaching_defs::DefSite::ForLoop(binding)
                 | dataflow::reaching_defs::DefSite::ForEachLoop(binding) => ReachingDef {
                     stmt: None,
+                    binding: Some(binding),
                     ty: self.binding_types.get(&binding).copied(),
                     possible_write: false,
                 },
                 dataflow::reaching_defs::DefSite::Unknown => {
-                    ReachingDef { stmt: None, ty: None, possible_write: false }
+                    ReachingDef { stmt: None, binding: None, ty: None, possible_write: false }
                 }
                 dataflow::reaching_defs::DefSite::MayWrite(_) => {
-                    ReachingDef { stmt: None, ty: None, possible_write: true }
+                    ReachingDef { stmt: None, binding: None, ty: None, possible_write: true }
                 }
             })
             .collect()
@@ -3899,19 +4752,7 @@ impl<'db> InferenceContext<'db> {
     /// form in scope: there a bare `Элементы = …` or `Параметры = …` declares a local,
     /// as the platform runs it, instead of writing the form's property.
     fn in_method_without_form_context(&self) -> bool {
-        let DefWithBodyId::Method(local_id) = self.owner else {
-            return false;
-        };
-        let module = hir_def::ModuleId::new(self.context_file_id);
-        self.db.interface_method(hir_def::MethodId { module, local_id }).is_some_and(|method| {
-            method.directives.iter().any(|directive| {
-                matches!(
-                    directive,
-                    hir_def::item_tree::AnnotationKind::AtServerNoContext
-                        | hir_def::item_tree::AnnotationKind::AtClientAtServerNoContext
-                )
-            })
-        })
+        !crate::owner_has_form_context(self.db, self.context_file_id, self.owner)
     }
 
     /// Gives a parameter the fields its doc-comment declares, for use inside the method's own body.
@@ -4745,7 +5586,6 @@ impl<'db> InferenceContext<'db> {
                     (None, Some(&first)) => self.constructed_type_name(&body, first),
                     _ => None,
                 };
-
                 if let Some(name) = type_name {
                     if matches!(
                         name.as_str().fold_lower().as_str(),
@@ -4765,6 +5605,7 @@ impl<'db> InferenceContext<'db> {
                             )
                         },
                     );
+                    self.record_notify_constructor_environment(expr_id, name.as_str(), environment);
                     if !platform.is_ambiguous_type_name(name.as_str()) && platform_type.is_some() {
                         self.check_member_env(expr_id, name, environment, EnvMemberKind::Type);
                         self.check_min_platform(expr_id, name, || {
@@ -4883,6 +5724,33 @@ impl<'db> InferenceContext<'db> {
             BareNameUse::ReadValue
         };
         let resolution = self.resolve_bare_name(name, expr_id, usage);
+        if usage == BareNameUse::AssignmentTarget {
+            let ownership = match &resolution {
+                BareNameResolution::Indeterminate { gaps }
+                    if !self.implicit_self_surface_has_bare_fields()
+                        || !gaps.contains(&BareNameGap::MissingImplicitReceiverSurface) =>
+                {
+                    BareNameResolution::Resolved {
+                        ty: self.db.unknown(),
+                        origin: BareNameOrigin::FlowLocal,
+                        availability: hir_def::execution_env::EnvFlags::ALL,
+                    }
+                }
+                _ => resolution.clone(),
+            };
+            self.assignment_target_resolutions.insert(expr_id, ownership);
+        }
+        if usage == BareNameUse::ReadValue {
+            match &resolution {
+                BareNameResolution::Resolved { ty, origin, .. } => {
+                    self.bare_name_resolutions.insert(expr_id, (*origin, *ty));
+                }
+                BareNameResolution::Indeterminate { .. } => {
+                    self.indeterminate_bare_reads.insert(expr_id);
+                }
+                BareNameResolution::Absent => {}
+            }
+        }
         if usage == BareNameUse::ReadValue
             && matches!(
                 resolution,
@@ -4942,14 +5810,40 @@ impl<'db> InferenceContext<'db> {
         use hir_def::resolver::Resolution;
 
         debug_assert!(matches!(usage, BareNameUse::ReadValue | BareNameUse::AssignmentTarget));
+        // The lowered body retains dead source for editor features, but it cannot produce a
+        // runtime unresolved-name diagnostic.
+        if usage == BareNameUse::ReadValue
+            && self
+                .body
+                .enclosing_stmt(expr_id)
+                .is_some_and(|stmt| self.impossible_body_stmts.contains(&stmt))
+        {
+            return BareNameResolution::Indeterminate { gaps: Vec::new() };
+        }
         let resolver = self.get_resolver();
         let found =
             |ty, origin, availability| BareNameResolution::Resolved { ty, origin, availability };
         let all_env = hir_def::execution_env::EnvFlags::ALL;
 
         let name_lower = name.as_str().fold_lower();
-        let self_name_wins =
-            is_self_name(&name_lower) && !self.self_name_is_shadowed(name, &resolver);
+        let flow_key = NormName::intern(name.as_str());
+        let resolved = resolver.resolve_name(self.db, name);
+        let resolver_says_builtin = matches!(resolved, Some(Resolution::Builtin(_)));
+        let hir_sig = builtin::builtin_functions().get(name.as_str());
+
+        // A compatible local shadows self and same-named common modules throughout the body,
+        // while other names retain their existing sequential type and initialization behavior.
+        let ownership = self.body_owns_bare_name_at(name, expr_id, usage);
+        let body_binding_shadows = ownership.body_binding_shadows;
+        let scope_sensitive = ownership.scope_sensitive;
+        let assigned_in_body = ownership.assigned_in_body;
+        let bodywide_local = ownership.bodywide_local;
+        let user_shadows =
+            matches!(resolved, Some(Resolution::Method(_)) | Some(Resolution::Variable(_)))
+                || resolver.resolve_module_variable(self.db, name).is_some();
+
+        let self_name_wins = is_self_name(&name_lower)
+            && !self.self_name_is_shadowed(name, &resolver, assigned_in_body);
         if self_name_wins && (name_lower == "этотобъект" || name_lower == "thisobject") {
             if let Some(owner) = crate::this_object::resolve_this_object_owner(self.db, &resolver) {
                 trace!("resolved {} as ThisObject {{ owner: {:?} }}", name, owner);
@@ -5005,59 +5899,75 @@ impl<'db> InferenceContext<'db> {
                 all_env,
             );
         }
-
-        let resolved = resolver.resolve_name(self.db, name);
-
-        let flow_key = NormName::intern(name.as_str());
-        if self.reset_vars.contains(&flow_key) {
-            trace!("resolved {} as a local reset by an untyped write", name);
-            return found(self.db.unknown(), BareNameOrigin::FlowLocal, all_env);
+        if self_name_wins
+            && matches!(name_lower.as_str(), "этотобъект" | "thisobject")
+            && resolver.module_id().is_some_and(|module_id| {
+                self.db.module_metadata(module_id).module_type
+                    == bsl_metadata::ModuleType::CommandModule
+            })
+        {
+            // A command module's `ЭтотОбъект` is a valid notification callback receiver,
+            // but it does not expose the current module's methods as object members.
+            return found(self.db.unknown(), BareNameOrigin::SelfName, all_env);
         }
-        if let Some(ty) = self.var_types.get(&flow_key) {
-            trace!("resolved {} via var_types = {:?}", name, ty);
-            let ty_id = *ty;
-            // Structure-literal key enrichment: a local typed as a `Структура` gets its collected
-            // literal keys (and value types known up to this read) surfaced for completion/hover.
-            // Soft — never feeds a diagnostic.
-            if matches!(self.db.lookup_type(ty_id), TypeKind::Structure(_)) {
-                let key = name.as_str().fold_lower();
-                if let Some(rich) =
-                    crate::structure_keys::materialize(self.db, &self.structure_shapes, &key)
-                {
-                    return found(rich, BareNameOrigin::FlowLocal, all_env);
-                }
-            }
-            if crate::method_lookup::receiver_needs_refinement_id(self.db, ty_id) {
-                if let Some(projections) = crate::query_text_dataflow::refine_query_at_use_site(
-                    self.db,
-                    self.context_file_id,
-                    self.owner,
-                    expr_id,
-                    name,
-                    &self.body,
-                ) {
-                    let refined = self.db.query(projections.iter().cloned().collect());
-                    trace!("Phase F refined {} to {:?}", name, refined);
-                    return found(refined, BareNameOrigin::FlowLocal, all_env);
-                }
-            }
-            return found(ty_id, BareNameOrigin::FlowLocal, all_env);
+        if self_name_wins && crate::this_object::form_module_metadata_missing(self.db, &resolver) {
+            return found(self.db.unknown(), BareNameOrigin::SelfName, all_env);
         }
 
-        let user_shadows =
-            matches!(resolved, Some(Resolution::Method(_)) | Some(Resolution::Variable(_)))
-                || resolver.resolve_module_variable(self.db, name).is_some();
-        let body_binding_shadows = self.body_declares_binding(name);
+        if usage == BareNameUse::AssignmentTarget && !user_shadows && !body_binding_shadows {
+            if let Some(ty) =
+                crate::this_object_attr::resolve_this_object_member(self.db, &resolver, name)
+            {
+                return found(ty, BareNameOrigin::ObjectMember, all_env);
+            }
+            if let Some(ty) =
+                crate::this_object_attr::resolve_this_record_set_member(self.db, &resolver, name)
+            {
+                return found(ty, BareNameOrigin::ObjectMember, all_env);
+            }
+        }
+
+        let flow_local_candidate = bodywide_local
+            && !body_binding_shadows
+            && !self.assigned_var_names.contains(&flow_key)
+            || (scope_sensitive && assigned_in_body)
+            || (!scope_sensitive
+                && (self.reset_vars.contains(&flow_key) || self.var_types.contains_key(&flow_key)));
+        let assignment_receiver_surface_missing = usage == BareNameUse::AssignmentTarget
+            && flow_local_candidate
+            && self.implicit_self_surface_has_bare_fields()
+            && self.implicit_self_surface_is_missing();
+        if !assignment_receiver_surface_missing {
+            if bodywide_local
+                && !body_binding_shadows
+                && !self.assigned_var_names.contains(&flow_key)
+            {
+                return found(self.db.unknown(), BareNameOrigin::FlowLocal, all_env);
+            }
+            if scope_sensitive {
+                if assigned_in_body {
+                    let ty = self.flow_local_type_at(name, expr_id);
+                    let ty = self.refine_flow_local_type(name, expr_id, ty);
+                    return found(ty, BareNameOrigin::FlowLocal, all_env);
+                }
+            } else {
+                if self.reset_vars.contains(&flow_key) {
+                    return found(self.db.unknown(), BareNameOrigin::FlowLocal, all_env);
+                }
+                if let Some(ty) = self.var_types.get(&flow_key).copied() {
+                    let ty = self.refine_flow_local_type(name, expr_id, ty);
+                    return found(ty, BareNameOrigin::FlowLocal, all_env);
+                }
+            }
+        }
 
         if user_shadows || body_binding_shadows {
             return found(self.db.unknown(), BareNameOrigin::UserBinding, all_env);
         }
 
-        let resolver_says_builtin = matches!(resolved, Some(Resolution::Builtin(_)));
-        let hir_sig = builtin::builtin_functions().get(name.as_str());
         // BSL procedures/functions are not first-class values: EDT accepts
         // `СтрДлина(...)` but reports `A = СтрДлина` as an undefined variable.
-        if usage != BareNameUse::ReadValue && (resolver_says_builtin || hir_sig.is_some()) {
+        if usage == BareNameUse::AssignmentTarget && (resolver_says_builtin || hir_sig.is_some()) {
             return found(self.db.unknown(), BareNameOrigin::Builtin, all_env);
         }
 
@@ -5080,6 +5990,20 @@ impl<'db> InferenceContext<'db> {
             {
                 trace!("resolved {} as the ordinary form's controls", name);
                 return found(ty, BareNameOrigin::FormMember, all_env);
+            }
+        }
+
+        // Resolve every known implicit member before treating an incomplete surface
+        // as a gap. A known form property still owns the target when sibling facts
+        // are missing from the platform snapshot.
+        if usage == BareNameUse::AssignmentTarget && self.implicit_self_surface_has_bare_fields() {
+            let miss = self.bare_name_miss();
+            if matches!(
+                &miss,
+                BareNameResolution::Indeterminate { gaps }
+                    if gaps.contains(&BareNameGap::MissingImplicitReceiverSurface)
+            ) {
+                return miss;
             }
         }
 
@@ -5123,7 +6047,7 @@ impl<'db> InferenceContext<'db> {
         if workspace_owns_common_module
             && !user_shadows
             && !body_binding_shadows
-            && !self.assigned_var_names.contains(&NormName::intern(name.as_str()))
+            && !assigned_in_body
         {
             if let Some(canonical) = self.canonical_common_module_name(name) {
                 trace!("resolved {} as common module type", name);
@@ -5139,7 +6063,6 @@ impl<'db> InferenceContext<'db> {
         // object's name (`ТестовыйОтчёт.Метод()`). Name dispatch already treats
         // that spelling as this module's object manager; classify the root the
         // same way so it cannot simultaneously become `Absent`.
-        let assigned_in_body = self.assigned_var_names.contains(&NormName::intern(name.as_str()));
         if !assigned_in_body {
             if let Some((mdo_type, self_name)) =
                 crate::this_object::resolve_this_manager_owner(self.db, &resolver)
@@ -5274,11 +6197,30 @@ impl<'db> InferenceContext<'db> {
             return found(self.db.unknown(), BareNameOrigin::UserBinding, all_env);
         }
 
+        // A conditionally declared standard attribute whose presence this object's own
+        // properties refute (`ЭтоГруппа` of a non-hierarchical catalog, `Код` of a
+        // zero-length code) is a proven absence: the configuration metadata decides it,
+        // so no platform member-surface attestation is needed. The same holds for a field
+        // the effective object has and the extension does not borrow: its absence from the
+        // lexical surface is stated by the configuration, not by a possibly incomplete
+        // platform snapshot. Only a plain value read is owned here: a bare call keeps the
+        // call channel's conservative silence, and the unknown-name miss below stays gated
+        // on that attestation.
+        if usage == BareNameUse::ReadValue
+            && !self.reading_bare_call_callee
+            && (crate::this_object_attr::standard_member_known_absent(self.db, &resolver, name)
+                || crate::this_object_attr::this_object_member_known_unborrowed(
+                    self.db, &resolver, name,
+                ))
+        {
+            return BareNameResolution::Absent;
+        }
+
         self.bare_name_miss()
     }
 
     /// What a miss of every owner amounts to: `Absent` only when the user global
-    /// surface, the configuration root and the platform catalog are all complete.
+    /// surface, configuration root, platform catalog and implicit-receiver surface are complete.
     fn bare_name_miss(&mut self) -> BareNameResolution {
         // Building the cached maps also records whether every user-global body
         // (global common + application modules) was readable and enumerable.
@@ -5292,11 +6234,42 @@ impl<'db> InferenceContext<'db> {
         {
             gaps.push(BareNameGap::MissingConfigurationRoot);
         }
+        if self.implicit_self_surface_is_missing() {
+            gaps.push(BareNameGap::MissingImplicitReceiverSurface);
+        }
 
         let target = self.db.target_platform_version();
         let platform_status =
             bsl_platform::PlatformGlobalCatalog::instance().status_for_target(target.as_deref());
         classify_bare_name_miss(gaps, platform_status)
+    }
+
+    fn implicit_self_surface_is_missing(&self) -> bool {
+        let receiver_surface = self.implicit_self_surface();
+        let data = bsl_platform::PlatformData::instance();
+        match receiver_surface {
+            ImplicitSelfSurface::PlatformTypes(type_names) => {
+                // A missing candidate may still own the name even if another type is known.
+                // Present type records are not enough: the corpus must also attest that
+                // their member lists are complete before a missing bare member is absent.
+                type_names.iter().any(|name| {
+                    data.get_type(name).is_none()
+                        || !data.platform_type_member_surface_verified(name, MemberSurface::Methods)
+                        || !data.platform_type_member_surface_verified(name, MemberSurface::Fields)
+                })
+            }
+            ImplicitSelfSurface::Receiver(receiver_ty) => {
+                match implicit_receiver_platform_type_name(self.db, receiver_ty) {
+                    Some(type_name) => !platform_member_surfaces_are_complete(data, &type_name),
+                    None => true,
+                }
+            }
+            ImplicitSelfSurface::PlatformPrefix(prefix) => {
+                !platform_member_surfaces_are_complete(data, prefix)
+            }
+            ImplicitSelfSurface::Unreadable => true,
+            ImplicitSelfSurface::None => false,
+        }
     }
 
     fn infer_literal(&self, lit: &Literal) -> TypeId {
@@ -5537,12 +6510,14 @@ impl<'db> InferenceContext<'db> {
                 // A bare module name as receiver (not a variable that holds a module) keeps the
                 // self-qualified-access and missed-parameter diagnostics that the name dispatch
                 // emits — the handlers filter further (TwoLevel only fires when the called module
-                // is the current one). A variable is in `assigned_var_names`, so it is excluded.
+                // is the current one). A local receiver is excluded by the same ownership verdict
+                // used for its read, including the registration's compile environment.
                 let mut static_receiver = false;
                 if let Expr::Path(recv) = self.body.expr(base_id) {
                     let recv = recv.clone();
-                    if !self.assigned_var_names.contains(&NormName::intern(recv.as_str()))
-                        && !self.body_declares_binding(&recv)
+                    if !self
+                        .body_owns_bare_name_at(&recv, base_id, BareNameUse::ReadValue)
+                        .assigned_in_body
                     {
                         static_receiver = true;
                         let arg_presence: Vec<bool> = args
@@ -6380,6 +7355,25 @@ impl<'db> InferenceContext<'db> {
         self.db.module_metadata(module_id).compiles_nowhere()
     }
 
+    fn implicit_self_surface_has_bare_fields(&self) -> bool {
+        use bsl_metadata::ModuleType;
+
+        let module_type = self
+            .get_resolver()
+            .module_id()
+            .map(|module_id| self.db.module_metadata(module_id).module_type);
+        match (self.implicit_self_surface(), module_type) {
+            (ImplicitSelfSurface::None, _) | (_, Some(ModuleType::Unknown)) | (_, None) => false,
+            (ImplicitSelfSurface::Receiver(_), Some(ModuleType::ManagerModule)) => false,
+            (ImplicitSelfSurface::Unreadable, Some(ModuleType::ManagerModule)) => false,
+            (ImplicitSelfSurface::Receiver(_) | ImplicitSelfSurface::Unreadable, Some(_))
+            | (
+                ImplicitSelfSurface::PlatformTypes(_) | ImplicitSelfSurface::PlatformPrefix(_),
+                Some(_),
+            ) => true,
+        }
+    }
+
     /// What a bare name in this module implicitly hangs off — the value `ЭтотОбъект`
     /// denotes here.
     ///
@@ -6559,14 +7553,16 @@ impl<'db> InferenceContext<'db> {
     }
 
     /// An ordinary symbol with a self name's spelling shadows the predefined
-    /// meaning: a parameter, a `Перем` in the body or at module level, an
-    /// assignment target, a user method. Typing such a receiver as the module's
-    /// own object or form would invent members it does not have and lose every
-    /// check that depends on its real type. Mirrors the `user_shadows` /
-    /// `body_binding_shadows` rule the rest of the name cascade uses.
-    fn self_name_is_shadowed(&self, name: &hir_def::Name, resolver: &Resolver) -> bool {
-        self.body_declares_binding(name)
-            || self.assigned_var_names.contains(&NormName::intern(name.as_str()))
+    /// meaning: a parameter, a `Перем` in a compatible compile environment,
+    /// an assignment target, or a user method. Typing such a receiver as the
+    /// module's own object or form would invent members it does not have.
+    fn self_name_is_shadowed(
+        &self,
+        name: &hir_def::Name,
+        resolver: &Resolver,
+        body_owner_shadows: bool,
+    ) -> bool {
+        body_owner_shadows
             || matches!(
                 resolver.resolve_name(self.db, name),
                 Some(
@@ -6582,14 +7578,21 @@ impl<'db> InferenceContext<'db> {
     /// variable that merely holds a `ФормаКлиентскогоПриложения` came from
     /// somewhere else, and resolving it against THIS module's methods would
     /// invent members it does not have.
-    fn form_self_receiver_name(&self, base_id: ExprId) -> Option<hir_def::Name> {
+    fn form_self_receiver_name(&mut self, base_id: ExprId) -> Option<hir_def::Name> {
         let Expr::Path(name) = self.body.expr(base_id) else { return None };
         let name = name.clone();
         if !is_self_name(&name.as_str().fold_lower()) {
             return None;
         }
         let resolver = self.get_resolver();
-        if self.self_name_is_shadowed(&name, &resolver) {
+        let body_binding_shadows = self.body_binding_applies_at(&name, base_id);
+        let body_assignment_shadows =
+            !body_binding_shadows && self.body_local_assignment_applies_at(&name, base_id);
+        if self.self_name_is_shadowed(
+            &name,
+            &resolver,
+            body_binding_shadows || body_assignment_shadows,
+        ) {
             return None;
         }
         let metadata = self.db.module_metadata(resolver.module_id()?);
@@ -6778,10 +7781,10 @@ impl<'db> InferenceContext<'db> {
             Some(Resolution::Builtin(_)) | None => {}
         }
 
-        if self.body_declares_binding(module_name) {
-            return BareReceiverDispatch::Unhandled;
-        }
-        if self.assigned_var_names.contains(&NormName::intern(module_name.as_str())) {
+        if self
+            .body_owns_bare_name_at(module_name, root_expr, BareNameUse::ReadValue)
+            .assigned_in_body
+        {
             return BareReceiverDispatch::Unhandled;
         }
 
@@ -7392,33 +8395,14 @@ pub fn infer_effective<'db>(
     // facts to the changed methods is therefore output-identical. The query facts are the one
     // exception: a loop in `#Вставка` reaches a query through a copied body too, in the same
     // logical module.
-    let changed_ids = hir_def::effective_module::changed_method_keys(db, eid);
+    let changed_ids = effective_changed_methods(db, eid);
 
     // Pass 1: infer each CHANGED method body once to capture its EFFECTIVE return type. A bare
     // same-module call to a `&ИзменениеИКонтроль` target must see its changed body's
     // return, not the base body's. Module code has no return, so only methods contribute.
     // This resolves one level of method→method return dependency; deeper chains keep the
     // base inference's same pragmatic bound (no panic, no infinite loop).
-    let mut effective_returns: FxHashMap<hir_def::MethodKey, TypeId> = FxHashMap::default();
-    for (local_id, body) in module_bodies.iter_bodies() {
-        if !changed_ids.contains(&local_id) {
-            continue;
-        }
-        let mut ctx = InferenceContext::new_effective(
-            db,
-            base_file,
-            Some(ext_file),
-            interface.clone(),
-            DefWithBodyId::Method(local_id),
-            &Arc::new(body.clone()),
-        );
-        ctx.infer_all();
-        let ret = body_return_type(db, &ctx.finish());
-        if ret != db.unknown() {
-            effective_returns.insert(local_id, ret);
-        }
-    }
-    let effective_returns = Arc::new(effective_returns);
+    let effective_returns = effective_method_returns(db, eid);
 
     // Pass 2: re-infer every body with the effective returns threaded in; these results are
     // authoritative (a changed method's call-expr types and diagnostics are now correct).
@@ -7471,6 +8455,405 @@ pub fn infer_effective<'db>(
     }
 
     Arc::new(result)
+}
+
+/// The `&ИзменениеИКонтроль` methods the effective module actually changes. Extracted so
+/// effective inference and the effective notification projection agree on which bodies
+/// run in the extension's context.
+#[salsa::tracked(returns(clone))]
+pub fn effective_changed_methods<'db>(
+    db: &'db dyn HirDatabase,
+    eid: EffectiveModuleId<'db>,
+) -> Arc<FxHashSet<hir_def::MethodKey>> {
+    Arc::new(hir_def::effective_module::changed_method_keys(db, eid))
+}
+
+/// The changed methods' effective return types. Shared by [`infer_effective`] and the
+/// effective notification projection so the first pass is reasoned about once.
+#[salsa::tracked(returns(clone))]
+pub fn effective_method_returns<'db>(
+    db: &'db dyn HirDatabase,
+    eid: EffectiveModuleId<'db>,
+) -> Arc<FxHashMap<hir_def::MethodKey, TypeId>> {
+    effective_method_returns_with_query_facts(db, eid, false, 0)
+}
+
+fn effective_method_returns_with_query_facts<'db>(
+    db: &'db dyn HirDatabase,
+    eid: EffectiveModuleId<'db>,
+    defer_query_facts: bool,
+    work_limit: usize,
+) -> Arc<FxHashMap<hir_def::MethodKey, TypeId>> {
+    effective_method_returns_and_incompleteness(db, eid, defer_query_facts, work_limit).0
+}
+
+fn effective_method_returns_and_incompleteness<'db>(
+    db: &'db dyn HirDatabase,
+    eid: EffectiveModuleId<'db>,
+    defer_query_facts: bool,
+    work_limit: usize,
+) -> (Arc<FxHashMap<hir_def::MethodKey, TypeId>>, bool, usize) {
+    let base_file = eid.base_file(db);
+    let ext_file = eid.ext_file(db);
+    let bodies = hir_def::effective_module::module_bodies_effective(db, eid);
+    let interface = hir_def::effective_module::module_interface_effective(db, eid);
+    let changed = effective_changed_methods(db, eid);
+    let mut returns = FxHashMap::default();
+    let mut incomplete = false;
+    let mut spent = 0usize;
+    let mut remaining = work_limit;
+    for (local_id, body) in bodies.iter_bodies() {
+        if !changed.contains(&local_id) {
+            continue;
+        }
+        let mut ctx = InferenceContext::new_effective(
+            db,
+            base_file,
+            Some(ext_file),
+            interface.clone(),
+            DefWithBodyId::Method(local_id),
+            &Arc::new(body.clone()),
+        );
+        if defer_query_facts {
+            ctx.defer_query_facts();
+            ctx.defer_reaching_definitions_with_limit(remaining);
+        }
+        ctx.infer_all();
+        let result = ctx.finish();
+        incomplete |= result.reaching_defs_incomplete;
+        spent = spent.saturating_add(result.reaching_defs_work_spent);
+        remaining = remaining.saturating_sub(result.reaching_defs_work_spent);
+        let ret = body_return_type(db, &result);
+        if ret != db.unknown() {
+            returns.insert(local_id, ret);
+        }
+    }
+    (Arc::new(returns), incomplete, spent)
+}
+
+/// Inference for one effective body with the shared return threading applied. Projections
+/// that need per-body facts [`infer_effective`] folds away read it, so no consumer
+/// re-derives the effective context.
+pub fn infer_effective_owner(
+    db: &dyn HirDatabase,
+    eid: EffectiveModuleId<'_>,
+    owner: DefWithBodyId,
+    body: &Body,
+) -> InferOwnerResult {
+    infer_effective_owner_with_query_facts(db, eid, owner, body, false, 0)
+}
+
+/// The effective body inference a notification projection needs. Query facts are
+/// deferred because they would solve reaching definitions outside the projection's
+/// budget; the result marks them incomplete. Ordinary inference keeps the full path.
+pub(crate) fn infer_effective_owner_for_notify(
+    db: &dyn HirDatabase,
+    eid: EffectiveModuleId<'_>,
+    owner: DefWithBodyId,
+    body: &Body,
+    work_limit: usize,
+) -> InferOwnerResult {
+    infer_effective_owner_with_query_facts(db, eid, owner, body, true, work_limit)
+}
+
+fn infer_effective_owner_with_query_facts(
+    db: &dyn HirDatabase,
+    eid: EffectiveModuleId<'_>,
+    owner: DefWithBodyId,
+    body: &Body,
+    defer_query_facts: bool,
+    work_limit: usize,
+) -> InferOwnerResult {
+    let base_file = eid.base_file(db);
+    let ext_file = eid.ext_file(db);
+    let changed = effective_changed_methods(db, eid);
+    let ext = match owner {
+        DefWithBodyId::Method(local_id) if changed.contains(&local_id) => Some(ext_file),
+        _ => None,
+    };
+    let interface = hir_def::effective_module::module_interface_effective(db, eid);
+    let mut ctx = InferenceContext::new_effective(
+        db,
+        base_file,
+        ext,
+        interface,
+        owner,
+        &Arc::new(body.clone()),
+    );
+    let (returns, returns_incomplete, returns_spent) = if defer_query_facts {
+        effective_method_returns_and_incompleteness(db, eid, true, work_limit)
+    } else {
+        (effective_method_returns(db, eid), false, 0)
+    };
+    ctx.set_local_effective_returns(returns);
+    ctx.notify_body_env = Some(effective_notify_body_env(db, eid, owner));
+    if defer_query_facts {
+        ctx.defer_query_facts();
+        ctx.defer_reaching_definitions_with_limit(work_limit.saturating_sub(returns_spent));
+        ctx.account_reaching_defs_work(returns_spent, returns_incomplete);
+    }
+    ctx.infer_all();
+    finish_owner_inference(owner, ctx.finish())
+}
+
+fn finish_owner_inference(owner: DefWithBodyId, result: BodyInferenceResult) -> InferOwnerResult {
+    match owner {
+        DefWithBodyId::Method(_) => InferOwnerResult::Method(Arc::new(result)),
+        DefWithBodyId::ModuleCode => {
+            InferOwnerResult::ModuleCode(Arc::new(ModuleCodeInferenceResult::from_body(result)))
+        }
+    }
+}
+
+/// The notification execution environment of one body projected from its real declarations.
+/// `new_effective`/`new_weaving` intentionally disable ordinary inference availability checks,
+/// but notification registrations still need the source declaration's proven environment.
+fn effective_notify_body_env(
+    db: &dyn HirDatabase,
+    eid: EffectiveModuleId<'_>,
+    owner: DefWithBodyId,
+) -> (hir_def::execution_env::EnvFlags, hir_def::execution_env::EnvFlags) {
+    use hir_def::execution_env::{self, EnvFlags};
+
+    let base_file = eid.base_file(db);
+    let module = hir_def::ModuleId::new(base_file);
+    let options = crate::method_environment::notify_env_options();
+    match owner {
+        DefWithBodyId::Method(local_id) => {
+            let method = hir_def::MethodId { module, local_id };
+            let interface = hir_def::effective_module::module_interface_effective(db, eid);
+            let Some(declaration) = interface.find_method_by_id(method) else {
+                return (EnvFlags::EMPTY, EnvFlags::ALL);
+            };
+            declared_notify_method_env(&db.module_metadata(module), declaration, &options)
+        }
+        DefWithBodyId::ModuleCode => {
+            let env = execution_env::module_code_env(&db.module_metadata(module), &options);
+            (env, env)
+        }
+    }
+}
+
+fn declared_notify_method_env(
+    metadata: &hir_def::ModuleMetadata,
+    declaration: &hir_def::module_interface::MethodDecl,
+    options: &hir_def::execution_env::EnvOptions,
+) -> (hir_def::execution_env::EnvFlags, hir_def::execution_env::EnvFlags) {
+    use hir_def::execution_env;
+
+    let env = execution_env::body_env(metadata, &declaration.directives, options);
+    (env & declaration.preproc_env, env & (declaration.preproc_env | declaration.preproc_undecided))
+}
+
+fn weaving_notify_body_env(
+    db: &dyn HirDatabase,
+    wid: WeavingModuleId<'_>,
+    facts: &WeavingProceedFacts,
+    owner: DefWithBodyId,
+) -> (hir_def::execution_env::EnvFlags, hir_def::execution_env::EnvFlags) {
+    use hir_def::execution_env::{self, EnvFlags};
+
+    let ext_file = wid.ext_file(db);
+    let base_file = wid.base_file(db);
+    let base_module = hir_def::ModuleId::new(base_file);
+    let ext_module = hir_def::ModuleId::new(ext_file);
+    let options = crate::method_environment::notify_env_options();
+    let DefWithBodyId::Method(local_id) = owner else {
+        let env = execution_env::module_code_env(&db.module_metadata(ext_module), &options);
+        return (env, env);
+    };
+
+    let ext_method = hir_def::MethodId { module: ext_module, local_id };
+    let Some(ext_declaration) = db.interface_method(ext_method) else {
+        return (EnvFlags::EMPTY, EnvFlags::ALL);
+    };
+    let Some(interception) = facts.interceptions.get(&local_id) else {
+        return declared_notify_method_env(
+            &db.module_metadata(ext_module),
+            &ext_declaration,
+            &options,
+        );
+    };
+    let ext_possible = ext_declaration.preproc_env | ext_declaration.preproc_undecided;
+    let base_declaration =
+        db.module_interface_ref(base_module).find_method(&Name::new(&interception.target));
+    let Some(base_declaration) = base_declaration else {
+        return (EnvFlags::EMPTY, EnvFlags::ALL);
+    };
+    let (base_definite, base_possible) =
+        declared_notify_method_env(&db.module_metadata(base_module), base_declaration, &options);
+    (base_definite & ext_declaration.preproc_env, base_possible & ext_possible)
+}
+
+/// The `ПродолжитьВызов` facts of a weaving extension module: the base method return and
+/// arity per interceptor, plus every recognized interception by the extension method's
+/// local id. Built in one pass over the module's methods and shared by [`infer_weaving`]
+/// and the weaving notification projection, whose per-body environment reads the index
+/// instead of rescanning the declarations.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct WeavingProceedFacts {
+    pub(crate) returns: FxHashMap<hir_def::MethodKey, TypeId>,
+    pub(crate) arities: FxHashMap<hir_def::MethodKey, (usize, usize)>,
+    pub(crate) interceptions: FxHashMap<hir_def::MethodKey, Interception>,
+    /// The base method each around interceptor wraps. A notify projection computes
+    /// its return later, against the projection's shared remaining budget.
+    pub(crate) base_methods: FxHashMap<hir_def::MethodKey, hir_def::MethodId>,
+}
+
+#[salsa::tracked(returns(clone))]
+pub(crate) fn weaving_proceed_facts<'db>(
+    db: &'db dyn HirDatabase,
+    wid: WeavingModuleId<'db>,
+) -> Arc<WeavingProceedFacts> {
+    weaving_proceed_facts_impl(db, wid, false)
+}
+
+#[salsa::tracked(returns(clone))]
+pub(crate) fn weaving_proceed_facts_for_notify<'db>(
+    db: &'db dyn HirDatabase,
+    wid: WeavingModuleId<'db>,
+) -> Arc<WeavingProceedFacts> {
+    weaving_proceed_facts_impl(db, wid, true)
+}
+
+fn weaving_proceed_facts_impl<'db>(
+    db: &'db dyn HirDatabase,
+    wid: WeavingModuleId<'db>,
+    defer_inference: bool,
+) -> Arc<WeavingProceedFacts> {
+    let ext_file = wid.ext_file(db);
+    let base_module = hir_def::ModuleId::new(wid.base_file(db));
+    let ext_module = hir_def::ModuleId::new(ext_file);
+    let ext_symbols = db.symbol_tree_ref(ext_module);
+    let base_symbols = db.symbol_tree_ref(base_module);
+    let ext_parse = db.parse(ext_file);
+    let mut facts = WeavingProceedFacts::default();
+    for method in ext_symbols.methods() {
+        let Some(node) = method.syntax_node(&ext_parse) else {
+            continue;
+        };
+        let Some(interception) = hir_def::weaving::interceptor_target(&node) else {
+            continue;
+        };
+        facts.interceptions.insert(method.id.local_id, interception.clone());
+        if interception.kind != hir_def::weaving::InterceptionKind::Around {
+            continue;
+        }
+        let Some(base_method) = base_symbols.find_method(&Name::new(&interception.target)) else {
+            continue;
+        };
+        facts.base_methods.insert(method.id.local_id, base_method.id);
+        // `required` mirrors `FunctionSignature::required_count`: one past the last
+        // non-defaulted parameter (defaults are trailing in well-formed BSL).
+        let total = base_method.params.len();
+        let required = base_method.params.iter().rposition(|p| !p.has_default).map_or(0, |i| i + 1);
+        facts.arities.insert(method.id.local_id, (required, total));
+
+        if defer_inference {
+            continue;
+        }
+        let base_input = hir_def::MethodIdInput::new(db, base_method.id);
+        let ret = crate::method_graph::method_return_type_query(db, base_input);
+        if ret != db.unknown() && ret != db.undefined() {
+            facts.returns.insert(method.id.local_id, ret);
+        }
+    }
+    Arc::new(facts)
+}
+
+/// A base method's return type for a notify projection: its ordinary inference
+/// would run the reaching-definitions solve the projection is metering, so this
+/// runs a context that defers both query facts and reaching definitions.
+fn method_return_type_with_deferred_inference(
+    db: &dyn HirDatabase,
+    method: MethodIdInput<'_>,
+    work_limit: usize,
+) -> (TypeId, bool, usize) {
+    let body = db.method_body_ref(method);
+    let mut ctx = InferenceContext::new_for_method(db, method, body);
+    ctx.defer_query_facts();
+    ctx.defer_reaching_definitions_with_limit(work_limit);
+    ctx.infer_all();
+    let result = ctx.finish();
+    let incomplete = result.reaching_defs_incomplete;
+    let spent = result.reaching_defs_work_spent;
+    (body_return_type(db, &result), incomplete, spent)
+}
+
+/// Inference for one extension body under weaving, with the shared `ПродолжитьВызов`
+/// facts applied. Read by projections that need the per-body facts `infer_weaving` folds
+/// away.
+pub fn infer_weaving_owner(
+    db: &dyn HirDatabase,
+    wid: WeavingModuleId<'_>,
+    owner: DefWithBodyId,
+    body: &Body,
+) -> InferOwnerResult {
+    infer_weaving_owner_with_query_facts(db, wid, owner, body, false, 0)
+}
+
+/// The weaving body inference a notification projection needs. See
+/// [`infer_effective_owner_for_notify`] for why query facts are deferred.
+pub(crate) fn infer_weaving_owner_for_notify(
+    db: &dyn HirDatabase,
+    wid: WeavingModuleId<'_>,
+    owner: DefWithBodyId,
+    body: &Body,
+    work_limit: usize,
+) -> InferOwnerResult {
+    infer_weaving_owner_with_query_facts(db, wid, owner, body, true, work_limit)
+}
+
+fn infer_weaving_owner_with_query_facts(
+    db: &dyn HirDatabase,
+    wid: WeavingModuleId<'_>,
+    owner: DefWithBodyId,
+    body: &Body,
+    defer_query_facts: bool,
+    work_limit: usize,
+) -> InferOwnerResult {
+    let ext_file = wid.ext_file(db);
+    let base_module = hir_def::ModuleId::new(wid.base_file(db));
+    let facts = if defer_query_facts {
+        weaving_proceed_facts_for_notify(db, wid)
+    } else {
+        weaving_proceed_facts(db, wid)
+    };
+
+    let mut base_return = None;
+    let mut base_incomplete = false;
+    let mut base_spent = 0usize;
+    if defer_query_facts {
+        if let DefWithBodyId::Method(local_id) = owner {
+            if let Some(&base_method) = facts.base_methods.get(&local_id) {
+                let base_input = hir_def::MethodIdInput::new(db, base_method);
+                let (ret, incomplete, spent) =
+                    method_return_type_with_deferred_inference(db, base_input, work_limit);
+                base_return = (ret != db.unknown() && ret != db.undefined()).then_some(ret);
+                base_incomplete = incomplete;
+                base_spent = spent;
+            }
+        }
+    }
+
+    let mut ctx =
+        InferenceContext::new_weaving(db, ext_file, base_module, owner, &Arc::new(body.clone()));
+    ctx.notify_body_env = Some(weaving_notify_body_env(db, wid, &facts, owner));
+    if defer_query_facts {
+        ctx.defer_query_facts();
+        ctx.defer_reaching_definitions_with_limit(work_limit.saturating_sub(base_spent));
+        ctx.account_reaching_defs_work(base_spent, base_incomplete);
+    }
+    if let DefWithBodyId::Method(local_id) = owner {
+        if let Some(ret) = base_return.or_else(|| facts.returns.get(&local_id).copied()) {
+            ctx.set_proceed_return(ret);
+        }
+        if let Some(&(required, total)) = facts.arities.get(&local_id) {
+            ctx.set_proceed_arity(required, total);
+        }
+    }
+    ctx.infer_all();
+    finish_owner_inference(owner, ctx.finish())
 }
 
 /// Whether a bare call name is the platform `ПродолжитьВызов` / `ProceedWithCall` global, the
@@ -7535,42 +8918,11 @@ pub fn infer_weaving<'db>(
     let module_bodies = db.module_bodies_ref(ext_module);
 
     // A `&Вместо("M")` interceptor's body may call `ПродолжитьВызов(...)` to re-enter the
-    // original base method `M`. Pre-compute, per ext method `local_id`: (a) `M`'s return type so
-    // the call types as `M`'s result, and (b) `M`'s arity `(required, total)` so the call is
-    // validated as a call to `M`. `&Перед`/`&После` carry no `ПродолжитьВызов`, so they are
-    // skipped. The return is dropped when uninformative (Unknown/Undefined) to preserve the
-    // platform default, but the arity is kept whenever `M` resolves — a procedure base has no
-    // informative return yet its arguments still need checking.
-    let ext_symbols = db.symbol_tree_ref(ext_module);
-    let base_symbols = db.symbol_tree_ref(base_module);
-    let ext_parse = db.parse(ext_file);
-    let mut proceed_returns: FxHashMap<hir_def::MethodKey, TypeId> = FxHashMap::default();
-    let mut proceed_arities: FxHashMap<hir_def::MethodKey, (usize, usize)> = FxHashMap::default();
-    for method in ext_symbols.methods() {
-        let Some(node) = method.syntax_node(&ext_parse) else {
-            continue;
-        };
-        let Some(interception) = hir_def::weaving::interceptor_target(&node) else {
-            continue;
-        };
-        if interception.kind != hir_def::weaving::InterceptionKind::Around {
-            continue;
-        }
-        let Some(base_method) = base_symbols.find_method(&Name::new(&interception.target)) else {
-            continue;
-        };
-        // `required` mirrors `FunctionSignature::required_count`: one past the last
-        // non-defaulted parameter (defaults are trailing in well-formed BSL).
-        let total = base_method.params.len();
-        let required = base_method.params.iter().rposition(|p| !p.has_default).map_or(0, |i| i + 1);
-        proceed_arities.insert(method.id.local_id, (required, total));
-
-        let base_input = hir_def::MethodIdInput::new(db, base_method.id);
-        let ret = crate::method_graph::method_return_type_query(db, base_input);
-        if ret != db.unknown() && ret != db.undefined() {
-            proceed_returns.insert(method.id.local_id, ret);
-        }
-    }
+    // original base method `M`. The shared facts carry, per ext method `local_id`: (a) `M`'s
+    // return type so the call types as `M`'s result, and (b) `M`'s arity `(required, total)` so
+    // the call is validated as a call to `M`. `&Перед`/`&После` carry no `ПродолжитьВызов`, so
+    // they are skipped. See [`weaving_proceed_facts`].
+    let proceed = weaving_proceed_facts(db, wid);
 
     let mut result = InferenceResult::default();
 
@@ -7605,10 +8957,10 @@ pub fn infer_weaving<'db>(
             DefWithBodyId::Method(local_id),
             &Arc::new(body.clone()),
         );
-        if let Some(ret) = proceed_returns.get(&local_id) {
+        if let Some(ret) = proceed.returns.get(&local_id) {
             ctx.set_proceed_return(*ret);
         }
-        if let Some(&(required, total)) = proceed_arities.get(&local_id) {
+        if let Some(&(required, total)) = proceed.arities.get(&local_id) {
             ctx.set_proceed_arity(required, total);
         }
         ctx.infer_all();
@@ -7670,6 +9022,45 @@ pub fn type_of_expr_query(
 mod tests {
     use super::*;
     use bsl_types::testing::InMemoryDb;
+
+    #[test]
+    fn deferred_reaching_defs_work_cancels_every_interval() {
+        let remaining = std::cell::Cell::new(1_000usize);
+        let spent = std::cell::Cell::new(0usize);
+        let since_cancel = std::cell::Cell::new(0usize);
+        let cancellations = std::cell::Cell::new(0usize);
+        let mut cancel = || cancellations.set(cancellations.get() + 1);
+
+        for _ in 0..127 {
+            assert!(charge_deferred_reaching_defs(
+                &remaining,
+                &spent,
+                &since_cancel,
+                1,
+                &mut cancel
+            ));
+        }
+        assert_eq!(cancellations.get(), 0, "below one interval there is no check");
+        assert!(charge_deferred_reaching_defs(&remaining, &spent, &since_cancel, 1, &mut cancel));
+        assert_eq!(cancellations.get(), 1, "the interval crossing checks cancellation");
+
+        // A large prepayment (index or suffix allocation) also reaches the check.
+        assert!(charge_deferred_reaching_defs(&remaining, &spent, &since_cancel, 300, &mut cancel));
+        assert_eq!(cancellations.get(), 2, "prepayment cancels immediately, not after the loop");
+        assert_eq!(since_cancel.get(), 300 % DEFERRED_REACHING_DEFS_CANCEL_INTERVAL);
+
+        let before_spent = spent.get();
+        let before_cancellations = cancellations.get();
+        assert!(!charge_deferred_reaching_defs(
+            &remaining,
+            &spent,
+            &since_cancel,
+            remaining.get() + 1,
+            &mut cancel
+        ));
+        assert_eq!(spent.get(), before_spent, "a refused payment spends nothing");
+        assert_eq!(cancellations.get(), before_cancellations, "a refused payment does no work");
+    }
 
     #[test]
     fn array_add_writeback_proof_yields_to_explicit_byref() {

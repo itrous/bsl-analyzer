@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Test-only knobs that shorten production bounds for the tests of dependent crates; enabled
+# by those crates' dev-dependencies alone, so no ordinary build carries them.
+test-seams = []
+
 [dependencies]
 stdx.workspace = true
 bsl-platform.workspace = true  # security registry consumed by security_state

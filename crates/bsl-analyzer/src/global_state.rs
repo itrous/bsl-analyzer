@@ -108,6 +108,13 @@ pub enum Task {
         generation: u64,
         completed_at: std::time::Instant,
     },
+    DiagnosticsIncomplete {
+        uri: Url,
+        reason: ide::DiagnosticsIncompleteReason,
+        version: i32,
+        generation: u64,
+        completed_at: std::time::Instant,
+    },
     DiagnosticsCancelled {
         uri: Url,
         version: i32,
@@ -324,6 +331,7 @@ pub struct WorkspaceBatchItem {
     pub uri: Url,
     pub result_id: String,
     pub diagnostics: Vec<lsp_types::Diagnostic>,
+    pub incomplete_reason: Option<ide::DiagnosticsIncompleteReason>,
 }
 
 /// An in-progress whole-project diagnostics sweep (Stream B). The file set is frozen

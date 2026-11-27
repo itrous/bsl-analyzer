@@ -79,23 +79,19 @@ fn infer_invalidates_when_config_set_changes() {
         unresolved_kinds(&db, file_id)
     );
 
-    db.set_all_config_paths(vec![(None, std::path::PathBuf::from("/does-not-exist"))], None);
+    let complete_config_without_module = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../bsl-metadata/fixtures/designer");
+    db.set_all_config_paths(vec![(None, complete_config_without_module)], None);
 
     let kinds = unresolved_kinds(&db, file_id);
     assert_eq!(
         kinds,
-        vec![UnresolvedMethodKind::ReceiverNameAbsent],
-        "after registering bogus config: the visibility gate must flip \
-         resolution to an absent receiver root; if this fails, `db.infer` \
-         is not invalidated by `set_all_config_paths` — the metadata bridge \
-         is not wired through Salsa. ReceiverNameAbsent preserves the legacy \
-         ReceiverNotResolved diagnostic while UnresolvedName is default-off, \
-         and lets the IDE deduplicate it when the root diagnostic is enabled."
+        vec![UnresolvedMethodKind::ReceiverNotResolved],
+        "after registering a configuration that does not establish this synthetic module's visibility, resolution must stop before arity checking; if the baseline result remains, `db.infer` is not invalidated by `set_all_config_paths` — the metadata bridge is not wired through Salsa. The incomplete ownership evidence does not justify ReceiverNameAbsent."
     );
     assert!(
         mismatched_arg_counts(&db, file_id).is_empty(),
-        "after registering bogus config: resolution failed before arity \
-         check, MismatchedArgCount must NOT be emitted, got {:?}",
+        "after registering a complete config without the synthetic module: resolution failed before arity check, MismatchedArgCount must NOT be emitted, got {:?}",
         mismatched_arg_counts(&db, file_id)
     );
 
