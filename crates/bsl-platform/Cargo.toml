@@ -13,6 +13,7 @@ rustc-hash = { workspace = true }
 once_cell = { workspace = true }
 salsa = { workspace = true }
 serde_json = { workspace = true }
+blake3 = "1.8"
 
 [build-dependencies]
 serde_json = { workspace = true }
@@ -21,7 +22,6 @@ serde_json = { workspace = true }
 serde_json = { workspace = true }
 html-parser = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
-blake3 = "1.8"
 sha2 = "0.11"
 
 [features]

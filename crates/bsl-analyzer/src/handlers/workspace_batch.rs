@@ -504,8 +504,16 @@ fn compute_chunk(
     };
     computed
         .into_iter()
-        .filter_map(|(file_id, diagnostics)| {
+        .filter_map(|(file_id, result)| {
             let uri = file_paths.url_for_file_id(file_id).ok()?;
+            if let Some(reason) = result.completeness.incomplete_reason() {
+                return Some(WorkspaceBatchItem {
+                    uri,
+                    result_id: String::new(),
+                    diagnostics: Vec::new(),
+                    incomplete_reason: Some(reason),
+                });
+            }
             let converted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let text = analysis.file_text(file_id);
                 let diagnostics = crate::diagnostics_baseline::active_for_publication(
@@ -513,7 +521,7 @@ fn compute_chunk(
                     baseline.1,
                     file_paths.path_for_file_id(file_id),
                     &text,
-                    diagnostics.to_vec(),
+                    result.diagnostics.clone(),
                     late_scope,
                 );
                 let result_id = crate::lsp::diagnostics_result_id(&diagnostics);
@@ -541,7 +549,7 @@ fn compute_chunk(
                     return None;
                 }
             };
-            Some(WorkspaceBatchItem { uri, result_id, diagnostics: lsp })
+            Some(WorkspaceBatchItem { uri, result_id, diagnostics: lsp, incomplete_reason: None })
         })
         .collect()
 }

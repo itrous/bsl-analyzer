@@ -79,6 +79,24 @@ impl<'a> DiagnosticsContext<'a> {
             .get_or_init(|| self.analysis.provider.method_declaration_conflicts(self.file_id))
     }
 
+    pub fn notify_candidates(&self) -> Arc<Vec<hir::NotifyCandidate>> {
+        self.query(|p| p.notify_candidates(self.file_id))
+    }
+
+    pub(crate) fn notify_handler_methods(&self, name: &hir::Name) -> Vec<hir::MethodId> {
+        self.query(|p| p.notify_handler_methods(self.file_id, name))
+    }
+
+    /// Propagate cancellation while traversing facts already returned by a semantic query.
+    pub fn check_cancellation(&self) {
+        self.query(|p| p.check_cancellation())
+    }
+
+    /// Whether the semantic provider serves platform-help data.
+    pub fn platform_help_available(&self) -> bool {
+        self.query(|p| p.platform_help_available())
+    }
+
     pub fn item_tree(&self) -> Arc<hir::ItemTree> {
         self.query(|p| p.item_tree(self.file_id))
     }
@@ -129,6 +147,10 @@ impl<'a> AnalysisContext<'a> {
     /// One declaration of this file's module, by key.
     pub fn interface_method(&self, method_id: hir::MethodId) -> Option<Arc<hir::MethodDecl>> {
         self.query(|p| p.interface_method(method_id))
+    }
+
+    pub(crate) fn owner_has_form_context(&self, owner: hir::DefWithBodyId) -> bool {
+        self.query(|p| p.owner_has_form_context(self.file_id, owner))
     }
 
     /// The first method of this file's module named `name`.
@@ -371,6 +393,46 @@ impl<'a> AnalysisContext<'a> {
     pub fn module_metadata(&self) -> Arc<hir::ModuleMetadata> {
         let module_id = hir::ModuleId::new(self.file_id);
         self.query(|p| p.module_metadata(module_id))
+    }
+
+    pub(crate) fn qualified_method_declarations(
+        &self,
+        module_name: &hir::Name,
+        method_name: &hir::Name,
+    ) -> Option<Result<hir::QualifiedMethodDeclarations, hir::QualifiedMethodError>> {
+        self.query(|p| p.qualified_method_declarations(self.file_id, module_name, method_name))
+    }
+
+    pub(crate) fn command_module_export_protection(
+        &self,
+    ) -> Option<hir::CommandModuleExportProtection> {
+        self.query(|p| p.command_module_export_protection(self.file_id))
+    }
+
+    pub(crate) fn notify_handler_availability_in_registration(
+        &self,
+        registration: &hir::call_graph::NotifyReg,
+        methods: &[hir::MethodId],
+    ) -> hir::NotifyHandlerAvailability {
+        self.query(|p| {
+            p.notify_handler_availability_in_registration(self.file_id, registration, methods)
+        })
+    }
+
+    pub(crate) fn notify_handler_availability_for_method_bodies_in_registration(
+        &self,
+        registration: &hir::call_graph::NotifyReg,
+        method_bodies: &[Vec<hir::MethodId>],
+        incomplete_tail: bool,
+    ) -> hir::NotifyHandlerAvailability {
+        self.query(|p| {
+            p.notify_handler_availability_for_method_bodies_in_registration(
+                self.file_id,
+                registration,
+                method_bodies,
+                incomplete_tail,
+            )
+        })
     }
 
     pub fn module_implicit_field_names(&self) -> Vec<String> {

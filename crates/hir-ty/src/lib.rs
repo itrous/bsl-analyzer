@@ -27,6 +27,9 @@ pub mod method_resolution;
 pub mod min_platform;
 pub mod module_implicit;
 pub mod narrow;
+pub(crate) mod notify_array;
+pub mod notify_export_protection;
+pub mod notify_targets;
 pub mod object_resolver;
 pub mod platform_global_lookup;
 pub mod platform_manager_lookup;
@@ -79,16 +82,26 @@ pub use infer::{
 };
 pub use lower::TyLoweringContext;
 pub use manager_lookup::{lookup_manager_field, ManagerMemberInfo};
-pub use method_environment::owner_body_env;
+pub use method_environment::{
+    method_has_form_context, notify_handler_availability_for_method_bodies_in_registration,
+    notify_handler_availability_in_registration, notify_handler_methods,
+    notify_method_is_exported_in_registration, notify_methods_exported_in_registrations,
+    owner_body_env, owner_has_form_context, NotifyHandlerAvailability,
+};
 pub use method_lookup::{lookup_method, MethodInfo};
 pub use method_resolution::{resolve_qualified_call, MethodResolution};
 pub use module_implicit::module_implicit_fields;
+pub use notify_export_protection::{
+    command_module_export_protection, command_module_export_verdict, CommandModuleExportProtection,
+    CommandModuleExportVerdict,
+};
 pub use object_resolver::{
     ConfigsObjectResolver, DbObjectResolver, MetadataResolution, ObjectResolver,
 };
 pub use platform_global_lookup::{
-    bare_global_name_claim, manager_collection_env, resolve_platform_global_property_type,
-    unassignable_global_property, BareGlobalClaim, BodyShadowScope,
+    bare_global_name_claim, manager_collection_env, nonlocal_common_module_receiver,
+    resolve_platform_global_property_type, unassignable_global_property, BareGlobalClaim,
+    BodyShadowScope,
 };
 pub use platform_manager_lookup::{
     platform_methods_for_manager, platform_methods_for_metadata_kind,

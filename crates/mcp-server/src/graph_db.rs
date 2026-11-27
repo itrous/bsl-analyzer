@@ -29,8 +29,10 @@ use stdx::batch::BatchBudget;
 use vfs::FileId;
 
 #[cfg(test)]
+use crate::graph::input::build_source_root;
+#[cfg(test)]
 use crate::graph::input::enumerate_bsl_files;
-use crate::graph::input::{build_source_root, db_for_files};
+use crate::graph::input::{db_for_files, db_for_files_in_snapshot, GraphBatchSnapshot};
 
 /// Bumped whenever the table layout OR the persisted edge/node content changes so a
 /// stale on-disk cache from an older binary is rejected (via the `meta` row) and
@@ -88,7 +90,16 @@ use crate::graph::input::{build_source_root, db_for_files};
 // 25: the row encoder strips the workspace root whichever way Windows spells it, so a full build
 // there mints `method/file/<rel>::<name>` where version 24 minted `method/file/<basename>::<name>`
 // and an incremental patch minted the former: one database could hold both for one method.
-pub(crate) const SCHEMA_VERSION: u32 = 25;
+// 26: notification-reference extraction now recognizes `CallbackDescription` and rejects
+// receivers shadowed by body bindings, assignments, or module variables. Version-25 graphs can
+// therefore contain missing or spurious `notify_ref` edges even when the source fingerprint is
+// unchanged, so they must be rebuilt before serving.
+// 27: the freshness token includes the served platform-help snapshot contents. A version-26 graph
+// can reflect a different corpus from the current process even when all workspace files match.
+// 28: a graph build refuses a semantic notify projection that stopped at its work budget.
+// Version-27 graphs can contain only a prefix of its `notify_ref` edges, and no fingerprint
+// component notices that omission, so they must be rebuilt before serving.
+pub(crate) const SCHEMA_VERSION: u32 = 28;
 
 /// One file's persisted identity in the `files` table: its complete content hash,
 /// a compact projection retained for the existing drift API, and (for `.bsl`) its
@@ -111,18 +122,18 @@ pub(crate) struct FileFingerprint {
     pub observation: Option<crate::graph::content_hash::Observation>,
 }
 
-/// The workspace identity a graph build reflects, as two independent components.
-/// `files` folds every graph-relevant file's `(root_id, path, content_hash)`; `topology`
-/// identifies the extension dependency graph (declared roots + `dependsOn`
-/// closures). Kept structured — not XOR-folded into one word — so a change in one
-/// component can never algebraically cancel a change in the other, and so a
-/// consumer can tell a topology-triggered rebuild from a plain file edit.
+/// The workspace identity a graph build reflects. `files` folds graph-relevant file
+/// contents; `topology` identifies extension dependencies; `platform_help` identifies
+/// the resolved platform-help snapshot used by semantic graph construction. Kept
+/// structured so changes in one component cannot cancel another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GraphFp {
     /// Stable BLAKE3 fold of the durable file keys and complete content hashes.
     pub files: u64,
     /// Stable hash of the extension-topology fingerprint.
     pub topology: u64,
+    /// Stable hash of the served platform-help snapshot contents.
+    pub platform_help: u64,
 }
 
 /// Build-level metadata recorded in the `meta` table, used on reopen to decide
@@ -131,7 +142,7 @@ pub struct GraphFp {
 pub struct GraphMeta {
     /// The [`GraphState`](crate::graph) generation this build reflects.
     pub revision: u64,
-    /// Workspace identity (portable file contents + extension topology) at build time.
+    /// Graph inputs (portable file contents, extension topology, and platform-help snapshot).
     pub fingerprint: GraphFp,
     /// Number of `.bsl` files indexed.
     pub files: usize,
@@ -534,12 +545,13 @@ impl GraphDbWriter {
         let nodes: i64 = self.conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
         let edges: i64 = self.conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
 
-        let rows: [(&str, String); 9] = [
+        let rows: [(&str, String); 10] = [
             ("schema_version", SCHEMA_VERSION.to_string()),
             ("publication_id", meta.publication_id.clone()),
             ("revision", meta.revision.to_string()),
             ("fingerprint", meta.fingerprint.files.to_string()),
             ("topology_fp", meta.fingerprint.topology.to_string()),
+            ("platform_help_fp", meta.fingerprint.platform_help.to_string()),
             ("files", meta.files.to_string()),
             ("built_at", meta.built_at.clone()),
             ("nodes", nodes.to_string()),
@@ -1177,10 +1189,10 @@ pub(crate) fn build_graph_database_inner(
         ),
     );
 
-    // The whole-workspace source root, built once and shared (cheap `Arc` clone)
-    // into every per-batch database, so the 25k-path file set is assembled a single
-    // time for the build rather than re-cloned per batch.
-    let source_root = build_source_root(files);
+    // One immutable source root and file-revision view serve every batch. Capturing
+    // revisions here lets cross-batch resolution read lazily without registering the
+    // whole workspace in every temporary database.
+    let source_snapshot = GraphBatchSnapshot::capture(files);
 
     let mut writer = GraphDbWriter::create(out_path)?;
     writer.set_workspace_roots(project.search_roots.as_ref());
@@ -1225,8 +1237,12 @@ pub(crate) fn build_graph_database_inner(
         let mut open_batch = |batch: &[ModuleId]| -> RootDatabaseImpl {
             let batch_files: Vec<(FileId, PathBuf)> =
                 batch.iter().map(|m| (m.file_id, file_paths[&m.file_id].clone())).collect();
-            let loaded =
-                db_for_files(&source_root, &batch_files, &project.configs, Some(&config_cache));
+            let loaded = db_for_files_in_snapshot(
+                &source_snapshot,
+                &batch_files,
+                &project.configs,
+                Some(&config_cache),
+            );
             unread.extend(loaded.unread);
             loaded.db
         };
@@ -1254,8 +1270,16 @@ pub(crate) fn build_graph_database_inner(
     let (summary, mut writer) = match (built, writer.finish()) {
         (Ok(summary), Ok(writer)) => (summary, writer),
         (_, Err(writer_error)) => return Err(writer_error),
-        (Err(build_error), Ok(_)) => return Err(build_error),
+        (Err(build_error), Ok(_)) => {
+            if source_snapshot.has_drifted() {
+                anyhow::bail!("graph source changed after the frozen batch snapshot was captured");
+            }
+            return Err(build_error);
+        }
     };
+    if source_snapshot.has_drifted() {
+        anyhow::bail!("graph source changed after the frozen batch snapshot was captured");
+    }
 
     // Persist a per-file fingerprint for every graph-relevant file (`.bsl` + `.xml`),
     // from the SAME scanned universe the build lowered — not a fresh walk, which
@@ -1822,7 +1846,7 @@ pub(crate) fn compute_body_patch_with_metadata(
         });
     }
 
-    let source_root = build_source_root(files);
+    let source_snapshot = GraphBatchSnapshot::capture(files);
     let config_cache = std::sync::Arc::new(ide::GraphConfigCache::default());
     // The patch's own report covers the WHOLE universe, not just `changed`: the
     // index pass opens `all_modules` through this same closure.
@@ -1830,8 +1854,12 @@ pub(crate) fn compute_body_patch_with_metadata(
     let mut open_batch = |batch: &[ModuleId]| -> RootDatabaseImpl {
         let batch_files: Vec<(FileId, PathBuf)> =
             batch.iter().map(|m| (m.file_id, file_paths[&m.file_id].clone())).collect();
-        let loaded =
-            db_for_files(&source_root, &batch_files, &project.configs, Some(&config_cache));
+        let loaded = db_for_files_in_snapshot(
+            &source_snapshot,
+            &batch_files,
+            &project.configs,
+            Some(&config_cache),
+        );
         unread.extend(loaded.unread);
         loaded.db
     };
@@ -1873,7 +1901,13 @@ pub(crate) fn compute_body_patch_with_metadata(
             None,
             Some(&ticker),
         )
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        .map_err(|error| {
+            if source_snapshot.has_drifted() {
+                anyhow::anyhow!("graph source changed after the frozen batch snapshot was captured")
+            } else {
+                anyhow::anyhow!("{error}")
+            }
+        })?;
         ide::ReprojectedRows {
             nodes: projected_nodes,
             edges: projected_edges,
@@ -1900,7 +1934,13 @@ pub(crate) fn compute_body_patch_with_metadata(
             &mut open_batch,
             Some(&ticker),
         )
-        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .map_err(|error| {
+            if source_snapshot.has_drifted() {
+                anyhow::anyhow!("graph source changed after the frozen batch snapshot was captured")
+            } else {
+                anyhow::anyhow!("{error}")
+            }
+        })?
     };
 
     // A form-module BSL add/remove changes whether the cold graph projects that
@@ -1971,8 +2011,8 @@ pub(crate) fn compute_body_patch_with_metadata(
                 .iter()
                 .map(|module| (module.file_id, file_paths[&module.file_id].clone()))
                 .collect();
-            let loaded = db_for_files(
-                &source_root,
+            let loaded = db_for_files_in_snapshot(
+                &source_snapshot,
                 &projection_files,
                 &project.configs,
                 Some(&config_cache),
@@ -1994,6 +2034,10 @@ pub(crate) fn compute_body_patch_with_metadata(
             // matter which metadata owner changed. `clear_graph` below writes that
             // exact empty projection in the same transaction.
         }
+    }
+
+    if source_snapshot.has_drifted() {
+        anyhow::bail!("graph source changed after the frozen batch snapshot was captured");
     }
 
     let mut metadata_node_prefixes = Vec::new();
@@ -2583,11 +2627,12 @@ fn write_body_patch(
         // never force-stale.
         let node_count: i64 = tx.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
         let edge_count: i64 = tx.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
-        let meta_rows: [(&str, String); 9] = [
+        let meta_rows: [(&str, String); 10] = [
             ("publication_id", meta.publication_id.clone()),
             ("revision", meta.revision.to_string()),
             ("fingerprint", meta.fingerprint.files.to_string()),
             ("topology_fp", meta.fingerprint.topology.to_string()),
+            ("platform_help_fp", meta.fingerprint.platform_help.to_string()),
             ("files", modules.to_string()),
             ("built_at", meta.built_at.clone()),
             ("nodes", node_count.to_string()),
@@ -3100,7 +3145,7 @@ mod tests {
         w.write_edges(&[edge("method/common/X/A", "method/common/X/B")]).unwrap();
         w.finalize(&GraphMeta {
             revision: 1,
-            fingerprint: GraphFp { files: 42, topology: 7 },
+            fingerprint: GraphFp { files: 42, topology: 7, platform_help: 0 },
             files: 1,
             built_at: "2026-06-01T00:00:00Z".to_string(),
             publication_id: "test-1".to_owned(),
@@ -3426,7 +3471,7 @@ mod tests {
         w.write_edges(&[sub_edge]).unwrap();
         w.finalize(&GraphMeta {
             revision: 1,
-            fingerprint: GraphFp { files: 1, topology: 0 },
+            fingerprint: GraphFp { files: 1, topology: 0, platform_help: 0 },
             files: 1,
             built_at: "t".to_string(),
             publication_id: "test-1".to_owned(),

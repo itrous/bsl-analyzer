@@ -68,7 +68,7 @@ fn call_hierarchy_index_overlay_prefers_frozen_open_buffer_text() {
     db.set_file_revision_from_disk(file_id, content_revision("Процедура НаДиске() КонецПроцедуры"));
     let uri = Url::from_file_path(&path).expect("file URL");
     let mut mem_docs = MemDocs::default();
-    mem_docs.insert(uri, "Процедура Буфер() КонецПроцедуры".to_owned(), 1);
+    mem_docs.insert(uri.clone(), "Процедура Буфер() КонецПроцедуры".to_owned(), 1);
     let snapshot = CallHierarchyIndexFrozenSnapshot::capture(
         &db,
         source_root_id,
@@ -85,6 +85,217 @@ fn call_hierarchy_index_overlay_prefers_frozen_open_buffer_text() {
     // Then: the batch sees the captured open-buffer text, not either disk revision.
     let text = Analysis::from_database(batch).file_text(file_id);
     assert_eq!(&*text, "Процедура Буфер() КонецПроцедуры");
+
+    let refreshed_text = "Процедура ОбновлённыйБуфер() КонецПроцедуры";
+    let mut refreshed_docs = MemDocs::default();
+    refreshed_docs.insert(uri, refreshed_text.to_owned(), 2);
+    let refreshed = snapshot.refresh(&refreshed_docs.freeze());
+    let refreshed_batch = refreshed.open_batch(&[ModuleId::new(file_id)]);
+    let text = Analysis::from_database(refreshed_batch).file_text(file_id);
+    assert_eq!(&*text, refreshed_text);
+}
+
+#[test]
+fn call_hierarchy_index_batch_reads_cross_batch_targets_from_frozen_revisions() {
+    // Given: a caller, an exported common-module target, and an unrelated module.
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let config_root = directory.path().join("src");
+    let caller_path = config_root.join("CommonModules/Первый/Ext/Module.bsl");
+    let target_path = config_root.join("CommonModules/Второй/Ext/Module.bsl");
+    let unrelated_path = config_root.join("CommonModules/Третий/Ext/Module.bsl");
+    std::fs::create_dir_all(caller_path.parent().unwrap()).expect("caller directory");
+    std::fs::create_dir_all(target_path.parent().unwrap()).expect("target directory");
+    std::fs::create_dir_all(unrelated_path.parent().unwrap()).expect("unrelated directory");
+    let caller_text = "Процедура Начать()\nВторой.Продолжить();\nКонецПроцедуры";
+    let target_disk_text = "Процедура Продолжить() Экспорт\nКонецПроцедуры";
+    let target_text = "Процедура Продолжить() Экспорт\nВызовИзБуфера();\nКонецПроцедуры";
+    let unrelated_text = "Процедура Независимый() КонецПроцедуры";
+    std::fs::write(&caller_path, caller_text).expect("caller module");
+    std::fs::write(&target_path, target_disk_text).expect("target module");
+    std::fs::write(&unrelated_path, unrelated_text).expect("unrelated module");
+    // CommonModules marks a configuration root, so declare the target module as a
+    // real project would; otherwise the resolver correctly rejects this fixture.
+    std::fs::write(config_root.join("Configuration.xml"), "<Configuration/>")
+        .expect("configuration metadata");
+    std::fs::write(
+        config_root.join("CommonModules/Второй.xml"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <CommonModule uuid="00000000-0000-0000-0000-000000000031">
+        <Properties><Name>Второй</Name><Server>true</Server></Properties>
+    </CommonModule>
+</MetaDataObject>"#,
+    )
+    .expect("target common-module metadata");
+
+    let source_root_id = SourceRootId(0);
+    let caller_file = FileId(0);
+    let target_file = FileId(1);
+    let unrelated_file = FileId(2);
+    let mut file_set = FileSet::new();
+    file_set.insert(caller_file, VfsPath::new(caller_path));
+    file_set.insert(target_file, VfsPath::new(target_path.clone()));
+    file_set.insert(unrelated_file, VfsPath::new(unrelated_path));
+    let mut db = RootDatabaseImpl::default();
+    db.set_source_root(source_root_id, SourceRoot::new_local(file_set));
+    db.set_workspace_configs_snapshot(ide::WorkspaceConfigsSnapshot::from_paths(vec![(
+        None,
+        config_root,
+    )]));
+    for (file_id, text) in [
+        (caller_file, caller_text),
+        (target_file, target_disk_text),
+        (unrelated_file, unrelated_text),
+    ] {
+        db.set_file_source_root(file_id, source_root_id);
+        db.set_file_revision_from_disk(file_id, content_revision(text));
+    }
+    let target_uri = Url::from_file_path(&target_path).expect("target URL");
+    let mut mem_docs = MemDocs::default();
+    mem_docs.insert(target_uri, target_text.to_owned(), 1);
+    let snapshot = CallHierarchyIndexFrozenSnapshot::capture(
+        &db,
+        source_root_id,
+        &mem_docs.freeze(),
+        7,
+        disk_read(),
+    )
+    .materialize();
+
+    // When: the disk file changes after capture and only the caller is opened.
+    std::fs::write(&target_path, "Процедура ИзмененаНаДиске() Экспорт\nКонецПроцедуры")
+        .expect("rewrite target module");
+    let caller_batch = snapshot.open_batch(&[ModuleId::new(caller_file)]);
+
+    // Then: an unregistered cross-batch target reads from the frozen overlay,
+    // while an unrelated closed module remains disk-backed and also stays unregistered.
+    assert!(caller_batch.try_file_revision_input(target_file).is_none());
+    assert!(caller_batch.try_file_revision_input(unrelated_file).is_none());
+    assert_eq!(
+        caller_batch.file_source_root_input(target_file).source_root_id(&caller_batch),
+        source_root_id,
+    );
+    let analysis = Analysis::from_database(caller_batch.clone());
+    assert_eq!(&*analysis.file_text(target_file), target_text);
+    assert_eq!(&*analysis.file_text(unrelated_file), unrelated_text);
+
+    let modules = snapshot.modules();
+    let mut open_batch = |batch: &[ModuleId]| snapshot.open_batch(batch);
+
+    // The bounded builder lowers the caller with its cross-batch target available.
+    let built = ide::build_call_hierarchy_index(
+        ide::CallHierarchyIndexBuildRequest::new(&modules, 1).with_concurrency(1),
+        &mut open_batch,
+    )
+    .expect("bounded index build");
+
+    assert_eq!(built.method_count, 3);
+    assert_eq!(built.pair_count, 1);
+    assert_eq!(
+        built.index.callers(hir::MethodId {
+            module: ModuleId::new(target_file),
+            local_id: hir::MethodKey::first("Продолжить"),
+        }),
+        &[hir::MethodId {
+            module: ModuleId::new(caller_file),
+            local_id: hir::MethodKey::first("Начать"),
+        }],
+    );
+}
+
+#[test]
+fn call_hierarchy_index_batch_revision_registration_is_linear() {
+    fn registration_counts(module_count: usize) -> (usize, usize) {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_root_id = SourceRootId(0);
+        let mut file_set = FileSet::new();
+        let mut contents = Vec::new();
+        for index in 0..module_count {
+            let module_name = format!("Модуль{index}");
+            let next_module = format!("Модуль{}", (index + 1) % module_count);
+            let path =
+                directory.path().join(format!("src/CommonModules/{module_name}/Ext/Module.bsl"));
+            std::fs::create_dir_all(path.parent().unwrap()).expect("module directory");
+            let text = format!(
+                "Процедура Вызов{index}()\n{next_module}.Цель();\nКонецПроцедуры\n\
+                 Процедура Цель() Экспорт\nКонецПроцедуры"
+            );
+            std::fs::write(&path, &text).expect("module");
+            file_set.insert(FileId(index as u32), VfsPath::new(path));
+            contents.push(text);
+        }
+
+        let mut db = RootDatabaseImpl::default();
+        db.set_source_root(source_root_id, SourceRoot::new_local(file_set));
+        for (index, text) in contents.iter().enumerate() {
+            let file_id = FileId(index as u32);
+            db.set_file_source_root(file_id, source_root_id);
+            db.set_file_revision_from_disk(file_id, content_revision(text));
+        }
+        let snapshot = CallHierarchyIndexFrozenSnapshot::capture(
+            &db,
+            source_root_id,
+            &MemDocs::default().freeze(),
+            7,
+            disk_read(),
+        )
+        .materialize();
+        let modules = snapshot.modules();
+        let mut explicit_registrations = Vec::new();
+        let mut open_batch = |batch: &[ModuleId]| {
+            let db = snapshot.open_batch(batch);
+            explicit_registrations.push(
+                snapshot
+                    .file_set
+                    .keys()
+                    .filter(|&&file_id| db.try_file_revision_input(file_id).is_some())
+                    .count(),
+            );
+            db
+        };
+        let built = ide::build_call_hierarchy_index(
+            ide::CallHierarchyIndexBuildRequest::new(&modules, 1).with_concurrency(1),
+            &mut open_batch,
+        )
+        .expect("bounded index build");
+        drop(open_batch);
+
+        let started_batches: Vec<_> = built
+            .batch_events
+            .iter()
+            .filter(|event| event.kind == ide::CallHierarchyBatchEventKind::Started)
+            .collect();
+        let index_batch_sizes: Vec<_> = started_batches
+            .iter()
+            .filter(|event| event.phase == ide::CallHierarchyBatchPhase::Index)
+            .map(|event| event.module_count)
+            .collect();
+        let pair_batch_sizes: Vec<_> = started_batches
+            .iter()
+            .filter(|event| event.phase == ide::CallHierarchyBatchPhase::MethodPairs)
+            .map(|event| event.module_count)
+            .collect();
+        let index_batch_count = index_batch_sizes.len();
+        let (index_registrations, pair_registrations) =
+            explicit_registrations.split_at(index_batch_count);
+        assert_eq!(index_registrations, index_batch_sizes);
+        assert_eq!(pair_registrations, pair_batch_sizes);
+
+        let index_total = index_registrations.iter().sum();
+        let pair_total = pair_registrations.iter().sum();
+        assert_eq!(index_total, module_count);
+        assert_eq!(pair_total, module_count);
+        (index_total, pair_total)
+    }
+
+    // Pass 1 opens extraction batches; pass 2 opens larger resolution chunks.
+    // Both paths register only their caller modules, so their total explicit
+    // Salsa inputs scale linearly rather than multiplying by the whole workspace.
+    let (small_index, small_pairs) = registration_counts(4);
+    let (large_index, large_pairs) = registration_counts(8);
+    assert_eq!((small_index, small_pairs), (4, 4));
+    assert_eq!((large_index, large_pairs), (8, 8));
+    assert_eq!(large_index + large_pairs, 2 * (small_index + small_pairs));
 }
 
 #[test]
@@ -120,6 +331,56 @@ fn call_hierarchy_index_overlay_uses_captured_disk_revision_after_buffer_closes(
     // Then: the batch falls back to the captured disk revision, not empty text.
     let text = Analysis::from_database(batch).file_text(file_id);
     assert_eq!(&*text, disk_text);
+}
+
+#[test]
+fn call_hierarchy_index_overlay_refresh_after_close_rejects_disk_drift() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let caller_path = directory.path().join("Caller.bsl");
+    let target_path = directory.path().join("Target.bsl");
+    let caller_text = "Процедура Начать() КонецПроцедуры";
+    let target_disk_text = "Процедура НаДиске() КонецПроцедуры";
+    let target_buffer_text = "Процедура ВБуфере() КонецПроцедуры";
+    std::fs::write(&caller_path, caller_text).expect("caller module");
+    std::fs::write(&target_path, target_disk_text).expect("target module");
+
+    let caller_file = FileId(0);
+    let target_file = FileId(1);
+    let source_root_id = SourceRootId(0);
+    let mut file_set = FileSet::new();
+    file_set.insert(caller_file, VfsPath::new(caller_path));
+    file_set.insert(target_file, VfsPath::new(target_path.clone()));
+    let mut db = RootDatabaseImpl::default();
+    db.set_source_root(source_root_id, SourceRoot::new_local(file_set));
+    for (file_id, text) in [(caller_file, caller_text), (target_file, target_disk_text)] {
+        db.set_file_source_root(file_id, source_root_id);
+        db.set_file_revision_from_disk(file_id, content_revision(text));
+    }
+    let target_uri = Url::from_file_path(&target_path).expect("target URL");
+    let mut mem_docs = MemDocs::default();
+    mem_docs.insert(target_uri, target_buffer_text.to_owned(), 1);
+    let snapshot = CallHierarchyIndexFrozenSnapshot::capture(
+        &db,
+        source_root_id,
+        &mem_docs.freeze(),
+        7,
+        disk_read(),
+    );
+
+    std::fs::write(&target_path, "Процедура ПослеСнимка() КонецПроцедуры")
+        .expect("rewrite target after capture");
+    let refreshed = snapshot.refresh(&MemDocs::default().freeze());
+    let caller_batch = refreshed.open_batch(&[ModuleId::new(caller_file)]);
+    assert!(caller_batch.try_file_revision_input(target_file).is_none());
+
+    let drift = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Analysis::from_database(caller_batch).file_text(target_file);
+    }))
+    .expect_err("closing the overlay must not hide later disk drift");
+    assert!(matches!(
+        drift.downcast_ref::<salsa::Cancelled>(),
+        Some(salsa::Cancelled::PendingWrite)
+    ));
 }
 
 #[test]

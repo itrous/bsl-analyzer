@@ -71,14 +71,38 @@ pub fn incoming_calls<DB: RootDatabase + ConfigsDatabase>(
 
 /// Methods called by the method under the cursor, each with the ranges of the
 /// call sites inside the anchor method.
+///
+/// `None` when the position is not on a method (callers validate the anchor with
+/// [`prepare_call_hierarchy`] first), or when the anchor module's semantic notify
+/// projection stopped at its work budget: the module's registrations were only
+/// partly read, so an outgoing answer built on them cannot be told apart from a
+/// complete one. The answer is withheld instead of served as full — a consumer
+/// must not read `None` as "no outgoing calls", the same way the incoming index
+/// build refuses to publish a partly read projection. Direct-call edges are
+/// unaffected by that budget, but the LSP protocol cannot say "notify entries
+/// are missing", so the whole answer stays unpublished.
 pub fn outgoing_calls<DB: RootDatabase + ConfigsDatabase>(
     db: &DB,
     file_id: FileId,
     offset: TextSize,
-) -> Vec<CallHierarchyCall> {
-    let Some(source) = method_at(db, file_id, offset) else {
-        return Vec::new();
-    };
+) -> Option<Vec<CallHierarchyCall>> {
+    let source = method_at(db, file_id, offset)?;
+    let notify_projection_incomplete =
+        db.module_call_summary(source.module).notify_projection_incomplete;
+    outgoing_calls_impl(db, source, notify_projection_incomplete)
+}
+
+/// [`outgoing_calls`] with the incompleteness fact injected: the flag lives on the
+/// semantic notify summary, which is read from the database, so tests supply it
+/// directly instead of reproducing a budget exhaustion.
+fn outgoing_calls_impl<DB: RootDatabase + ConfigsDatabase>(
+    db: &DB,
+    source: MethodId,
+    notify_projection_incomplete: bool,
+) -> Option<Vec<CallHierarchyCall>> {
+    if notify_projection_incomplete {
+        return None;
+    }
 
     let summary = db.resolved_module_summary(source.module);
     let mut by_callee: FxHashMap<MethodId, Vec<TextRange>> = FxHashMap::default();
@@ -97,14 +121,15 @@ pub fn outgoing_calls<DB: RootDatabase + ConfigsDatabase>(
         ranges.push(edge.range);
     }
 
-    order
+    let calls = order
         .into_iter()
         .filter_map(|callee| {
             let ranges = by_callee.remove(&callee)?;
             let item = item_for_method(db, callee)?;
             Some(CallHierarchyCall { item, ranges })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    Some(calls)
 }
 
 fn method_at<DB: RootDatabase>(db: &DB, file_id: FileId, offset: TextSize) -> Option<MethodId> {
@@ -210,7 +235,8 @@ mod tests {
     fn outgoing_lists_callees_with_every_call_site() {
         let (db, file_id) = single_file(MODULE);
         // Anchor on the declaration of Второй, which calls Помощник twice.
-        let calls = outgoing_calls(&db, file_id, offset_of(MODULE, "Второй"));
+        let calls = outgoing_calls(&db, file_id, offset_of(MODULE, "Второй"))
+            .expect("a complete projection publishes the outgoing answer");
         assert_eq!(calls.len(), 1, "Второй calls a single distinct method");
         assert_eq!(calls[0].item.name, "Помощник");
         assert_eq!(calls[0].ranges.len(), 2, "both call sites reported");
@@ -316,6 +342,23 @@ mod tests {
     fn outgoing_from_leaf_method_is_empty() {
         let (db, file_id) = single_file(MODULE);
         // Помощник calls nothing; anchor on its declaration (first occurrence).
-        assert!(outgoing_calls(&db, file_id, offset_of(MODULE, "Помощник")).is_empty());
+        let calls = outgoing_calls(&db, file_id, offset_of(MODULE, "Помощник"))
+            .expect("a complete module answers, even with no outgoing calls");
+        assert!(calls.is_empty());
+    }
+
+    /// A partial notify projection must not reach the outgoing answer: `None` says
+    /// "withheld", which a consumer cannot confuse with the empty complete answer.
+    #[test]
+    fn incomplete_notify_projection_withholds_the_outgoing_answer() {
+        let (db, file_id) = single_file(MODULE);
+        let source = method_id(&db, file_id, MODULE, "Второй");
+        assert!(
+            outgoing_calls_impl(&db, source, true).is_none(),
+            "a truncated projection withholds the answer instead of publishing a prefix"
+        );
+        let calls = outgoing_calls_impl(&db, source, false)
+            .expect("the same module with a complete projection answers");
+        assert_eq!(calls.len(), 1);
     }
 }

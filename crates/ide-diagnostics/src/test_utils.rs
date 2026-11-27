@@ -664,12 +664,47 @@ impl ide_db::provider::AnalysisProvider for MetadataTestProvider {
         std::sync::Arc::clone(&self.metadata)
     }
 
+    fn module_implicit_field_names(&self, _file_id: vfs::FileId) -> Vec<String> {
+        let mut names = Vec::new();
+        if let Some(mdo) = &self.metadata.mdo {
+            names.extend(mdo.attributes.iter().map(|attribute| attribute.name.as_str()));
+            names.extend(mdo.tabular_sections.iter().map(|section| section.name()));
+            names.extend(mdo.common_attributes.iter().map(|field| field.name.as_str()));
+        }
+        if let Some(register) = &self.metadata.register {
+            names.extend(register.dimensions().iter().map(|dimension| dimension.name()));
+            names.extend(register.resources().iter().map(|resource| resource.name()));
+            names.extend(register.attributes().iter().map(|attribute| attribute.name()));
+            names.extend(register.common_attributes().iter().map(|field| field.name.as_str()));
+        }
+        if let Some(form) = &self.metadata.form {
+            names.extend(form.attributes().iter().map(|attribute| attribute.name.as_str()));
+        }
+        names.into_iter().map(stdx::case::fold_lower_per_char).collect()
+    }
+
     /// The test file stands for a module of the main configuration.
     fn vendor_support_for_file(
         &self,
         _file_id: vfs::FileId,
     ) -> Option<std::sync::Arc<bsl_metadata::VendorSupport>> {
         self.db.vendor_support()
+    }
+
+    fn notify_candidates(&self, file_id: vfs::FileId) -> std::sync::Arc<Vec<hir::NotifyCandidate>> {
+        let input = ide_db::base_db::FileIdInput::new(&self.db, file_id);
+        hir::semantic_notify_candidates_query(&self.db, input)
+    }
+
+    fn command_module_export_protection(
+        &self,
+        file_id: vfs::FileId,
+    ) -> Option<hir::CommandModuleExportProtection> {
+        hir::command_module_export_protection(
+            &self.db,
+            || self.notify_candidates(file_id),
+            || self.symbol_tree(hir::ModuleId::new(file_id)),
+        )
     }
 
     fn call_summary(&self, module_id: hir::ModuleId) -> std::sync::Arc<hir::ModuleCallSummary> {
@@ -1530,6 +1565,21 @@ pub(crate) fn check_cfe_at_with_db_setup(
             file_set.insert(fid, VfsPath::new(path.to_string_lossy().into_owned()));
             module_files.push((fid, body, spelling));
         }
+    }
+
+    // A paired extension object module needs its base body in the source database for
+    // effective/weaving inference. Register that one counterpart when the fixture writes it;
+    // ordinary CFE fixtures remain unchanged when no such file exists.
+    let paired_base_path = fixture.root().join(caller_relative);
+    let paired_base_spelling = relative_to_root(&paired_base_path);
+    if paired_base_path.is_file()
+        && !module_files.iter().any(|(_, _, spelling)| spelling == &paired_base_spelling)
+    {
+        let fid = FileId((module_files.len() + 1) as u32);
+        let body = std::fs::read_to_string(&paired_base_path)
+            .expect("read paired base object-module fixture");
+        file_set.insert(fid, VfsPath::new(paired_base_path.to_string_lossy().into_owned()));
+        module_files.push((fid, body, paired_base_spelling));
     }
 
     let source_root = SourceRoot::new_local(file_set);

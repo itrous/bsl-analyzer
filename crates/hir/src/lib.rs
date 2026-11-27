@@ -31,6 +31,12 @@ pub use hir_ty::{
     BareGlobalClaim, BodyShadowScope,
 };
 pub use hir_ty::{is_form_items_collection_ty, FORM_ITEMS_TYPE_EN, FORM_ITEMS_TYPE_RU};
+pub use hir_ty::{
+    method_has_form_context, notify_handler_availability_for_method_bodies_in_registration,
+    notify_handler_availability_in_registration, notify_handler_methods,
+    notify_method_is_exported_in_registration, notify_methods_exported_in_registrations,
+    owner_has_form_context, NotifyHandlerAvailability,
+};
 pub use hir_ty::{PlatformMethodHandle, PlatformMethodOrigin};
 pub use name_classify::{classify_token, NameClass};
 pub use semantic_symbol::{
@@ -42,8 +48,9 @@ pub use type_facade::{
     kernel_type_is_boolean, kernel_type_is_fixed_structure, kernel_type_is_form_data_structure,
     kernel_type_is_metadata_reference, kernel_type_is_structure, kernel_type_label,
     kernel_union_member_labels, module_implicit_field_names, module_implicit_fields,
-    platform_name_entries, root_metadata_object_type, root_metadata_ref_type,
-    root_object_manager_type, Field, HirFieldOrigin, PlatformNameEntry, PlatformNameKind, Type,
+    platform_help_available, platform_name_entries, root_metadata_object_type,
+    root_metadata_ref_type, root_object_manager_type, Field, HirFieldOrigin, PlatformNameEntry,
+    PlatformNameKind, Type,
 };
 
 /// The owning configuration and execution model selected for a source file.
@@ -88,7 +95,8 @@ pub use hir_def::{
 
 pub use hir_def::resolver::{
     AssignmentResolution, GlobalExportCapabilities, GlobalExportDefinition, GlobalExportEntry,
-    GlobalExportHost, GlobalExports, GlobalSurfaceGap, Resolver,
+    GlobalExportHost, GlobalExports, GlobalSurfaceGap, QualifiedMethodDeclarations,
+    QualifiedMethodError, Resolver,
 };
 pub use hir_def::scope::{ExprScopes, ScopeDef};
 pub use hir_def::DefDatabase;
@@ -202,8 +210,9 @@ pub use bsl_config::VisibleConfig;
 pub use bsl_types::facet::{FormBindingFacet, FormBindingTargetFacet, MdoRefFacet};
 pub use hir_def::effective_module::{
     all_sdbl_in_effective_file, effective_module_text, item_tree_effective,
-    module_bodies_effective, module_interface_effective, parse_effective,
-    sdbl_hir_for_effective_file, symbol_tree_effective, EffectiveModule, EffectiveModuleId,
+    module_bodies_effective, module_call_summary_effective, module_interface_effective,
+    parse_effective, sdbl_hir_for_effective_file, symbol_tree_effective, EffectiveModule,
+    EffectiveModuleId,
 };
 pub use hir_def::extension_merge::{
     extract_change_and_validate, pair_base_module_path, unquote_bsl_string, Origin, Segment,
@@ -231,8 +240,8 @@ pub use hir_ty::form_self::{
     is_form_self_property_name, managed_form_platform_type_names, FORM_TYPE_NAME,
 };
 pub use hir_ty::infer::{
-    infer_effective, infer_module_code_query, infer_owner, infer_query, infer_weaving,
-    type_of_expr_query,
+    infer_effective, infer_effective_owner, infer_module_code_query, infer_owner, infer_query,
+    infer_weaving, infer_weaving_owner, type_of_expr_query,
 };
 pub use hir_ty::method_graph::{
     infer_method_query, method_return_type_query, set_infer_method_lru_sweep_mode,
@@ -241,6 +250,19 @@ pub use hir_ty::method_resolution::{resolve_qualified_call, MethodResolution};
 pub use hir_ty::narrow::{
     narrow_or_base, narrow_or_base_indexed, narrow_query, narrowed_type_at, NarrowExprIndex,
     NarrowState,
+};
+pub use hir_ty::notify_export_protection::{
+    command_module_export_protection, command_module_export_verdict, CommandModuleExportProtection,
+    CommandModuleExportVerdict,
+};
+pub use hir_ty::notify_targets::{
+    semantic_module_call_summary_effective_query, semantic_module_call_summary_query,
+    semantic_module_call_summary_weaving_query, semantic_notify_candidates_effective_query,
+    semantic_notify_candidates_query, semantic_notify_candidates_weaving_query,
+    semantic_notify_facts_effective_query, semantic_notify_facts_weaving_query,
+    semantic_notify_facts_weaving_with_work_limit, semantic_notify_facts_with_work_limit,
+    NotifyCallbackSlot, NotifyCandidate, NotifyCandidateKind, NotifyCandidateReceiver,
+    NotifySignatureProtection,
 };
 pub use hir_ty::proc_signature;
 pub use hir_ty::query_in_loop::{
@@ -981,6 +1003,177 @@ mod tests {
         db.set_file_text(file_id, source);
 
         (db, file_id)
+    }
+
+    #[test]
+    fn conditional_range_sort_charges_the_budget_before_an_uncancelled_sort() {
+        const REGIONS: usize = 4096;
+        let mut source = String::from("&НаКлиенте\nПроцедура Зарегистрировать()\n");
+        for _ in 0..REGIONS {
+            source.push_str("#Если Сервер Тогда\n#КонецЕсли\n");
+        }
+        source.push_str(
+            "    Описание = Новый ОписаниеОповещения(\"Обработчик\", ЭтотОбъект);\n\n\
+             КонецПроцедуры\n\n&НаКлиенте\nПроцедура Обработчик(Параметр)\nКонецПроцедуры\n",
+        );
+        let (db, file_id) = create_db_with_file(&source);
+
+        // The filter (one candidate) and the index entries (one per region) leave
+        // sort_work(REGIONS) − 1: the log-linear charge must exhaust exactly there,
+        // before the sort runs, while the uncharged linear passes would still fit.
+        let sort_charge = REGIONS * 12; // ceil(log2(REGIONS)) merge levels
+        let exhausted = semantic_notify_facts_with_work_limit(
+            &db,
+            base_db::FileIdInput::new(&db, file_id),
+            REGIONS + sort_charge,
+        );
+        assert!(exhausted.summary.notify_projection_incomplete);
+
+        // The same module finishes inside the default work limit.
+        let complete = semantic_notify_facts_with_work_limit(
+            &db,
+            base_db::FileIdInput::new(&db, file_id),
+            131_072,
+        );
+        assert!(!complete.summary.notify_projection_incomplete);
+    }
+
+    #[test]
+    fn notify_projection_with_zero_budget_does_not_mark_a_module_without_candidates_incomplete() {
+        let source = r#"
+Процедура Первый()
+    Значение = 1;
+КонецПроцедуры
+Процедура Второй()
+    Значение = 2;
+КонецПроцедуры
+Процедура Третий()
+    Значение = 3;
+КонецПроцедуры
+"#;
+        let (db, file_id) = create_db_with_file(source);
+        let facts =
+            semantic_notify_facts_with_work_limit(&db, base_db::FileIdInput::new(&db, file_id), 0);
+        assert!(!facts.summary.notify_projection_incomplete);
+        assert!(facts.summary.notify_regs.is_empty());
+        assert!(facts.notify_candidates.is_empty());
+    }
+
+    #[test]
+    fn named_dynamic_array_gap_does_not_mark_budget_exhaustion() {
+        let source = r#"
+Процедура Зарегистрировать(Параметры, Флаг)
+    Параметры.Добавить("Обработчик");
+    Параметры.Добавить(ЭтотОбъект);
+    Если Флаг Тогда
+        Параметры = Новый Массив;
+        Параметры.Добавить("Другой");
+        Параметры.Добавить(ЭтотОбъект);
+    КонецЕсли;
+    Описание = Новый("CallbackDescription", Параметры);
+КонецПроцедуры
+"#;
+        let (db, file_id) = create_db_with_file(source);
+        let facts = semantic_notify_facts_with_work_limit(
+            &db,
+            base_db::FileIdInput::new(&db, file_id),
+            100_000,
+        );
+        assert!(!facts.summary.notify_projection_incomplete);
+        assert!(
+            !facts.summary.notify_dynamic_signature_analysis_incomplete.is_empty(),
+            "the source-level unknown array is still reported as a named gap"
+        );
+    }
+
+    #[test]
+    fn notify_projection_budget_exhaustion_is_distinct_from_named_array_gaps() {
+        let source = r#"
+Процедура Зарегистрировать()
+    Описание = Новый ОписаниеОповещения("Обработчик", ЭтотОбъект);
+КонецПроцедуры
+"#;
+        let (db, file_id) = create_db_with_file(source);
+        let facts =
+            semantic_notify_facts_with_work_limit(&db, base_db::FileIdInput::new(&db, file_id), 0);
+        assert!(facts.summary.notify_projection_incomplete);
+        assert!(facts.summary.notify_regs.is_empty());
+        assert!(facts.notify_candidates.iter().any(|candidate| {
+            candidate.analysis_incomplete
+                && candidate.signature_protection() == NotifySignatureProtection::Indeterminate
+        }));
+    }
+
+    #[test]
+    fn static_notify_projection_does_not_solve_reaching_definitions() {
+        // The executable solution is only needed to prove a dynamic array's handler.
+        // A static registration in a body whose write index would cost more than this
+        // budget must still complete: an eager solve would exhaust it before the
+        // registration is normalized.
+        let mut source = String::from("Процедура Зарегистрировать()\n");
+        for index in 0..1_000 {
+            source.push_str(&format!("    Перем A{index};\n"));
+        }
+        source.push_str("    Описание = Новый ОписаниеОповещения(\"Обработчик\", ЭтотОбъект);\n");
+        for _ in 0..200 {
+            source.push_str("    Выполнить(\"A0 = 1\");\n");
+        }
+        source.push_str("КонецПроцедуры\n");
+        let (db, file_id) = create_db_with_file(&source);
+        let facts = semantic_notify_facts_with_work_limit(
+            &db,
+            base_db::FileIdInput::new(&db, file_id),
+            100_000,
+        );
+        assert!(
+            !facts.summary.notify_projection_incomplete,
+            "a static-only projection must not spend the budget on an unused executable solve"
+        );
+        assert_eq!(facts.summary.notify_regs.len(), 1);
+    }
+
+    #[test]
+    fn notify_signature_protection_distinguishes_alternative_and_impossible_builds() {
+        let source = r#"
+&НаКлиенте
+Процедура Зарегистрировать()
+#Если МобильныйКлиент Тогда
+    Описание = Новый ОписаниеОповещения("Возможный", ЭтотОбъект);
+#КонецЕсли
+#Если Сервер И Не Сервер Тогда
+    Описание = Новый ОписаниеОповещения("Невозможный", ЭтотОбъект);
+#КонецЕсли
+КонецПроцедуры
+
+&НаКлиенте
+Процедура Возможный(Параметр)
+КонецПроцедуры
+
+&НаКлиенте
+Процедура Невозможный(Параметр)
+КонецПроцедуры
+"#;
+        let (db, file_id) = create_db_with_file(source);
+        let facts = semantic_notify_facts_with_work_limit(
+            &db,
+            base_db::FileIdInput::new(&db, file_id),
+            100_000,
+        );
+        let possible = facts
+            .notify_candidates
+            .iter()
+            .find(|candidate| candidate.callback_name.as_str() == "Возможный")
+            .expect("the alternate mobile build retains the callback candidate");
+        assert!(possible.site_reachable, "another valid build compiles this branch: {possible:#?}");
+        assert_eq!(possible.signature_protection(), NotifySignatureProtection::Protected);
+
+        let impossible = facts
+            .notify_candidates
+            .iter()
+            .find(|candidate| candidate.callback_name.as_str() == "Невозможный")
+            .expect("the semantically contradictory branch remains visible for the verdict");
+        assert!(!impossible.site_reachable, "no environment compiles this branch: {impossible:#?}");
+        assert_eq!(impossible.signature_protection(), NotifySignatureProtection::NotProtected);
     }
 
     #[test]

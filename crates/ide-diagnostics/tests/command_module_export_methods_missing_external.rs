@@ -1,0 +1,18 @@
+#[path = "support/command_module_export_methods.rs"]
+mod command_module_export_methods;
+
+use bsl_platform::{install_platform_help, InstallOutcome, PlatformHelp, PlatformHelpRequest};
+
+#[test]
+fn unavailable_external_facts_silence_command_exports() {
+    let request = PlatformHelpRequest::ExternalPath("missing-corpus.json".into());
+    assert_eq!(
+        install_platform_help(PlatformHelp::missing(request, "unavailable")),
+        Ok(InstallOutcome::Installed)
+    );
+    let (diagnostics, _) = command_module_export_methods::command_module_export_diagnostics();
+    assert!(
+        diagnostics.is_empty(),
+        "missing external facts must not imply unused exports: {diagnostics:#?}"
+    );
+}

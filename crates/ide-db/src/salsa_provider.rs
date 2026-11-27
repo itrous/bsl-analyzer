@@ -3,9 +3,9 @@ use std::sync::Arc;
 use base_db::{FileIdInput, SourceRootId};
 use bsl_metadata::Configuration;
 use hir::{
-    AssignmentResolution, DefWithBodyId, HirDatabase, InferenceDiagnostic, InferenceResult,
-    ItemTree, MethodId, ModuleBodies, ModuleId, ModuleIndex, ModuleMetadata, Name, Resolver,
-    SymbolTree,
+    call_graph::NotifyReg, AssignmentResolution, DefWithBodyId, HirDatabase, InferenceDiagnostic,
+    InferenceResult, ItemTree, MethodId, ModuleBodies, ModuleId, ModuleIndex, ModuleMetadata, Name,
+    Resolver, SymbolTree,
 };
 use syntax::{Parse, SyntaxNode};
 use vfs::FileId;
@@ -92,6 +92,31 @@ impl<'db> SalsaProvider<'db> {
 }
 
 impl AnalysisProvider for SalsaProvider<'_> {
+    fn check_cancellation(&self) {
+        salsa::Database::unwind_if_revision_cancelled(self.db);
+    }
+
+    fn notify_method_is_exported_in_registration(
+        &self,
+        _file_id: FileId,
+        registration: &hir::call_graph::NotifyReg,
+        method: hir::MethodId,
+        methods: &[hir::MethodId],
+    ) -> bool {
+        hir::notify_method_is_exported_in_registration(self.db, registration, method, methods)
+    }
+
+    fn command_module_export_protection(
+        &self,
+        file_id: FileId,
+    ) -> Option<hir::CommandModuleExportProtection> {
+        hir::command_module_export_protection(
+            self.db,
+            || self.notify_candidates(file_id),
+            || self.symbol_tree(ModuleId::new(file_id)),
+        )
+    }
+
     fn configuration(&self) -> Option<Arc<Configuration>> {
         let path_input = self.configuration_path_input?;
         Some(self.db.load_configuration(path_input))
@@ -156,6 +181,58 @@ impl AnalysisProvider for SalsaProvider<'_> {
         name: &str,
     ) -> Option<Arc<bsl_metadata::CommonModule>> {
         self.db.resolve_common_module(file_id, name)
+    }
+
+    fn qualified_method_declarations(
+        &self,
+        file_id: FileId,
+        module_name: &Name,
+        method_name: &Name,
+    ) -> Option<Result<hir::QualifiedMethodDeclarations, hir::QualifiedMethodError>> {
+        Some(
+            Resolver::with_workspace_scope(ModuleId::new(file_id))
+                .resolve_qualified_method_declarations(self.db, module_name, method_name),
+        )
+    }
+
+    fn notify_handler_methods(&self, file_id: FileId, name: &Name) -> Vec<MethodId> {
+        hir::notify_handler_methods(
+            self.db,
+            file_id,
+            name,
+            self.effective_for(file_id),
+            self.weaving_for(file_id),
+        )
+    }
+
+    fn notify_handler_availability_in_registration(
+        &self,
+        file_id: FileId,
+        registration: &NotifyReg,
+        methods: &[MethodId],
+    ) -> hir::NotifyHandlerAvailability {
+        hir::notify_handler_availability_in_registration(
+            self.db,
+            ModuleId::new(file_id),
+            registration,
+            methods,
+        )
+    }
+
+    fn notify_handler_availability_for_method_bodies_in_registration(
+        &self,
+        file_id: FileId,
+        registration: &NotifyReg,
+        method_bodies: &[Vec<MethodId>],
+        incomplete_tail: bool,
+    ) -> hir::NotifyHandlerAvailability {
+        hir::notify_handler_availability_for_method_bodies_in_registration(
+            self.db,
+            ModuleId::new(file_id),
+            registration,
+            method_bodies,
+            incomplete_tail,
+        )
     }
 
     fn resolve_event_subscription(
@@ -394,6 +471,20 @@ impl AnalysisProvider for SalsaProvider<'_> {
         }
     }
 
+    fn owner_has_form_context(&self, file_id: FileId, owner: DefWithBodyId) -> bool {
+        if self.effective_for(file_id).is_some() {
+            match owner {
+                DefWithBodyId::Method(local_id) => hir::method_has_form_context(
+                    self.interface_method(MethodId { module: ModuleId::new(file_id), local_id })
+                        .as_deref(),
+                ),
+                DefWithBodyId::ModuleCode => true,
+            }
+        } else {
+            hir::owner_has_form_context(self.db, file_id, owner)
+        }
+    }
+
     fn interface_method_named(
         &self,
         module_id: ModuleId,
@@ -470,6 +561,30 @@ impl AnalysisProvider for SalsaProvider<'_> {
     }
 
     fn infer_owner(&self, file_id: FileId, owner: DefWithBodyId) -> hir::InferOwnerResult {
+        // Owner inference is a per-body projection of the same merge routing as `infer`:
+        // an effective `#Вставка` body must be inferred in the spliced module context and a
+        // weaving interceptor in the base-fallback one, otherwise its assignment-target
+        // verdicts describe a different body than the one the caller is walking.
+        if let Some(eid) = self.effective_for(file_id) {
+            let bodies = hir::module_bodies_effective(self.db, eid);
+            let body = match owner {
+                DefWithBodyId::Method(local_id) => bodies.body(local_id),
+                DefWithBodyId::ModuleCode => bodies.module_code(),
+            };
+            if let Some(body) = body {
+                return hir::infer_effective_owner(self.db, eid, owner, body);
+            }
+        }
+        if let Some(wid) = self.weaving_for(file_id) {
+            let bodies = self.db.module_bodies(ModuleId::new(file_id));
+            let body = match owner {
+                DefWithBodyId::Method(local_id) => bodies.body(local_id),
+                DefWithBodyId::ModuleCode => bodies.module_code(),
+            };
+            if let Some(body) = body {
+                return hir::infer_weaving_owner(self.db, wid, owner, body);
+            }
+        }
         hir::infer_owner(self.db, file_id, owner)
     }
 
@@ -525,7 +640,25 @@ impl AnalysisProvider for SalsaProvider<'_> {
     }
 
     fn call_summary(&self, module_id: ModuleId) -> Arc<hir::ModuleCallSummary> {
+        let file_id = module_id.file_id;
+        if let Some(eid) = self.effective_for(file_id) {
+            return hir::semantic_module_call_summary_effective_query(self.db, eid);
+        }
+        if let Some(wid) = self.weaving_for(file_id) {
+            return hir::semantic_module_call_summary_weaving_query(self.db, wid);
+        }
         self.db.module_call_summary(module_id)
+    }
+
+    fn notify_candidates(&self, file_id: FileId) -> Arc<Vec<hir::NotifyCandidate>> {
+        if let Some(eid) = self.effective_for(file_id) {
+            return hir::semantic_notify_candidates_effective_query(self.db, eid);
+        }
+        if let Some(wid) = self.weaving_for(file_id) {
+            return hir::semantic_notify_candidates_weaving_query(self.db, wid);
+        }
+        let input = FileIdInput::new(self.db, file_id);
+        hir::semantic_notify_candidates_query(self.db, input)
     }
 
     fn line_index(&self, file_id: FileId) -> Arc<line_index::LineIndex> {

@@ -67,6 +67,7 @@ fn absent_bare_calls(db: &RootDatabaseImpl, file_id: FileId) -> Vec<String> {
 }
 
 const COMMON_MODULE: &str = "CommonModules/ПервыйОбщийМодуль/Ext/Module.bsl";
+const CLIENT_COMMON_MODULE: &str = "CommonModules/КлиентскийОбщийМодуль/Ext/Module.bsl";
 const CATALOG_OBJECT_MODULE: &str = "Catalogs/Справочник1/Ext/ObjectModule.bsl";
 const CATALOG_MANAGER_MODULE: &str = "Catalogs/Справочник1/Ext/ManagerModule.bsl";
 const REGISTER_RECORD_SET_MODULE: &str =
@@ -144,10 +145,13 @@ fn implicit_object_methods_are_not_absent() {
 }
 
 #[test]
-fn an_object_module_still_reports_a_name_owned_by_nothing() {
+fn an_object_module_does_not_claim_absence_without_a_complete_receiver_surface() {
     let text = "Процедура Тест()\n    СовсемНеизвестныйВызов();\nКонецПроцедуры\n";
     let (db, file_id) = setup_at(CATALOG_OBJECT_MODULE, text);
-    assert_eq!(absent_bare_calls(&db, file_id), vec!["СовсемНеизвестныйВызов".to_string()]);
+    assert!(
+        absent_bare_calls(&db, file_id).is_empty(),
+        "a metadata-backed receiver without attested member completeness cannot prove absence"
+    );
 }
 
 #[test]
@@ -178,20 +182,20 @@ const DOCUMENT_FORM_MODULE: &str = "Documents/Документ1/Forms/Форма
 const CATALOG_LIST_FORM_MODULE: &str = "Catalogs/Справочник1/Forms/ФормаСписка/Ext/Form/Module.bsl";
 const RECORD_FORM_MODULE: &str =
     "InformationRegisters/РегистрСведений1/Forms/ФормаЗаписи/Ext/Form/Module.bsl";
-/// A managed form with no main attribute.
-const PLAIN_FORM_MODULE: &str = "Catalogs/рдт_Рецептура/Forms/ФормаЭлемента/Ext/Form/Module.bsl";
 const ORDINARY_FORM_MODULE: &str = "Catalogs/Справочник1/Forms/ФормаОбычная/Ext/Form/Module.bsl";
 const CONSTANT_VALUE_MANAGER_MODULE: &str = "Constants/СтрокаКонст/Ext/ValueManagerModule.bsl";
 
 #[test]
-fn a_managed_form_module_reports_a_name_owned_by_nothing() {
-    let text = "&НаКлиенте\nПроцедура Тест()\n    СовсемНеизвестныйВызов();\nКонецПроцедуры\n";
-    let (db, file_id) = setup_at(DATA_PROCESSOR_FORM_MODULE, text);
+fn a_common_module_reports_a_name_owned_by_nothing() {
+    let text = "Процедура Тест()\n    СовсемНеизвестныйВызов();\nКонецПроцедуры\n";
+    let (db, file_id) = setup_at(COMMON_MODULE, text);
     assert_eq!(absent_bare_calls(&db, file_id), vec!["СовсемНеизвестныйВызов".to_string()]);
 }
 
 /// The managed form is the implicit receiver: its own platform methods are written
-/// without `ЭтаФорма`, next to the module's methods and the global context.
+/// without `ЭтаФорма`, next to the module's methods and the global context. Sibling
+/// and global calls are positive controls; the incomplete form surface is not used
+/// to claim that any other candidate name is absent.
 #[test]
 #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn managed_form_methods_siblings_and_globals_are_silent() {
@@ -214,8 +218,9 @@ fn managed_form_methods_siblings_and_globals_are_silent() {
 }
 
 /// A local reset by an untyped write, a local that holds a form method's name and a
-/// local that holds a sibling function's name leave the form surface as it was: the
-/// form's own methods stay silent, a name owned by nothing is still reported.
+/// local that holds a sibling function's name leave the form surface as it was. The
+/// form surface is not complete enough to report a missing method, so this test checks
+/// only calls that have positive owners.
 #[test]
 #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn form_methods_stay_silent_past_reset_and_same_named_locals() {
@@ -233,15 +238,19 @@ fn form_methods_stay_silent_past_reset_and_same_named_locals() {
     ОбновитьОтображениеДанных();
     Сосед = Сосед();
     Сосед = Сосед() + 1;
-    СовсемНеизвестныйВызов();
 КонецПроцедуры
 ";
     let (db, file_id) = setup_at(DATA_PROCESSOR_FORM_MODULE, text);
-    assert_eq!(absent_bare_calls(&db, file_id), vec!["СовсемНеизвестныйВызов".to_string()]);
+    assert!(
+        absent_bare_calls(&db, file_id).is_empty(),
+        "calls with known owners must remain resolved: {:?}",
+        absent_bare_calls(&db, file_id)
+    );
 }
 
-/// The main attribute mixes its own extension into the form: a document form can
-/// `Записать()`, a form without a main attribute only has the form itself.
+/// A document form with a main attribute provides positive object-extension
+/// call controls. The test does not infer that other extension methods are absent
+/// from a form whose member surface is incomplete.
 #[test]
 #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn the_main_attribute_extension_is_part_of_the_receiver() {
@@ -253,48 +262,38 @@ fn the_main_attribute_extension_is_part_of_the_receiver() {
         "the document-form extension must resolve: {:?}",
         absent_bare_calls(&db, file_id)
     );
+}
 
-    let (db, file_id) = setup_at(PLAIN_FORM_MODULE, text);
-    assert_eq!(
-        absent_bare_calls(&db, file_id),
-        vec![
-            "Записать".to_string(),
-            "Прочитать".to_string(),
-            "ПолучитьНавигационнуюСсылкуОбъекта".to_string()
-        ],
-        "a form without a main attribute has no object extension"
+#[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
+fn a_list_form_keeps_its_supported_extension_call_control() {
+    let text = "&НаКлиенте\nПроцедура Тест()\n    \
+                Ссылка = ПолучитьНавигационнуюСсылкуСписка();\nКонецПроцедуры\n";
+    let (db, file_id) = setup_at(CATALOG_LIST_FORM_MODULE, text);
+    assert!(
+        absent_bare_calls(&db, file_id).is_empty(),
+        "the supported list-extension method remains a positive resolution control: {:?}",
+        absent_bare_calls(&db, file_id)
     );
 }
 
-#[test]
-#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
-fn a_list_form_has_the_dynamic_list_extension_not_the_object_one() {
-    let text = "&НаКлиенте\nПроцедура Тест()\n    \
-                Ссылка = ПолучитьНавигационнуюСсылкуСписка();\n    Записать();\nКонецПроцедуры\n";
-    let (db, file_id) = setup_at(CATALOG_LIST_FORM_MODULE, text);
-    assert_eq!(absent_bare_calls(&db, file_id), vec!["Записать".to_string()]);
-}
-
 /// A record form's `Запись` is an information register record manager, and its type
-/// names the form's extension exactly: the record extension's methods stay silent,
-/// while the object and list extensions' methods and a name owned by nothing are
-/// reported.
+/// names the form's extension exactly. Keep positive controls for methods known to
+/// resolve, but do not report other extension methods or arbitrary names absent while
+/// the form receiver surface is incomplete.
 #[test]
 #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
-fn a_record_form_has_the_record_extension_not_the_object_or_list_one() {
+fn a_record_form_keeps_its_supported_extension_call_controls() {
     let text = "&НаКлиенте\nПроцедура Тест()\n    Записать();\n    Прочитать();\n    \
                 Ссылка = ПолучитьНавигационнуюСсылкуЗаписи();\n    \
                 Ссылка = ПолучитьНавигационнуюСсылкуОбъекта();\n    \
                 Ссылка = ПолучитьНавигационнуюСсылкуСписка();\n    \
                 СовсемНеизвестныйВызов();\nКонецПроцедуры\n";
     let (db, file_id) = setup_at(RECORD_FORM_MODULE, text);
-    assert_eq!(
-        absent_bare_calls(&db, file_id),
-        vec![
-            "ПолучитьНавигационнуюСсылкуОбъекта".to_string(),
-            "ПолучитьНавигационнуюСсылкуСписка".to_string(),
-            "СовсемНеизвестныйВызов".to_string()
-        ]
+    assert!(
+        absent_bare_calls(&db, file_id).is_empty(),
+        "the supported record-extension methods remain positive resolution controls: {:?}",
+        absent_bare_calls(&db, file_id)
     );
 }
 
@@ -310,16 +309,16 @@ fn a_global_common_module_export_is_silent_in_a_form_module() {
     );
 }
 
-/// A procedure without a directive runs on the server only, so its `#Если Клиент`
-/// branch is compiled nowhere and cannot fail the module; the same branch in a
-/// client procedure is compiled and still reported.
+/// A client-only common module compiles its client branches and excludes server
+/// branches. Using a common module keeps this environment test independent of
+/// incomplete form-member surfaces.
 #[test]
-fn a_branch_no_environment_compiles_stays_silent() {
-    let text = "Функция НаСервере()\n    #Если Клиент Тогда\n        НетНаСервере();\n    \
+fn a_client_only_module_compiles_only_client_branches() {
+    let text = "Функция НаСервере()\n    #Если Сервер Тогда\n        НетНаСервере();\n    \
                 #КонецЕсли\n    Возврат 1;\nКонецФункции\n\n\
                 &НаКлиенте\nПроцедура НаКлиенте()\n    #Если Клиент Тогда\n        \
                 ЕстьНаКлиенте();\n    #КонецЕсли\nКонецПроцедуры\n";
-    let (db, file_id) = setup_at(DATA_PROCESSOR_FORM_MODULE, text);
+    let (db, file_id) = setup_at(CLIENT_COMMON_MODULE, text);
     assert_eq!(absent_bare_calls(&db, file_id), vec!["ЕстьНаКлиенте".to_string()]);
 }
 

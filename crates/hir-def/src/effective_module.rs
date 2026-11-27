@@ -266,6 +266,34 @@ pub fn module_bodies_effective<'db>(
     Arc::new(ModuleBodies::from_parse_with_text(&parse, &source_text))
 }
 
+/// The raw call summary of the effective module: the same extractor the ordinary
+/// per-file query runs, over the spliced item tree and bodies. Ranges and constructor
+/// identities are in effective-text coordinates; the diagnostics pass remaps them to
+/// the extension source through the same segment map.
+#[salsa::tracked(
+    lru = 256,
+    heap_size = crate::queries::module_call_summary_heap,
+    returns(clone)
+)]
+pub fn module_call_summary_effective<'db>(
+    db: &'db dyn crate::DefDatabase,
+    eid: EffectiveModuleId<'db>,
+) -> Arc<crate::call_graph::ModuleCallSummary> {
+    let base = eid.base_file(db);
+    let _span = tracing::info_span!("module_call_summary_effective", ?base).entered();
+    let metadata = db.module_metadata(ModuleId::new(base));
+    let form_handlers: &[bsl_metadata::FormEventHandler] =
+        metadata.form.as_ref().map(|f| f.event_handlers.as_slice()).unwrap_or(&[]);
+    let item_tree = item_tree_effective(db, eid);
+    let bodies = module_bodies_effective(db, eid);
+    Arc::new(crate::call_graph::extract_call_summary_with_cancellation(
+        &item_tree,
+        &bodies,
+        form_handlers,
+        &mut || db.unwind_if_revision_cancelled(),
+    ))
+}
+
 /// Base-method identities whose bodies compile from the extension's replacements.
 pub fn changed_method_keys(
     db: &dyn crate::DefDatabase,

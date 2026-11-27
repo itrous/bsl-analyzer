@@ -3,8 +3,9 @@ use crate::metadata::*;
 use crate::utils::platform_event_handlers as peh;
 use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext, Fix, TextEdit};
 use ide_db::TextRange;
+use intern::NormName;
 use rustc_hash::FxHashSet;
-use stdx::case::CaseExt;
+use stdx::case::{eq_ignore_case, CaseExt};
 use syntax::{SyntaxKind, SyntaxNode, SyntaxToken, TextSize};
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
@@ -132,12 +133,17 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
 pub(crate) fn collect_called_methods(
     ctx: &DiagnosticsContext,
     member_calls_count: bool,
-) -> Option<FxHashSet<String>> {
+) -> Option<FxHashSet<NormName>> {
     let metadata = ctx.module_metadata();
     let module_id = hir::ModuleId::new(ctx.file_id);
     let summary = ctx.call_summary(module_id);
 
-    let mut called_methods: FxHashSet<String> = FxHashSet::default();
+    let mut called_methods: FxHashSet<NormName> = FxHashSet::default();
+    let notify_candidates = ctx.notify_candidates();
+    if notify_candidates.iter().any(|candidate| candidate.analysis_incomplete) {
+        called_methods
+            .extend(summary.methods.iter().map(|method| NormName::intern(method.name.as_str())));
+    }
 
     for edge in &summary.call_edges {
         match &edge.target {
@@ -145,7 +151,7 @@ pub(crate) fn collect_called_methods(
                 if let Some(method) =
                     summary.methods.iter().find(|m| m.local_id == *callee_local_id)
                 {
-                    called_methods.insert(method.name.as_str().fold_lower());
+                    called_methods.insert(NormName::intern(method.name.as_str()));
                 }
             }
             // The method segment of a member call counts as a use regardless of
@@ -153,22 +159,21 @@ pub(crate) fn collect_called_methods(
             // callback by name through a common-module wrapper —
             // `УправлениеСвойствамиКлиент.ОбновитьЗависимостиДополнительныхРеквизитов(Форма)`
             // ultimately runs `Форма.ПодключитьОбработчикОжидания("ОбновитьЗависимости…")`
-            // — so the local procedure sharing that name is reachable even
-            // though the module contains no bare call to it. Matching by name is
-            // the only signal available without cross-module flow.
+            // — so the local procedure sharing its name remains reachable despite there
+            // being no bare call to it.
             hir::call_graph::CallTarget::QualifiedModule { method_name, .. } => {
                 if member_calls_count {
-                    called_methods.insert(method_name.as_str().fold_lower());
+                    called_methods.insert(NormName::intern(method_name.as_str()));
                 }
             }
             hir::call_graph::CallTarget::ThisObjectMethod { method_name } => {
-                called_methods.insert(method_name.as_str().fold_lower());
+                called_methods.insert(NormName::intern(method_name.as_str()));
             }
             hir::call_graph::CallTarget::ManagerAccess {
                 method_name: Some(method_name), ..
             } => {
                 if member_calls_count {
-                    called_methods.insert(method_name.as_str().fold_lower());
+                    called_methods.insert(NormName::intern(method_name.as_str()));
                 }
             }
             hir::call_graph::CallTarget::ManagerAccess { method_name: None, .. }
@@ -179,11 +184,16 @@ pub(crate) fn collect_called_methods(
 
     // The platform invokes these by the registered string name:
     // ПодключитьОбработчикОжидания and Новый ОписаниеОповещения (both handler slots).
-    for reg in &summary.notify_regs {
-        called_methods.insert(reg.callback_name.as_str().fold_lower());
+    for candidate in notify_candidates.iter() {
+        if !candidate.analysis_incomplete
+            && candidate.site_reachable
+            && candidate.protects_local_method
+        {
+            called_methods.insert(NormName::intern(candidate.callback_name.as_str()));
+        }
     }
     for reg in &summary.idle_handler_regs {
-        called_methods.insert(reg.handler_name.as_str().fold_lower());
+        called_methods.insert(NormName::intern(reg.handler_name.as_str()));
     }
     // `Элементы.X.УстановитьДействие("Событие", "Обработчик")` binds a form element's
     // event to a module procedure by name at runtime — the procedure has no other call
@@ -192,7 +202,7 @@ pub(crate) fn collect_called_methods(
     // could mask a genuinely unused local that shares a name with some object's action.
     if metadata.module_type == bsl_metadata::ModuleType::FormModule {
         for reg in &summary.set_action_regs {
-            called_methods.insert(reg.handler_name.as_str().fold_lower());
+            called_methods.insert(NormName::intern(reg.handler_name.as_str()));
         }
         // Handler names also reach `УстановитьДействие`/`Действие` indirectly — through a
         // command created in code or a parameter structure handed to a helper in another
@@ -201,7 +211,7 @@ pub(crate) fn collect_called_methods(
         // modules, where dynamic binding is idiomatic and worth the missed-dead-code risk.
         for local_id in &summary.name_literal_refs {
             if let Some(method) = summary.methods.iter().find(|m| m.local_id == *local_id) {
-                called_methods.insert(method.name.as_str().fold_lower());
+                called_methods.insert(NormName::intern(method.name.as_str()));
             }
         }
         // The binding may sit in ANOTHER module: a helper handed the form runs
@@ -211,7 +221,7 @@ pub(crate) fn collect_called_methods(
         if !bindings.is_empty() {
             for method in &summary.methods {
                 if bindings.is_bound(method.name.as_str()) {
-                    called_methods.insert(method.name.as_str().fold_lower());
+                    called_methods.insert(NormName::intern(method.name.as_str()));
                 }
             }
         }
@@ -227,17 +237,17 @@ pub(crate) fn collect_called_methods(
             return None;
         }
         for handler in form.event_handlers() {
-            called_methods.insert(handler.handler_name.fold_lower());
+            called_methods.insert(NormName::intern(&handler.handler_name));
         }
         for handler in form.command_handlers() {
-            called_methods.insert(handler.fold_lower());
+            called_methods.insert(NormName::intern(handler));
         }
     }
 
     if let Some(ref http_service) = metadata.http_service {
         for (_template, method) in http_service.all_methods() {
             if !method.is_handler_empty() {
-                called_methods.insert(method.handler().fold_lower());
+                called_methods.insert(NormName::intern(method.handler()));
             }
         }
     }
@@ -245,14 +255,14 @@ pub(crate) fn collect_called_methods(
     if let Some(ref web_service) = metadata.web_service {
         for operation in web_service.operations() {
             if !operation.is_handler_empty() {
-                called_methods.insert(operation.procedure_name().fold_lower());
+                called_methods.insert(NormName::intern(operation.procedure_name()));
             }
         }
     }
 
     if let Some(ref integration_service) = metadata.integration_service {
         for handler in integration_service.receive_handlers() {
-            called_methods.insert(handler.fold_lower());
+            called_methods.insert(NormName::intern(handler));
         }
     }
 
@@ -270,8 +280,7 @@ fn remove_method_fix(
     name: &hir::Name,
     string_literals: &[String],
 ) -> Vec<Fix> {
-    let name_lower = name.as_str().fold_lower();
-    if string_literals.iter().any(|literal| mentions_identifier(literal, &name_lower)) {
+    if string_literals.iter().any(|literal| mentions_identifier(literal, name.as_str())) {
         return Vec::new();
     }
     let Some(method) = root.descendants().find(|node| {
@@ -404,18 +413,24 @@ pub(crate) fn string_literal_texts(root: &SyntaxNode) -> Vec<String> {
                     | SyntaxKind::STRING_TAIL
             )
         })
-        .map(|token| token.text().fold_lower())
+        .map(|token| token.text().to_string())
         .collect()
 }
 
-/// `name_lower` occurs in `text` as a whole identifier, not as a part of a longer one.
-pub(crate) fn mentions_identifier(text: &str, name_lower: &str) -> bool {
+/// `name` occurs in `text` as a whole identifier, not as a part of a longer one.
+pub(crate) fn mentions_identifier(text: &str, name: &str) -> bool {
     let is_ident = |c: char| c.is_alphanumeric() || c == '_';
-    text.match_indices(name_lower).any(|(at, found)| {
-        let before = text[..at].chars().next_back();
-        let after = text[at + found.len()..].chars().next();
-        !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
-    })
+    let mut start = None;
+    for (offset, ch) in text.char_indices() {
+        if is_ident(ch) {
+            start.get_or_insert(offset);
+        } else if let Some(start) = start.take() {
+            if eq_ignore_case(&text[start..offset], name) {
+                return true;
+            }
+        }
+    }
+    start.is_some_and(|start| eq_ignore_case(&text[start..], name))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -425,7 +440,7 @@ fn check_method_unused(
     is_export: bool,
     annotations: &[hir::Annotation],
     attachable_prefixes: &[String],
-    called_methods: &FxHashSet<String>,
+    called_methods: &FxHashSet<NormName>,
     owner: peh::ModuleOwner,
     code: DiagnosticCode,
     ctx: &DiagnosticsContext,
@@ -448,7 +463,7 @@ fn check_method_unused(
         return None;
     }
 
-    if called_methods.contains(&name_lower) {
+    if called_methods.contains(&NormName::intern(name.as_str())) {
         return None;
     }
 
@@ -506,6 +521,46 @@ mod tests {
     };
     use crate::{DiagnosticCode, DiagnosticsConfig};
     use expect_test::expect;
+
+    #[test]
+    fn greek_sigma_call_counts_as_use_of_local_method() {
+        let code = r#"
+Процедура Главная()
+    οσ();
+КонецПроцедуры
+
+Процедура ΟΣ()
+    Возврат;
+КонецПроцедуры
+"#;
+
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::UnusedLocalMethod,
+            expect![[r#"
+            UnusedLocalMethod @ 2:11..2:18
+              message: Неиспользуемый локальный метод "Главная"
+              severity: Warning"#]],
+        );
+    }
+
+    #[test]
+    fn greek_sigma_string_literal_prevents_delete_quick_fix() {
+        use crate::test_utils::check_hir_diagnostic_with_config;
+
+        let code = r#"Процедура ΟΣ()
+    Сообщить("οσ");
+КонецПроцедуры
+"#;
+        let config = DiagnosticsConfig { quick_fixes: true, ..DiagnosticsConfig::default() };
+        let diagnostics = check_hir_diagnostic_with_config(code, config, crate::diagnostics);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|d| d.code == DiagnosticCode::UnusedLocalMethod)
+            .expect("the string literal is not a known call site");
+
+        assert!(diagnostic.fixes.is_empty(), "a matching string identifier may bind this method");
+    }
 
     #[test]
     fn test_call_inside_dot_function_condition_is_counted() {
@@ -871,10 +926,8 @@ mod tests {
 
     #[test]
     fn test_callback_used_via_qualified_call_not_flagged() {
-        // BSP "Свойства" pattern: the form's local no-arg callback is re-armed by
-        // name from a common-module wrapper that shares its name. No bare call to
-        // the local procedure exists, only the qualified `Модуль.Имя(...)` call, so
-        // the method segment of a member call must count as a use.
+        // The method segment of an external member call is still an established use
+        // for this rule's historical same-name reachability behaviour.
         let code = r#"
 &НаКлиенте
 Процедура ОбновитьЗависимостиДополнительныхРеквизитов()
@@ -892,6 +945,90 @@ mod tests {
             expect![[r#"
                 UnusedLocalMethod @ 8:11..8:25
                   message: Неиспользуемый локальный метод "НеИспользуемая"
+                  severity: Warning"#]],
+        );
+    }
+
+    #[test]
+    fn notify_reg_requires_normalized_this_object_target_to_reach_local_method() {
+        let code = r#"
+&НаКлиенте
+Процедура Зарегистрировать()
+    Описание = Новый ОписаниеОповещения("ОбработчикОбъекта", ЭтотОбъект);
+    Описание = Новый ОписаниеОповещения("ОбработчикМодуля", ВнешнийМодуль);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура ОбработчикОбъекта()
+    Сообщить("self");
+КонецПроцедуры
+
+&НаКлиенте
+Процедура ОбработчикМодуля()
+    Сообщить("module");
+КонецПроцедуры
+
+&НаКлиенте
+Процедура НеИспользуется()
+    Сообщить("unused");
+КонецПроцедуры
+"#;
+        let mut builder = test_fixture::CfeFixtureBuilder::new("");
+        builder.add_base_module("Caller", "");
+        // A real configuration root makes both unresolved receivers absent rather than
+        // merely indeterminate: a common module has no `ЭтотОбъект` to resolve to.
+        let unused = crate::test_utils::check_cfe_at_with_db(
+            "CommonModules/Caller/Ext/Module.bsl",
+            code,
+            builder.build(),
+            &[],
+            crate::DiagnosticsConfig::all_enabled(),
+            |_| {},
+            |_db, ctx| super::check(ctx),
+        )
+        .into_iter()
+        .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedLocalMethod)
+        .map(|diagnostic| diagnostic.message)
+        .collect::<Vec<_>>();
+
+        assert!(
+            unused
+                .iter()
+                .any(|message| message.as_str()
+                    == "Неиспользуемый локальный метод \"ОбработчикМодуля\""),
+            "external-receiver handler must remain unused: {unused:?}"
+        );
+        assert!(
+            unused
+                .iter()
+                .any(|message| message.as_str()
+                    == "Неиспользуемый локальный метод \"НеИспользуется\""),
+            "unrelated method must remain unused: {unused:?}"
+        );
+        assert!(
+            unused.iter().any(|message| message.as_str()
+                == "Неиспользуемый локальный метод \"ОбработчикОбъекта\""),
+            "syntactic receiver spelling without a normalized ThisObject target is not a proven use: {unused:?}"
+        );
+    }
+
+    #[test]
+    fn test_this_object_call_uses_local_method() {
+        let code = r#"
+Процедура Используется()
+КонецПроцедуры
+
+Процедура Вызов()
+    ЭтотОбъект.Используется();
+КонецПроцедуры
+"#;
+
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::UnusedLocalMethod,
+            expect![[r#"
+                UnusedLocalMethod @ 5:11..5:16
+                  message: Неиспользуемый локальный метод "Вызов"
                   severity: Warning"#]],
         );
     }
@@ -970,6 +1107,169 @@ mod tests {
         assert!(
             names.iter().any(|m| m.contains("Обработчик")),
             "non-form SetAction must not exempt a local: {names:?}"
+        );
+    }
+
+    #[test]
+    fn unavailable_notify_registration_does_not_keep_a_form_method_live() {
+        let code = r#"
+&НаКлиентеНаСервере
+Процедура Настроить() Экспорт
+#Если Сервер И Не Сервер Тогда
+    О = Новый ОписаниеОповещения("МёртвыйТолькоИзРегистрации", ЭтотОбъект);
+    О = Новый ОписаниеОповещения("МёртвыйНоЕстьСтрока", ЭтотОбъект);
+#КонецЕсли
+#Если Клиент Тогда
+    О = Новый ОписаниеОповещения("ЖивойОбработчик", ЭтотОбъект);
+#КонецЕсли
+    СтроковыеСсылки();
+КонецПроцедуры
+
+Процедура МёртвыйТолькоИзРегистрации()
+КонецПроцедуры
+
+Процедура МёртвыйНоЕстьСтрока()
+КонецПроцедуры
+
+Процедура ЖивойОбработчик()
+КонецПроцедуры
+
+Процедура ТолькоСтрока()
+КонецПроцедуры
+
+Процедура СтроковыеСсылки() Экспорт
+    Выполнить("МёртвыйНоЕстьСтрока");
+    Выполнить("ТолькоСтрока");
+КонецПроцедуры
+"#;
+        let diagnostics = crate::test_utils::check_form_with_common_modules(code, &[]);
+        let unused: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedLocalMethod)
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        assert_eq!(unused, vec!["Неиспользуемый локальный метод \"МёртвыйТолькоИзРегистрации\""]);
+    }
+
+    #[test]
+    fn duplicate_foreign_notify_slots_do_not_keep_a_form_local_method_alive() {
+        let handlers_xml = r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+<CommonModule uuid="00000000-0000-0000-0000-000000000011"><Properties>
+<Name>Handlers</Name><Global>false</Global><ClientManagedApplication>true</ClientManagedApplication>
+<ClientOrdinaryApplication>false</ClientOrdinaryApplication><Server>true</Server>
+<ExternalConnection>false</ExternalConnection><ServerCall>false</ServerCall>
+<Privileged>false</Privileged><ReturnValuesReuse>DontUse</ReturnValuesReuse>
+</Properties></CommonModule></MetaDataObject>"#;
+        let handlers_source = r#"&НаКлиентеНаСервере
+Процедура H() Экспорт
+    Сообщить("external");
+КонецПроцедуры
+"#;
+        let source = |ordinary_string_reference: bool| {
+            format!(
+                r#"&НаКлиенте
+Процедура Зарегистрировать() Экспорт
+    О = Новый ОписаниеОповещения("H", Handlers, , "H", Handlers);
+    {ordinary_string_reference}
+КонецПроцедуры
+
+&НаКлиенте
+Процедура H()
+    Сообщить("local");
+КонецПроцедуры
+"#,
+                ordinary_string_reference = if ordinary_string_reference {
+                    "    Параметры = Новый Структура(\"Имя\", \"H\");"
+                } else {
+                    ""
+                }
+            )
+        };
+        let diagnostics = crate::test_utils::check_form_with_common_modules(
+            &source(false),
+            &[("Handlers", handlers_source, handlers_xml)],
+        );
+        let unused = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedLocalMethod)
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unused,
+            vec!["Неиспользуемый локальный метод \"H\""],
+            "duplicate foreign slots must not count as an ordinary local name reference: {diagnostics:#?}"
+        );
+
+        let diagnostics = crate::test_utils::check_form_with_common_modules(
+            &source(true),
+            &[("Handlers", handlers_source, handlers_xml)],
+        );
+        let unused = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedLocalMethod)
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            !unused.iter().any(|message| message.contains("\"H\"")),
+            "an ordinary independent string reference remains a local use: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn external_notify_receiver_does_not_hide_form_local_method() {
+        let code = r#"
+&НаКлиенте
+Процедура Зарегистрировать()
+    ВнешнийМодуль = Новый Структура;
+    О = Новый ОписаниеОповещения("ВнешнийОбработчик", ВнешнийМодуль);
+    О = Новый ОписаниеОповещения("ЛокальныйОбработчик", ЭтотОбъект);
+    П = Новый Структура("Имя", "СвязанныйСтрокой");
+    Сообщить("register");
+КонецПроцедуры
+
+&НаКлиенте
+Процедура ВнешнийОбработчик()
+    Сообщить("external");
+КонецПроцедуры
+
+&НаКлиенте
+Процедура ЛокальныйОбработчик()
+    Сообщить("self");
+КонецПроцедуры
+
+&НаКлиенте
+Процедура СвязанныйСтрокой()
+    Сообщить("bound");
+КонецПроцедуры
+
+&НаКлиенте
+Процедура НеИспользуемый()
+    Сообщить("unused");
+КонецПроцедуры
+"#;
+        let diagnostics = crate::test_utils::check_form_with_common_modules(code, &[]);
+        let unused: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedLocalMethod)
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        assert!(
+            unused.iter().any(|message| message.contains("ВнешнийОбработчик")),
+            "external receiver must not keep a same-named form method alive: {unused:?}"
+        );
+        assert!(
+            unused.iter().any(|message| message.contains("НеИспользуемый")),
+            "unrelated unused form method must remain flagged: {unused:?}"
+        );
+        assert!(
+            !unused.iter().any(|message| message.contains("ЛокальныйОбработчик")),
+            "ThisObject callback remains a valid form-local use: {unused:?}"
+        );
+        assert!(
+            !unused.iter().any(|message| message.contains("СвязанныйСтрокой")),
+            "other form string-name bindings remain protected: {unused:?}"
         );
     }
 

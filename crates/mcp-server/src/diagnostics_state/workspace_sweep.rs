@@ -18,8 +18,10 @@ pub(crate) struct CodeAggregate {
 /// The result of a workspace sweep: per-code aggregates plus coverage bookkeeping.
 pub(crate) struct WorkspaceSweep {
     pub aggregates: Vec<CodeAggregate>,
-    /// Files actually analysed. Equals the capped request size on a completed sweep;
-    /// smaller when the sweep was cancelled mid-flight.
+    /// Files actually analysed and served whole. Equals the capped request size on a
+    /// completed sweep; smaller when the sweep was cancelled mid-flight, and smaller
+    /// still by the files counted in `files_incomplete`, whose analysis reported
+    /// itself incomplete and whose findings are withheld.
     pub files_swept: usize,
     pub files_total: usize,
     /// Files excluded by the vendor-diff analysis scope (no changed lines vs the
@@ -29,6 +31,13 @@ pub(crate) struct WorkspaceSweep {
     /// could not be read. Beside `files_out_of_scope` and for the same reason: a gap
     /// in coverage is reported, never quietly removed from the total.
     pub files_unread: usize,
+    /// Files swept whole but whose analysis reported itself incomplete (a rule's
+    /// bounded projection hit its work limit). Their findings are withheld from the
+    /// aggregates — classifying a partial finding set would renumber the file's
+    /// occurrences and label its baseline entries on the strength of findings the
+    /// file never produced — and their baseline entries are never resolved. Beside
+    /// `files_unread` and for the same reason: coverage is reported, never assumed.
+    pub files_incomplete: usize,
     /// Findings dropped because every covered line is attributed to an
     /// `[analysis].ignored_authors` entry; 0 when the filter is off.
     pub findings_ignored_by_author: usize,
@@ -67,6 +76,7 @@ impl WorkspaceSweep {
             files_total,
             files_out_of_scope: 0,
             files_unread,
+            files_incomplete: 0,
             findings_ignored_by_author: 0,
             author_head: None,
             truncated: false,

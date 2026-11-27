@@ -1097,8 +1097,17 @@ pub(crate) fn execute_once(
             let t = Instant::now();
             let r = a.call_hierarchy_outgoing(file_id, *offset);
             let ns = t.elapsed().as_nanos() as u64;
-            let lines = r.iter().map(|c| format!("{c:?}")).collect();
-            Ok((ns, Observation::from_lines(r.len(), lines)))
+            // `None` is a withheld answer (the anchor module's semantic notify
+            // projection is incomplete), not an empty complete one: a zero-call
+            // observation would read as a full negative conclusion.
+            let calls = r.ok_or_else(|| {
+                RunError::Other(
+                    "call_hierarchy_outgoing withheld: the anchor module's notify projection is incomplete"
+                        .to_owned(),
+                )
+            })?;
+            let lines = calls.iter().map(|c| format!("{c:?}")).collect();
+            Ok((ns, Observation::from_lines(calls.len(), lines)))
         }
         FeatureSpec::CallHierarchyIndexBuild { batch_size } => {
             if *batch_size == 0 {

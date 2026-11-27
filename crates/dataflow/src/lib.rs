@@ -72,6 +72,19 @@ pub trait Lattice: Clone + PartialEq + Eq {
     fn is_more_informative_than(&self, other: &Self) -> bool {
         self == other
     }
+
+    /// Work proportional to this state's size for a clone, join or equality
+    /// comparison. The default is one unit; a lattice whose states own large
+    /// sets overrides it so a metered solve charges their real weight.
+    fn work_weight(&self) -> usize {
+        1
+    }
+}
+
+/// Spends at least one unit for a state operation, so an empty state still
+/// reaches the caller's cancellation check.
+fn spend_for_state<L: Lattice>(spend: &mut dyn FnMut(usize) -> bool, state: &L) -> bool {
+    spend(state.work_weight().max(1))
 }
 
 pub trait Transfer<L: Lattice> {
@@ -188,14 +201,54 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
         }
     }
 
+    /// [`DataflowSolver::set_bottom_factory`] that meters every bottom state
+    /// before the factory builds it: each of a vertex's two states charges
+    /// `cost_per_state` through `spend`, and a refusal stops the seeding with
+    /// `false`, leaving the solver uninitialized — the caller must give up
+    /// instead of solving. Like [`spend_for_state`], a state charges at least
+    /// one unit, so even a free state still reaches the cancellation check.
+    pub fn set_bottom_factory_with_work<F>(
+        &mut self,
+        mut factory: F,
+        cost_per_state: usize,
+        spend: &mut dyn FnMut(usize) -> bool,
+    ) -> bool
+    where
+        F: FnMut() -> L,
+    {
+        for (block_idx, _vertex) in self.cfg.vertices() {
+            if !spend(cost_per_state.max(1)) {
+                return false;
+            }
+            self.block_in.insert(block_idx, factory());
+            if !spend(cost_per_state.max(1)) {
+                return false;
+            }
+            self.block_out.insert(block_idx, factory());
+        }
+        true
+    }
+
     pub fn solve(self) -> Option<DataflowResult<L>> {
+        self.solve_with_work(&mut |_| true)
+    }
+
+    /// [`DataflowSolver::solve`] that reports its work to `spend` and stops with a
+    /// non-converged result as soon as `spend` refuses more work. A block visit, each
+    /// traversed incoming or outgoing edge, and every state clone, transfer and join
+    /// spend in proportion to [`Lattice::work_weight`], so repeated visits of a block
+    /// and merges of large states are metered on every round.
+    pub fn solve_with_work(
+        self,
+        spend: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<DataflowResult<L>> {
         match self.direction {
-            Direction::Forward => self.solve_forward(),
-            Direction::Backward => self.solve_backward(),
+            Direction::Forward => self.solve_forward(spend),
+            Direction::Backward => self.solve_backward(spend),
         }
     }
 
-    fn solve_forward(mut self) -> Option<DataflowResult<L>> {
+    fn solve_forward(mut self, spend: &mut dyn FnMut(usize) -> bool) -> Option<DataflowResult<L>> {
         use std::collections::VecDeque;
 
         let entry = self.cfg.start();
@@ -215,9 +268,15 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
         let mut iterations = 0;
         let mut converged = true;
 
-        while let Some(block_idx) = worklist.pop_front() {
+        'solve: while let Some(block_idx) = worklist.pop_front() {
             worklist_set.remove(&block_idx);
             iterations += 1;
+
+            if !spend(1) {
+                tracing::debug!("Forward dataflow analysis stopped by its work budget");
+                converged = false;
+                break;
+            }
 
             if iterations > self.max_iterations {
                 tracing::warn!(
@@ -232,44 +291,92 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
             let is_entry = Some(block_idx) == entry;
 
             let in_state = if is_entry && !has_predecessors {
-                self.block_in.get(&block_idx).cloned().expect("block_in should be initialized")
+                let stored = self.block_in.get(&block_idx).expect("block_in should be initialized");
+                if !spend_for_state(spend, stored) {
+                    converged = false;
+                    break 'solve;
+                }
+                stored.clone()
             } else {
                 let mut state: Option<L> = None;
                 for (pred_idx, edge_kind) in self.cfg.incoming_edges(block_idx) {
+                    if !spend(1) {
+                        converged = false;
+                        break 'solve;
+                    }
                     if !self.crosses(pred_idx, *edge_kind) {
                         continue;
                     }
                     if let Some(pred_out) = self.block_out.get(&pred_idx) {
-                        let edge_state = self.transfer_edge_state(pred_idx, *edge_kind, pred_out);
+                        let Some(edge_state) =
+                            self.transfer_edge_state(pred_idx, *edge_kind, pred_out, spend)
+                        else {
+                            converged = false;
+                            break 'solve;
+                        };
                         match &mut state {
                             None => {
                                 state = Some(edge_state);
                             }
                             Some(s) => {
+                                if !spend_for_state(spend, s)
+                                    || !spend_for_state(spend, &edge_state)
+                                {
+                                    converged = false;
+                                    break 'solve;
+                                }
                                 s.join_in_place(&edge_state);
                             }
                         }
                     }
                 }
-                state.unwrap_or_else(|| {
-                    self.block_in.get(&block_idx).cloned().expect("block_in should be initialized")
-                })
+                match state {
+                    Some(state) => state,
+                    None => {
+                        let stored =
+                            self.block_in.get(&block_idx).expect("block_in should be initialized");
+                        if !spend_for_state(spend, stored) {
+                            converged = false;
+                            break 'solve;
+                        }
+                        stored.clone()
+                    }
+                }
             };
 
+            if !spend_for_state(spend, &in_state) {
+                converged = false;
+                break;
+            }
             self.block_in.insert(block_idx, in_state.clone());
 
-            let out_state = self.transfer_block(block_idx, &in_state);
+            let Some(out_state) = self.transfer_block(block_idx, &in_state, spend) else {
+                converged = false;
+                break;
+            };
 
             let changed = if let Some(old_out) = self.block_out.get(&block_idx) {
+                if !spend_for_state(spend, &out_state) || !spend_for_state(spend, old_out) {
+                    converged = false;
+                    break;
+                }
                 &out_state != old_out
             } else {
                 true
             };
 
             if changed {
+                if !spend_for_state(spend, &out_state) {
+                    converged = false;
+                    break;
+                }
                 self.block_out.insert(block_idx, out_state);
 
                 for (succ_idx, _edge) in self.cfg.outgoing_edges(block_idx) {
+                    if !spend(1) {
+                        converged = false;
+                        break 'solve;
+                    }
                     if worklist_set.insert(succ_idx) {
                         worklist.push_back(succ_idx);
                     }
@@ -287,7 +394,7 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
         })
     }
 
-    fn solve_backward(mut self) -> Option<DataflowResult<L>> {
+    fn solve_backward(mut self, spend: &mut dyn FnMut(usize) -> bool) -> Option<DataflowResult<L>> {
         use std::collections::VecDeque;
 
         let exit = self.cfg.exit();
@@ -311,10 +418,16 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
         let mut block_visit_count: rustc_hash::FxHashMap<NodeIndex, usize> =
             rustc_hash::FxHashMap::default();
 
-        while let Some(block_idx) = worklist.pop_front() {
+        'solve: while let Some(block_idx) = worklist.pop_front() {
             worklist_set.remove(&block_idx);
             iterations += 1;
             *block_visit_count.entry(block_idx).or_insert(0) += 1;
+
+            if !spend(1) {
+                tracing::debug!("Backward dataflow analysis stopped by its work budget");
+                converged = false;
+                break;
+            }
 
             if iterations > self.max_iterations {
                 let max_visits = block_visit_count.values().max().copied().unwrap_or(0);
@@ -346,47 +459,95 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
             let is_exit = block_idx == exit;
 
             let out_state = if is_exit && !has_successors {
-                self.block_out.get(&block_idx).cloned().expect("block_out should be initialized")
+                let stored =
+                    self.block_out.get(&block_idx).expect("block_out should be initialized");
+                if !spend_for_state(spend, stored) {
+                    converged = false;
+                    break 'solve;
+                }
+                stored.clone()
             } else {
                 let mut state: Option<L> = None;
                 for (succ_idx, edge_kind) in self.cfg.outgoing_edges(block_idx) {
+                    if !spend(1) {
+                        converged = false;
+                        break 'solve;
+                    }
                     if !self.crosses(block_idx, *edge_kind) {
                         continue;
                     }
                     if let Some(succ_in) = self.block_in.get(&succ_idx) {
-                        let edge_state = self.transfer_edge_state(block_idx, *edge_kind, succ_in);
+                        let Some(edge_state) =
+                            self.transfer_edge_state(block_idx, *edge_kind, succ_in, spend)
+                        else {
+                            converged = false;
+                            break 'solve;
+                        };
                         match &mut state {
                             None => {
                                 state = Some(edge_state);
                             }
                             Some(s) => {
+                                if !spend_for_state(spend, s)
+                                    || !spend_for_state(spend, &edge_state)
+                                {
+                                    converged = false;
+                                    break 'solve;
+                                }
                                 s.join_in_place(&edge_state);
                             }
                         }
                     }
                 }
-                state.unwrap_or_else(|| {
-                    self.block_out
-                        .get(&block_idx)
-                        .cloned()
-                        .expect("block_out should be initialized")
-                })
+                match state {
+                    Some(state) => state,
+                    None => {
+                        let stored = self
+                            .block_out
+                            .get(&block_idx)
+                            .expect("block_out should be initialized");
+                        if !spend_for_state(spend, stored) {
+                            converged = false;
+                            break 'solve;
+                        }
+                        stored.clone()
+                    }
+                }
             };
 
+            if !spend_for_state(spend, &out_state) {
+                converged = false;
+                break;
+            }
             self.block_out.insert(block_idx, out_state.clone());
 
-            let in_state = self.transfer_block(block_idx, &out_state);
+            let Some(in_state) = self.transfer_block(block_idx, &out_state, spend) else {
+                converged = false;
+                break;
+            };
 
             let changed = if let Some(old_in) = self.block_in.get(&block_idx) {
+                if !spend_for_state(spend, &in_state) || !spend_for_state(spend, old_in) {
+                    converged = false;
+                    break;
+                }
                 &in_state != old_in
             } else {
                 true
             };
 
             if changed {
+                if !spend_for_state(spend, &in_state) {
+                    converged = false;
+                    break;
+                }
                 self.block_in.insert(block_idx, in_state);
 
                 for (pred_idx, _edge) in self.cfg.incoming_edges(block_idx) {
+                    if !spend(1) {
+                        converged = false;
+                        break 'solve;
+                    }
                     if worklist_set.insert(pred_idx) {
                         worklist.push_back(pred_idx);
                     }
@@ -426,92 +587,134 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
     }
 
     /// [`Transfer::transfer_edge`], plus [`Transfer::transfer_exception_edge`] on the
-    /// `Exception` edge of a `Попытка`.
-    fn transfer_edge_state(&self, source: NodeIndex, edge_kind: CfgEdgeType, state: &L) -> L {
+    /// `Exception` edge of a `Попытка`. The edge state is a clone of `state`, so its
+    /// work is charged before the clone.
+    fn transfer_edge_state(
+        &self,
+        source: NodeIndex,
+        edge_kind: CfgEdgeType,
+        state: &L,
+        spend: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<L> {
+        if !spend_for_state(spend, state) {
+            return None;
+        }
         let mut edge_state = self.transfer.transfer_edge(edge_kind, state);
         if matches!(edge_kind, CfgEdgeType::Exception)
             && matches!(self.cfg.vertex(source), Some(cfg::CfgVertex::Try))
         {
             if let Some(try_stmt) = self.cfg.source_stmt_id(source) {
+                if !spend(1) {
+                    return None;
+                }
                 self.transfer.transfer_exception_edge(try_stmt, &mut edge_state, &self.body);
             }
         }
-        edge_state
+        Some(edge_state)
     }
 
-    fn transfer_block(&self, block_idx: NodeIndex, in_state: &L) -> L {
+    fn transfer_block(
+        &self,
+        block_idx: NodeIndex,
+        in_state: &L,
+        spend: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<L> {
         use cfg::CfgVertex;
 
         let Some(vertex) = self.cfg.vertex(block_idx) else {
-            return in_state.clone();
+            return spend_for_state(spend, in_state).then(|| in_state.clone());
         };
 
+        if !spend_for_state(spend, in_state) {
+            return None;
+        }
         match vertex {
             CfgVertex::BasicBlock(block) => {
                 let mut state = in_state.clone();
                 for &stmt_id in block.statements() {
+                    if !spend_for_state(spend, &state) {
+                        return None;
+                    }
                     self.transfer.transfer_stmt_in_place(
                         stmt_id.into_raw(),
                         &mut state,
                         &self.body,
                     );
                 }
-                state
+                Some(state)
             }
 
             CfgVertex::WhileHeader(while_vertex) => {
                 let mut state = in_state.clone();
+                if !spend_for_state(spend, &state) {
+                    return None;
+                }
                 self.transfer.transfer_expr_in_place(
                     while_vertex.condition,
                     &mut state,
                     &self.body,
                 );
-                state
+                Some(state)
             }
 
             CfgVertex::Conditional(conditional_vertex) => {
                 let mut state = in_state.clone();
+                if !spend_for_state(spend, &state) {
+                    return None;
+                }
                 self.transfer.transfer_expr_in_place(
                     conditional_vertex.condition,
                     &mut state,
                     &self.body,
                 );
-                state
+                Some(state)
             }
 
             CfgVertex::LoopEntry(entry) => {
                 let mut state = in_state.clone();
                 for &root in entry.roots() {
+                    if !spend_for_state(spend, &state) {
+                        return None;
+                    }
                     self.transfer.transfer_expr_in_place(root, &mut state, &self.body);
                 }
-                state
+                Some(state)
             }
 
             CfgVertex::ForHeader(for_vertex) => {
                 let mut state = in_state.clone();
+                if !spend_for_state(spend, &state) {
+                    return None;
+                }
                 self.transfer.transfer_loop_var_bind(for_vertex.loop_var, &mut state, &self.body);
-                state
+                Some(state)
             }
 
             CfgVertex::ForEachHeader(foreach_vertex) => {
                 let mut state = in_state.clone();
+                if !spend_for_state(spend, &state) {
+                    return None;
+                }
                 self.transfer.transfer_loop_var_bind(
                     foreach_vertex.loop_var,
                     &mut state,
                     &self.body,
                 );
-                state
+                Some(state)
             }
 
             CfgVertex::Try => {
                 let mut state = in_state.clone();
                 if let Some(try_stmt) = self.cfg.source_stmt_id(block_idx) {
+                    if !spend_for_state(spend, &state) {
+                        return None;
+                    }
                     self.transfer.transfer_try_entry(try_stmt, &mut state, &self.body);
                 }
-                state
+                Some(state)
             }
 
-            _ => in_state.clone(),
+            _ => Some(in_state.clone()),
         }
     }
 }
@@ -573,6 +776,8 @@ impl<L: Lattice> DataflowResult<L> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct IntSetLattice {
@@ -779,5 +984,237 @@ mod tests {
         let mut merged: Vec<i32> = merge_in.values.clone();
         merged.sort_unstable();
         assert_eq!(merged, vec![-2, -1, 0, 1, 2], "diamond merge must recover full set");
+    }
+
+    /// Counts every `Clone::clone` of itself and reports its length as work, so a
+    /// test can see whether a clone happened behind a charge the budget refused.
+    #[derive(Debug, PartialEq, Eq)]
+    struct CloneCountedLattice {
+        values: Vec<usize>,
+        clones: Rc<Cell<usize>>,
+    }
+
+    impl Clone for CloneCountedLattice {
+        fn clone(&self) -> Self {
+            self.clones.set(self.clones.get() + 1);
+            Self { values: self.values.clone(), clones: Rc::clone(&self.clones) }
+        }
+    }
+
+    impl Lattice for CloneCountedLattice {
+        fn join(&self, other: &Self) -> Self {
+            let mut values = self.values.clone();
+            for &v in &other.values {
+                if !values.contains(&v) {
+                    values.push(v);
+                }
+            }
+            values.sort_unstable();
+            Self { values, clones: Rc::clone(&self.clones) }
+        }
+
+        fn work_weight(&self) -> usize {
+            self.values.len()
+        }
+    }
+
+    struct PassThroughTransfer;
+
+    impl Transfer<CloneCountedLattice> for PassThroughTransfer {
+        fn transfer_stmt(
+            &self,
+            _: RawIdx,
+            state: &CloneCountedLattice,
+            _: &Body,
+        ) -> CloneCountedLattice {
+            state.clone()
+        }
+    }
+
+    fn refused_after(accepted: usize) -> impl FnMut(usize) -> bool {
+        let mut calls = 0;
+        move |_amount| {
+            calls += 1;
+            calls <= accepted
+        }
+    }
+
+    /// The first spend of a solve is the block visit, the second is the charge
+    /// for cloning the large entry state; refusing it must leave the state
+    /// uncloned instead of copying it and stopping afterwards.
+    #[test]
+    fn budget_refusal_does_not_clone_the_entry_state() {
+        use cfg::{BasicBlockVertex, CfgVertex};
+
+        let mut cfg = ControlFlowGraph::new();
+        let entry = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
+        cfg.set_start(entry);
+
+        let clones = Rc::new(Cell::new(0usize));
+        let mut solver = DataflowSolver::new(Arc::new(cfg), Body::default(), PassThroughTransfer);
+        solver.set_bottom_factory(|| CloneCountedLattice {
+            values: Vec::new(),
+            clones: Rc::clone(&clones),
+        });
+        solver.set_initial_state(CloneCountedLattice {
+            values: vec![0; 1_000_000],
+            clones: Rc::clone(&clones),
+        });
+
+        let result =
+            solver.solve_with_work(&mut refused_after(1)).expect("solve returns a partial result");
+
+        assert!(!result.converged(), "the entry-state charge must be refused");
+        assert_eq!(clones.get(), 0, "a state whose charge was refused must not be cloned");
+    }
+
+    /// Mirror of the entry-state refusal for a backward solve seeded at exit.
+    #[test]
+    fn budget_refusal_does_not_clone_the_exit_state() {
+        let cfg = ControlFlowGraph::new();
+
+        let clones = Rc::new(Cell::new(0usize));
+        let mut solver = DataflowSolver::new(Arc::new(cfg), Body::default(), PassThroughTransfer);
+        solver.set_direction(Direction::Backward);
+        solver.set_bottom_factory(|| CloneCountedLattice {
+            values: Vec::new(),
+            clones: Rc::clone(&clones),
+        });
+        solver.set_initial_state_at_exit(CloneCountedLattice {
+            values: vec![0; 1_000_000],
+            clones: Rc::clone(&clones),
+        });
+
+        let result =
+            solver.solve_with_work(&mut refused_after(1)).expect("solve returns a partial result");
+
+        assert!(!result.converged(), "the exit-state charge must be refused");
+        assert_eq!(clones.get(), 0, "a state whose charge was refused must not be cloned");
+    }
+
+    /// The entry block whose only incoming edge is an un-crossed possible-failure
+    /// edge has no predecessor state and falls back to its seeded IN state; the
+    /// budget refuses that fallback charge (visit, incoming edge, fallback), so
+    /// the seeded state must not be cloned either.
+    #[test]
+    fn budget_refusal_does_not_clone_the_fallback_state() {
+        use cfg::{BasicBlockVertex, CfgVertex};
+
+        let mut cfg = ControlFlowGraph::new();
+        let entry = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
+        let mid = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
+        let exit = cfg.exit();
+        cfg.set_start(entry);
+        cfg.add_edge(entry, mid, CfgEdgeType::Unconditional);
+        cfg.add_edge(mid, exit, CfgEdgeType::Unconditional);
+        cfg.add_edge(mid, entry, CfgEdgeType::Exception);
+
+        let clones = Rc::new(Cell::new(0usize));
+        let mut solver = DataflowSolver::new(Arc::new(cfg), Body::default(), PassThroughTransfer);
+        solver.set_bottom_factory(|| CloneCountedLattice {
+            values: Vec::new(),
+            clones: Rc::clone(&clones),
+        });
+
+        let result =
+            solver.solve_with_work(&mut refused_after(2)).expect("solve returns a partial result");
+
+        assert!(!result.converged(), "the fallback charge must be refused");
+        assert_eq!(clones.get(), 0, "the fallback state must not be cloned behind its refusal");
+    }
+
+    /// Each bottom state is charged before the factory builds it, so a budget
+    /// that funds exactly `n` charges builds exactly `n` states and stops; a
+    /// full budget builds both states of every vertex and the solve may run.
+    #[test]
+    fn bottom_factory_charges_each_state_before_it_is_built() {
+        use cfg::{BasicBlockVertex, CfgEdgeType, CfgVertex};
+
+        let mut cfg = ControlFlowGraph::new();
+        let entry = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
+        let mid = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
+        cfg.set_start(entry);
+        cfg.add_edge(entry, mid, CfgEdgeType::Unconditional);
+        let vertices = cfg.vertex_count();
+
+        let builds = Rc::new(Cell::new(0usize));
+        let clones = Rc::new(Cell::new(0usize));
+        let mut solver =
+            DataflowSolver::new(Arc::new(cfg.clone()), Body::default(), PassThroughTransfer);
+        let built = solver.set_bottom_factory_with_work(
+            || {
+                builds.set(builds.get() + 1);
+                CloneCountedLattice { values: vec![], clones: Rc::clone(&clones) }
+            },
+            3,
+            &mut refused_after(4),
+        );
+        assert!(!built, "a budget that funds fewer charges than the states must refuse");
+        assert_eq!(builds.get(), 4, "every accepted charge bought its state before the refusal");
+
+        builds.set(0);
+        let mut solver = DataflowSolver::new(Arc::new(cfg), Body::default(), PassThroughTransfer);
+        let built = solver.set_bottom_factory_with_work(
+            || {
+                builds.set(builds.get() + 1);
+                CloneCountedLattice { values: vec![], clones: Rc::clone(&clones) }
+            },
+            3,
+            &mut |_| true,
+        );
+        assert!(built, "an unlimited budget seeds every block");
+        assert_eq!(builds.get(), 2 * vertices, "both states of every vertex are built");
+    }
+
+    /// With an adequate budget the same forward solve converges and the charged
+    /// clones do happen.
+    #[test]
+    fn adequate_budget_converges_forward_and_clones() {
+        use cfg::{BasicBlockVertex, CfgVertex};
+
+        let mut cfg = ControlFlowGraph::new();
+        let entry = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
+        cfg.set_start(entry);
+
+        let clones = Rc::new(Cell::new(0usize));
+        let mut solver = DataflowSolver::new(Arc::new(cfg), Body::default(), PassThroughTransfer);
+        solver.set_bottom_factory(|| CloneCountedLattice {
+            values: Vec::new(),
+            clones: Rc::clone(&clones),
+        });
+        solver
+            .set_initial_state(CloneCountedLattice { values: vec![7], clones: Rc::clone(&clones) });
+
+        let result = solver.solve_with_work(&mut |_| true).expect("the solve converges");
+
+        assert!(result.converged());
+        assert_eq!(result.block_in(entry).expect("entry IN exists").values, vec![7]);
+        assert!(clones.get() > 0, "an accepted charge buys its clone");
+    }
+
+    /// With an adequate budget the same backward solve converges and the charged
+    /// clones do happen.
+    #[test]
+    fn adequate_budget_converges_backward_and_clones() {
+        let cfg = ControlFlowGraph::new();
+        let exit = cfg.exit();
+
+        let clones = Rc::new(Cell::new(0usize));
+        let mut solver = DataflowSolver::new(Arc::new(cfg), Body::default(), PassThroughTransfer);
+        solver.set_direction(Direction::Backward);
+        solver.set_bottom_factory(|| CloneCountedLattice {
+            values: Vec::new(),
+            clones: Rc::clone(&clones),
+        });
+        solver.set_initial_state_at_exit(CloneCountedLattice {
+            values: vec![7],
+            clones: Rc::clone(&clones),
+        });
+
+        let result = solver.solve_with_work(&mut |_| true).expect("the solve converges");
+
+        assert!(result.converged());
+        assert_eq!(result.block_out(exit).expect("exit OUT exists").values, vec![7]);
+        assert!(clones.get() > 0, "an accepted charge buys its clone");
     }
 }

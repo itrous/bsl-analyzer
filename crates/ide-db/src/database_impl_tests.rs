@@ -3317,11 +3317,36 @@ fn test_workspace_call_graph_module_code_and_multiple_callers() {
     assert!(callers.iter().all(|e| !e.crosses_client_to_server));
 }
 
+fn managed_form_module_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("managed form fixture directory");
+    let forms_dir = dir.path().join("Catalogs/Товары/Forms");
+    let module_path = forms_dir.join("Форма/Ext/Form/Module.bsl");
+    let module_dir = module_path.parent().expect("form module directory");
+    std::fs::create_dir_all(module_dir).expect("create form module directory");
+    std::fs::write(&module_path, "").expect("write form module path anchor");
+    std::fs::write(
+        module_dir.parent().expect("form Ext directory").join("Form.xml"),
+        r#"<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" version="2.20"><Events /></Form>"#,
+    )
+    .expect("write managed form contents");
+    std::fs::write(
+        forms_dir.join("Форма.xml"),
+        r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <Form uuid="12345678-1234-1234-1234-123456789012">
+        <Properties><Name>Форма</Name><FormType>Managed</FormType></Properties>
+    </Form>
+</MetaDataObject>"#,
+    )
+    .expect("write managed form descriptor");
+    (dir, module_path)
+}
+
 #[test]
 fn project_batch_method_pairs_include_resolved_callbacks_and_exclude_non_methods() {
     use hir::graph_index::{project_batch_method_call_pairs, GraphIndex};
 
-    const BASE_CALLER: &str = "Процедура Главная() Экспорт\n\
+    const BASE_CALLER: &str = "&НаКлиенте\n\
+         Процедура Главная() Экспорт\n\
          ЛокальнаяЦель();\n\
          Сервер.Считать();\n\
          Справочники.Контрагенты.НайтиПоИНН();\n\
@@ -3329,11 +3354,16 @@ fn project_batch_method_pairs_include_resolved_callbacks_and_exclude_non_methods
          Оп2 = Новый ОписаниеОповещения(\"Считать\", Сервер);\n\
          ПодключитьОбработчикОжидания(\"ОбновитьЭкран\", 1);\n\
          КонецПроцедуры\n\
+         &НаКлиенте\n\
          Процедура ЛокальнаяЦель() Экспорт КонецПроцедуры\n\
+         &НаКлиенте\n\
          Процедура ЛокальныйОбработчик() Экспорт КонецПроцедуры\n\
+         &НаКлиенте\n\
          Процедура ОбновитьЭкран() Экспорт КонецПроцедуры\n\
+         &НаКлиенте\n\
          Процедура ОбработчикДействия() Экспорт КонецПроцедуры";
-    const IGNORED_CALLER: &str = "Процедура Главная() Экспорт\n\
+    const IGNORED_CALLER: &str = "&НаКлиенте\n\
+         Процедура Главная() Экспорт\n\
          ЛокальнаяЦель();\n\
          Сервер.Считать();\n\
          Справочники.Контрагенты.НайтиПоИНН();\n\
@@ -3344,13 +3374,19 @@ fn project_batch_method_pairs_include_resolved_callbacks_and_exclude_non_methods
          Элементы.Кнопка.УстановитьДействие(\"Нажатие\", \"ОбработчикДействия\");\n\
          Запрос = Новый Запрос(\"ВЫБРАТЬ Ссылка ИЗ Справочник.Номенклатура\");\n\
          КонецПроцедуры\n\
+         &НаКлиенте\n\
          Процедура ЛокальнаяЦель() Экспорт КонецПроцедуры\n\
+         &НаКлиенте\n\
          Процедура ЛокальныйОбработчик() Экспорт КонецПроцедуры\n\
+         &НаКлиенте\n\
          Процедура ОбновитьЭкран() Экспорт КонецПроцедуры\n\
+         &НаКлиенте\n\
          Процедура ОбработчикДействия() Экспорт КонецПроцедуры\n\
          ЛокальнаяЦель();";
+    let (_form_fixture, caller_path) = managed_form_module_fixture();
+    let caller_path = caller_path.to_string_lossy().into_owned();
     let files = [
-        ("/src/CommonModules/Клиент/Ext/Module.bsl", BASE_CALLER),
+        (caller_path.as_str(), BASE_CALLER),
         ("/src/CommonModules/Сервер/Ext/Module.bsl", "Функция Считать() Экспорт КонецФункции"),
         (
             "/src/Catalogs/Контрагенты/Ext/ManagerModule.bsl",
@@ -3376,8 +3412,11 @@ fn project_batch_method_pairs_include_resolved_callbacks_and_exclude_non_methods
         db
     };
 
-    // Given: direct, qualified, manager, and callback calls in one caller module.
+    // Given: direct, qualified, manager, and callback calls in a managed form module.
     let base = make_db(BASE_CALLER);
+    let caller_metadata = base.module_metadata(ModuleId::new(client));
+    assert_eq!(caller_metadata.module_type, bsl_metadata::ModuleType::FormModule);
+    assert!(caller_metadata.form.as_ref().is_some_and(|form| form.is_managed()));
     let index = GraphIndex::build(&base, &modules);
     let pool = rayon::ThreadPoolBuilder::new().build().expect("projection pool");
 
@@ -3448,6 +3487,98 @@ fn project_batch_method_pairs_include_resolved_callbacks_and_exclude_non_methods
         pairs,
         "module code, MDO, query, and SetAction additions must not alter the method-pair digest",
     );
+}
+
+#[test]
+fn client_common_module_named_thisobject_is_not_treated_as_form_self() {
+    use hir::call_graph::NotifyTarget;
+    use hir::graph_index::{project_batch_method_call_pairs, GraphIndex};
+    use hir::{MethodCallPair, MethodId};
+
+    let root = tempfile::tempdir().expect("common module fixture directory");
+    std::fs::write(
+        root.path().join("Configuration.xml"),
+        r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <Configuration uuid="00000000-0000-0000-0000-000000000000">
+        <Properties><Name>Test</Name></Properties>
+    </Configuration>
+</MetaDataObject>"#,
+    )
+    .expect("write configuration descriptor");
+
+    let module_xml = |name: &str| {
+        format!(
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <CommonModule uuid="00000000-0000-0000-0000-000000000001">
+        <Properties>
+            <Name>{name}</Name><Server>false</Server><Global>false</Global>
+            <ClientManagedApplication>true</ClientManagedApplication>
+            <ClientOrdinaryApplication>true</ClientOrdinaryApplication>
+        </Properties>
+    </CommonModule>
+</MetaDataObject>"#
+        )
+    };
+    let caller_source = "&НаКлиенте\n\
+         Процедура Главная() Экспорт\n\
+         Оп = Новый ОписаниеОповещения(\"Обработчик\", ЭтотОбъект);\n\
+         КонецПроцедуры\n\
+         &НаКлиенте\n\
+         Процедура Обработчик() Экспорт КонецПроцедуры";
+    let target_source = "&НаКлиенте\nПроцедура Обработчик() Экспорт КонецПроцедуры";
+    let caller = FileId(0);
+    let target = FileId(1);
+    let mut db = RootDatabaseImpl::new();
+    let mut file_set = FileSet::new();
+    for (file_id, name, source) in
+        [(caller, "Клиент", caller_source), (target, "ЭтотОбъект", target_source)]
+    {
+        let module_dir = root.path().join("CommonModules").join(name);
+        std::fs::create_dir_all(module_dir.join("Ext")).expect("create common module directory");
+        let module_path = module_dir.join("Ext/Module.bsl");
+        std::fs::write(&module_path, source).expect("write common module body");
+        std::fs::write(
+            root.path().join("CommonModules").join(format!("{name}.xml")),
+            module_xml(name),
+        )
+        .expect("write common module descriptor");
+        file_set.insert(file_id, VfsPath::new(module_path.to_string_lossy().as_ref()));
+        db.set_file_source_root(file_id, SourceRootId(0));
+        db.set_file_text(file_id, source);
+    }
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    db.set_all_config_paths(vec![(None, root.path().to_path_buf())], None);
+
+    let caller_module = ModuleId::new(caller);
+    let target_module = ModuleId::new(target);
+    let caller_metadata = db.module_metadata(caller_module);
+    assert_eq!(caller_metadata.module_type, bsl_metadata::ModuleType::CommonModule);
+    assert!(caller_metadata
+        .common_module
+        .as_ref()
+        .is_some_and(|module| module.is_client_managed_application()));
+    let target_metadata = db.module_metadata(target_module);
+    assert!(target_metadata
+        .common_module
+        .as_ref()
+        .is_some_and(|module| module.is_client_managed_application()));
+
+    let summary = db.module_call_summary(caller_module);
+    assert!(summary.notify_regs.iter().any(|registration| {
+        matches!(&registration.target, NotifyTarget::Module(name) if name.as_str() == "ЭтотОбъект")
+    }));
+    let modules = [caller_module, target_module];
+    let index = GraphIndex::build(&db, &modules);
+    let pool = rayon::ThreadPoolBuilder::new().build().expect("projection pool");
+    let pairs = project_batch_method_call_pairs(&pool, &db, &index, &modules);
+    let caller_method =
+        MethodId { module: caller_module, local_id: hir::MethodKey::first("Главная") };
+    let module_handler =
+        MethodId { module: target_module, local_id: hir::MethodKey::first("Обработчик") };
+    let local_decoy =
+        MethodId { module: caller_module, local_id: hir::MethodKey::first("Обработчик") };
+    assert_eq!(pairs, vec![MethodCallPair::new(caller_method, module_handler)]);
+    assert!(!pairs.contains(&MethodCallPair::new(caller_method, local_decoy)));
 }
 
 #[test]
@@ -4052,6 +4183,199 @@ fn an_unread_manager_module_still_yields_a_platform_manager_edge() {
     );
 }
 
+/// A semantic notify projection that stopped at its work budget must not publish
+/// `notify_ref` edges into the workspace graph. Every publication path — the Salsa
+/// fold, the batched full build, the incremental reprojection — resolves callbacks
+/// through the shared `resolve_callback_edges`, which the index projection carries:
+/// a truncated summary fed to it must produce no notify edges while direct calls
+/// survive. The truncated summary comes from the production work-limit hook, not
+/// from a hand-assembled struct.
+#[test]
+fn truncated_notify_projection_publishes_no_notify_ref_edges() {
+    use base_db::FileIdInput;
+    use hir::call_graph::{EdgeKind, EdgeProvenance, ResolvedTarget};
+    use hir::graph_index::{resolve_summary_via_index, GraphIndex};
+    use hir::{semantic_notify_facts_with_work_limit, ConfigsDatabase};
+
+    let mut db = RootDatabaseImpl::new();
+    let caller = FileId(0);
+    let target = FileId(1);
+    let mut file_set = FileSet::new();
+    file_set.insert(caller, VfsPath::new("/src/CommonModules/Первый/Ext/Module.bsl"));
+    file_set.insert(target, VfsPath::new("/src/CommonModules/Второй/Ext/Module.bsl"));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    db.set_file_source_root(caller, SourceRootId(0));
+    db.set_file_source_root(target, SourceRootId(0));
+    db.set_file_text(
+        caller,
+        "Процедура Начать()\n\
+         Внутренний();\n\
+         Оп = Новый ОписаниеОповещения(\"Завершить\", Второй);\n\
+         КонецПроцедуры\n\
+         Процедура Внутренний() Экспорт КонецПроцедуры",
+    );
+    db.set_file_text(target, "Процедура Завершить() Экспорт КонецПроцедуры");
+    let module = ModuleId::new(caller);
+
+    let notify_refs = |summary: &hir::ResolvedModuleSummary| {
+        summary
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::NotifyRef)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    // Control: with the budget intact the registration resolves into a notify_ref
+    // edge — without this half the assertions below pass on a fixture that never
+    // produced one.
+    let complete = db.module_call_summary(module);
+    assert!(
+        !complete.notify_projection_incomplete,
+        "control: this fixture completes its notify projection"
+    );
+    let complete_resolved = db.resolved_module_summary(module);
+    assert!(
+        !complete_resolved.notify_projection_incomplete,
+        "control: the complete resolved summary carries no incomplete status"
+    );
+    let baseline = notify_refs(&complete_resolved);
+    assert!(
+        baseline.iter().all(|edge| edge.provenance == EdgeProvenance::StringResolved
+            && matches!(edge.target, ResolvedTarget::Method(_))),
+        "control: the complete projection resolves the registration: {baseline:#?}"
+    );
+    assert_eq!(baseline.len(), 1, "one registration, one edge: {baseline:#?}");
+
+    // The same module under an exhausted budget: the projection itself, not a
+    // hand-built flag, marks the summary incomplete.
+    let truncated = semantic_notify_facts_with_work_limit(&db, FileIdInput::new(&db, caller), 0);
+    assert!(truncated.summary.notify_projection_incomplete);
+
+    let index = GraphIndex::build(&db, &[module, ModuleId::new(target)]);
+    let projected = resolve_summary_via_index(&db, module, &truncated.summary, &index);
+    assert!(
+        projected.notify_projection_incomplete,
+        "the resolved summary must carry the stopped notify projection"
+    );
+    assert!(
+        notify_refs(&projected).is_empty(),
+        "a truncated projection must not publish notify_ref edges: {projected:#?}"
+    );
+    assert!(
+        projected.edges.iter().any(|edge| edge.kind == EdgeKind::DirectLocal),
+        "withholding the notify projection must not drop direct-call edges: {projected:#?}"
+    );
+
+    // The Salsa fold and the index projection must agree on the same complete
+    // input — the filter sits in the function both call, so neither path may
+    // diverge into publishing what the other withholds.
+    assert_eq!(
+        notify_refs(&resolve_summary_via_index(&db, module, &complete, &index)),
+        notify_refs(&complete_resolved),
+        "the index projection and the Salsa fold must agree on a complete projection",
+    );
+}
+
+/// The real production budget, not the work-limit hook: a module whose first
+/// method registers a handler and whose second method exhausts the notify budget
+/// keeps the registration as a read prefix. Both full-build publication paths —
+/// the Salsa fold (`workspace_call_graph`) and the batched index projection
+/// (`workspace_call_graph_via_index`) — must publish no `notify_ref` edge from
+/// that prefix while direct-call edges survive, and a sibling module with an
+/// intact projection must still publish its reference.
+#[test]
+fn full_build_publishes_no_notify_edges_from_a_partially_read_projection() {
+    use base_db::SourceDatabase as _;
+    use hir::call_graph::{EdgeKind, GraphNode};
+    use hir::graph_index::{workspace_call_graph_via_index, GraphIndex};
+    use hir::{ConfigsDatabase, MethodId, MethodKey};
+
+    let mut text = String::from(
+        "Процедура Начать()\n\
+         Внутренний();\n\
+         Хоро = Новый ОписаниеОповещения(\"Цель\", Второй);\n\
+         КонецПроцедуры\n\
+         Процедура Внутренний() Экспорт\n\
+         КонецПроцедуры\n\
+         Процедура Масса(А)\n",
+    );
+    for i in 0..3_000 {
+        text.push_str(&format!("О{i} = Новый(\"CallbackDescription\", А);\n"));
+    }
+    text.push_str("КонецПроцедуры\n");
+
+    let files: [(&str, &str); 3] = [
+        ("/src/CommonModules/Первый/Ext/Module.bsl", &text),
+        ("/src/CommonModules/Второй/Ext/Module.bsl", "Процедура Цель() Экспорт\nКонецПроцедуры"),
+        (
+            "/src/CommonModules/Контроль/Ext/Module.bsl",
+            "Процедура Старт()\n\
+             Хоро = Новый ОписаниеОповещения(\"Цель\", Второй);\n\
+             КонецПроцедуры",
+        ),
+    ];
+    let mut db = RootDatabaseImpl::new();
+    let mut file_set = FileSet::new();
+    for (index, (path, _)) in files.iter().enumerate() {
+        file_set.insert(FileId(index as u32), VfsPath::new(*path));
+    }
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    for (index, (_, file_text)) in files.iter().enumerate() {
+        let file_id = FileId(index as u32);
+        db.set_file_source_root(file_id, SourceRootId(0));
+        db.set_file_text(file_id, file_text);
+    }
+    let big = ModuleId::new(FileId(0));
+    let modules = vec![big, ModuleId::new(FileId(1)), ModuleId::new(FileId(2))];
+
+    // Control of the shape: the real budget exhausted, the registration read
+    // before the exhaustion survived as a one-entry prefix.
+    let summary = db.module_call_summary(big);
+    assert!(summary.notify_projection_incomplete, "the fixture must exhaust the budget");
+    assert_eq!(
+        summary.notify_regs.len(),
+        1,
+        "the fixture must keep the read registration: {summary:#?}"
+    );
+    assert_eq!(summary.notify_regs[0].callback_name.as_str(), "Цель");
+
+    let notify_edges = |graph: &hir::WorkspaceCallGraph| {
+        graph.edges().filter(|edge| edge.kind == EdgeKind::NotifyRef).count()
+    };
+    let start =
+        GraphNode::Method(MethodId { module: big, local_id: MethodKey::first("Начать") });
+    let keeps_direct_calls = |graph: &hir::WorkspaceCallGraph| {
+        graph.callees(&start).iter().any(|edge| {
+            edge.kind == EdgeKind::DirectLocal
+                && matches!(&edge.to, GraphNode::Method(m) if m.module == big)
+        })
+    };
+
+    // Full build, Salsa fold: the withheld prefix must not appear, the direct
+    // call must, and the sibling module's intact projection publishes exactly
+    // its own reference — proving the absence above is not vacuous.
+    let folded = db.workspace_call_graph(SourceRootId(0));
+    assert!(folded.incomplete, "the fold must carry the truncated projection state");
+    assert_eq!(
+        notify_edges(&folded),
+        1,
+        "only the intact sibling module publishes a notify_ref edge: {folded:#?}"
+    );
+    assert!(keeps_direct_calls(&folded), "the direct call survives the withholding: {folded:#?}");
+
+    // Full build, batched index projection: byte-identical contract.
+    let index = GraphIndex::build(&db, &modules);
+    let batched = workspace_call_graph_via_index(&db, &modules, &index);
+    assert!(batched.incomplete, "the index projection must carry the truncated state");
+    assert_eq!(
+        notify_edges(&batched),
+        1,
+        "the batched full build must agree with the fold: {batched:#?}"
+    );
+    assert!(keeps_direct_calls(&batched), "the direct call survives in the batched build");
+}
+
 #[test]
 fn workspace_call_graph_via_index_matches_salsa_fold() {
     use bsl_metadata::MdoType;
@@ -4061,9 +4385,11 @@ fn workspace_call_graph_via_index_matches_salsa_fold() {
     };
     use hir::ConfigsDatabase;
 
+    let (_form_fixture, caller_module_path) = managed_form_module_fixture();
+    let caller_module_path = caller_module_path.to_string_lossy().into_owned();
     let files: &[(&str, &str)] = &[
         (
-            "/src/CommonModules/Клиент/Ext/Module.bsl",
+            caller_module_path.as_str(),
             "&НаКлиенте\n\
              Процедура Главная() Экспорт\n\
              ЛокальнаяЦель();\n\
@@ -4115,6 +4441,10 @@ fn workspace_call_graph_via_index_matches_salsa_fold() {
         db.set_file_text(fid, text);
     }
 
+    let caller_metadata = db.module_metadata(ModuleId::new(FileId(0)));
+    assert_eq!(caller_metadata.module_type, bsl_metadata::ModuleType::FormModule);
+    assert!(caller_metadata.form.as_ref().is_some_and(|form| form.is_managed()));
+
     // Enumerate modules exactly as the fold does (same iteration order → same
     // edge insertion order, so the two graphs compare equal).
     let source_root = db.source_root_input(SourceRootId(0)).root(&db);
@@ -4165,25 +4495,61 @@ fn workspace_call_graph_via_index_matches_salsa_fold() {
             && matches!(e.target, ResolvedTarget::Mdo { .. })),
         "platform find / absent manager method → Mdo + ManagerAccess"
     );
-    // String-dispatched callbacks: ЭтотОбъект handler + exported cross-module handler
-    // both resolve to a NotifyRef method edge with StringResolved provenance.
+    // String-dispatched callbacks: assert their exact destinations so a missing
+    // ЭтотОбъект pair cannot be hidden by another same-module callback.
+    let mut notify_targets: Vec<_> = caller
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            if edge.kind != EdgeKind::NotifyRef || edge.provenance != EdgeProvenance::StringResolved
+            {
+                return None;
+            }
+            let ResolvedTarget::Method(target) = &edge.target else {
+                return None;
+            };
+            let name = db
+                .symbol_tree(target.module)
+                .find_method_by_id(*target)
+                .expect("resolved callback target exists")
+                .name
+                .as_str()
+                .to_string();
+            Some((target.module, name))
+        })
+        .collect();
+    notify_targets.sort_unstable_by_key(|(_, name)| name.clone());
     assert_eq!(
-        caller
-            .edges
-            .iter()
-            .filter(|e| e.kind == EdgeKind::NotifyRef
-                && e.provenance == EdgeProvenance::StringResolved
-                && matches!(e.target, ResolvedTarget::Method(_)))
-            .count(),
-        2,
-        "ОписаниеОповещения(ЭтотОбъект) + ОписаниеОповещения(exported Сервер) → 2 NotifyRef methods"
+        notify_targets,
+        vec![
+            (ModuleId::new(FileId(0)), "ЛокальныйОбработчик".to_string()),
+            (ModuleId::new(FileId(1)), "Считать".to_string()),
+        ],
+        "ОписаниеОповещения must retain the local ЭтотОбъект pair and exported Сервер pair",
     );
-    assert!(
-        has(&|e| e.kind == EdgeKind::IdleHandler
-            && e.provenance == EdgeProvenance::StringResolved
-            && matches!(e.target, ResolvedTarget::Method(_))),
-        "ПодключитьОбработчикОжидания → IdleHandler method"
-    );
+    let idle_targets: Vec<_> = caller
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            if edge.kind != EdgeKind::IdleHandler
+                || edge.provenance != EdgeProvenance::StringResolved
+            {
+                return None;
+            }
+            let ResolvedTarget::Method(target) = &edge.target else {
+                return None;
+            };
+            Some(
+                db.symbol_tree(target.module)
+                    .find_method_by_id(*target)
+                    .expect("resolved idle target exists")
+                    .name
+                    .as_str()
+                    .to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(idle_targets, vec!["ОбновитьЭкран"]);
     // The non-exported callback (Приватная) is surfaced VisibilityBlocked, never as an
     // edge; the unsupported receiver (Объекты[0]) yields nothing at all.
     assert!(
@@ -4255,11 +4621,14 @@ fn call_hierarchy_index_fixture_parity() {
     use rustc_hash::FxHashMap;
 
     // Given: all method-only call forms supported by the compact projection.
+    let (_form_fixture, caller_module_path) = managed_form_module_fixture();
+    let caller_module_path = caller_module_path.to_string_lossy().into_owned();
     let files: &[(FileId, &str, &str)] = &[
         (
             FileId(0),
-            "/src/CommonModules/Вызыватель/Ext/Module.bsl",
-            "Процедура Главная() Экспорт\n\
+            caller_module_path.as_str(),
+            "&НаКлиенте\n\
+             Процедура Главная() Экспорт\n\
              ЛокальнаяЦель();\n\
              Общий.Метод();\n\
              Справочники.Товары.МетодМенеджера();\n\
@@ -4267,9 +4636,13 @@ fn call_hierarchy_index_fixture_parity() {
              ПодключитьОбработчикОжидания(\"Ожидание\", 1);\n\
              УстановитьДействие(\"ПриНажатии\", \"Исключен\");\n\
              КонецПроцедуры\n\
+             &НаКлиенте\n\
              Процедура ЛокальнаяЦель() Экспорт КонецПроцедуры\n\
+             &НаКлиенте\n\
              Процедура Оповещение() Экспорт КонецПроцедуры\n\
+             &НаКлиенте\n\
              Процедура Ожидание() Экспорт КонецПроцедуры\n\
+             &НаКлиенте\n\
              Процедура Исключен() Экспорт КонецПроцедуры",
         ),
         (
@@ -4299,6 +4672,9 @@ fn call_hierarchy_index_fixture_parity() {
         db.set_file_source_root(file_id, source_root_id);
         db.set_file_text(file_id, text);
     }
+    let caller_metadata = db.module_metadata(ModuleId::new(FileId(0)));
+    assert_eq!(caller_metadata.module_type, bsl_metadata::ModuleType::FormModule);
+    assert!(caller_metadata.form.as_ref().is_some_and(|form| form.is_managed()));
     let modules: Vec<_> = files.iter().map(|(file_id, _, _)| ModuleId::new(*file_id)).collect();
 
     // When: the compact batch projection builds the reverse index.
@@ -4309,10 +4685,29 @@ fn call_hierarchy_index_fixture_parity() {
     let salsa = db.workspace_call_graph(source_root_id);
     let folded = method_call_digest_from_fold(&salsa, &encoder);
 
-    // Then: every retained method edge agrees with the Salsa incoming graph.
+    // Then: every retained method edge agrees with the Salsa incoming graph, and
+    // all five expected destinations survive the form-specific ЭтотОбъект dispatch.
     assert_eq!(compact, folded);
-    assert_eq!(compact.len(), 5, "direct, qualified, manager, notify, and idle rows");
     let caller = ModuleId::new(FileId(0));
+    let main = hir::MethodId { module: caller, local_id: hir::MethodKey::first("Главная") };
+    let expected = hir::MethodCallDigest::from_rows(
+        [
+            (caller, "ЛокальнаяЦель"),
+            (ModuleId::new(FileId(1)), "Метод"),
+            (ModuleId::new(FileId(2)), "МетодМенеджера"),
+            (caller, "Оповещение"),
+            (caller, "Ожидание"),
+        ]
+        .into_iter()
+        .map(|(module, name)| {
+            let target = hir::MethodId { module, local_id: hir::MethodKey::first(name) };
+            (
+                encoder.encode(&GraphNode::Method(target)).0,
+                encoder.encode(&GraphNode::Method(main)).0,
+            )
+        }),
+    );
+    assert_eq!(compact, expected, "direct, qualified, manager, notify, and idle rows");
     assert!(salsa.edges().any(|edge| {
         edge.kind == EdgeKind::DirectLocal
             && matches!((&edge.from, &edge.to),
@@ -9504,6 +9899,150 @@ fn dataflow_writes_i14_body_flow_identity() {
     effective_body_has_its_own_flow();
 }
 
+#[test]
+fn body_flow_budget_refuses_cold_memo_queries_before_they_run() {
+    let mut db = RootDatabaseImpl::new_with_salsa_events();
+    let file_id = FileId(0);
+    let mut files = FileSet::new();
+    files.insert(file_id, VfsPath::new("/Module.bsl"));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(files));
+    db.set_file_source_root(file_id, SourceRootId(0));
+    let statements = (0..256).map(|index| format!("\tA{index} = {index};\n")).collect::<String>();
+    db.set_file_text(file_id, &format!("Процедура Т()\n{statements}КонецПроцедуры\n{statements}"));
+    let module = ModuleId::new(file_id);
+    let method = db.symbol_tree(module).find_method(&hir::Name::new("Т")).expect("method").id;
+    let input = hir::MethodIdInput::new(&db, method);
+    let method_flow = hir::BodyFlow::for_method(&db, input, db.method_body_ref(input));
+    let module_body = db.module_bodies_ref(module).module_code_arc().expect("module code").clone();
+    let module_flow = hir::BodyFlow::for_module_code(&db, file_id, &module_body);
+
+    assert!(db.salsa_events_reset());
+    let mut cancellation_checks = 0;
+    let mut refuse = |_: usize| {
+        cancellation_checks += 1;
+        false
+    };
+    assert!(method_flow.cfg_with_work(&db, &mut refuse).is_none());
+    assert!(method_flow.events_with_work(&db, &mut refuse).is_none());
+    assert!(module_flow.cfg_with_work(&db, &mut refuse).is_none());
+    assert!(module_flow.events_with_work(&db, &mut refuse).is_none());
+    assert_eq!(cancellation_checks, 4, "each cold query is charged before it starts");
+    assert_eq!(db.salsa_family_churn("method_cfg_query").unwrap().0, 0);
+    assert_eq!(db.salsa_family_churn("method_body_events_query").unwrap().0, 0);
+    assert_eq!(db.salsa_family_churn("module_level_cfg_query").unwrap().0, 0);
+    assert_eq!(db.salsa_family_churn("module_code_body_events_query").unwrap().0, 0);
+
+    let mut cancellation_checks = 0;
+    let mut allow = |work: usize| {
+        if work >= 128 {
+            cancellation_checks += 1;
+        }
+        true
+    };
+    assert!(method_flow.cfg_with_work(&db, &mut allow).is_some());
+    assert!(method_flow.events_with_work(&db, &mut allow).is_some());
+    assert!(module_flow.cfg_with_work(&db, &mut allow).is_some());
+    assert!(module_flow.events_with_work(&db, &mut allow).is_some());
+    assert_eq!(cancellation_checks, 4, "large cold builds reach their cancellation check");
+}
+
+#[test]
+fn effective_owner_inference_reuses_tracked_effective_returns() {
+    let temp = tempfile::tempdir().unwrap();
+    let main_root = temp.path().join("src/cf");
+    let ext_root = temp.path().join("src/cfe/X");
+    std::fs::create_dir_all(&main_root).unwrap();
+    std::fs::create_dir_all(&ext_root).unwrap();
+
+    let mut db = RootDatabaseImpl::new_with_salsa_events();
+    db.set_all_config_paths(
+        vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
+    let base_file = FileId(0);
+    let ext_file = FileId(1);
+    let mut files = FileSet::new();
+    files.insert(
+        base_file,
+        VfsPath::new(main_root.join("CommonModules/М/Ext/Module.bsl").to_string_lossy().as_ref()),
+    );
+    files.insert(
+        ext_file,
+        VfsPath::new(ext_root.join("CommonModules/М/Ext/Module.bsl").to_string_lossy().as_ref()),
+    );
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(files));
+    db.set_file_source_root(base_file, SourceRootId(0));
+    db.set_file_source_root(ext_file, SourceRootId(0));
+    db.set_file_text(base_file, "Функция Цель() Экспорт\nВозврат 0;\nКонецФункции\n");
+    db.set_file_text(
+        ext_file,
+        "&ИзменениеИКонтроль(\"Цель\")\nФункция Расш_Цель()\n#Вставка\nВозврат 1;\n#КонецВставки\nКонецФункции\n",
+    );
+
+    let eid = hir::EffectiveModuleId::new(&db, base_file, ext_file);
+    let target = db
+        .symbol_tree(ModuleId::new(base_file))
+        .find_method(&hir::Name::new("Цель"))
+        .expect("base target")
+        .id;
+    let body = hir::module_bodies_effective(&db, eid)
+        .body(target.local_id)
+        .expect("effective target body")
+        .clone();
+    assert!(db.salsa_events_reset());
+    for _ in 0..2 {
+        hir::infer_effective_owner(&db, eid, hir::DefWithBodyId::Method(target.local_id), &body);
+    }
+    assert_eq!(
+        db.salsa_family_churn("effective_method_returns").unwrap().0,
+        1,
+        "the first owner inference computes the tracked return query; the second reads its memo",
+    );
+}
+
+/// A budget stop says what one reader could afford, not what the body is: a later
+/// reader with room solves the same flow, and a warmed flow answers without
+/// charging its reader at all.
+#[test]
+fn executable_reaching_defs_budget_stop_is_not_cached() {
+    let mut db = RootDatabaseImpl::new();
+    let file_id = FileId(0);
+    let mut file_set = FileSet::new();
+    file_set.insert(file_id, VfsPath::new("/Module.bsl"));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    db.set_file_source_root(file_id, SourceRootId(0));
+    db.set_file_text(
+        file_id,
+        "Процедура Т(Знач Флаг)\n\tЕсли Флаг Тогда\n\t\tА = 1;\n\tКонецЕсли;\n\tБ = А;\nКонецПроцедуры\n",
+    );
+    let module_id = ModuleId::new(file_id);
+    let method_id = db.symbol_tree(module_id).find_method(&hir::Name::new("Т")).expect("method").id;
+    let input = hir::MethodIdInput::new(&db, method_id);
+    let flow = hir::BodyFlow::for_method(&db, input, db.method_body_ref(input));
+
+    let mut spent = 0usize;
+    let stopped = flow.executable_reaching_defs_with_work(&db, &mut |work| {
+        if spent + work > 1 {
+            return false;
+        }
+        spent += work;
+        true
+    });
+    assert!(stopped.is_none(), "the first reader's budget stops the solve");
+
+    let solved = flow
+        .executable_reaching_defs_with_work(&db, &mut |_| true)
+        .expect("a later reader with room solves the same flow");
+
+    let mut cache_work = 0usize;
+    let cached = flow.executable_reaching_defs_with_work(&db, &mut |work| {
+        cache_work += work;
+        true
+    });
+    assert!(Arc::ptr_eq(&cached.expect("the warmed flow answers"), &solved));
+    assert_eq!(cache_work, 0, "a warmed flow must not charge its reader");
+}
+
 /// The `&ИзменениеИКонтроль` splice of a method has ids of its own, so its
 /// inference judges it over its own flow, never over the memo of the base
 /// method it replaces.
@@ -9574,4 +10113,113 @@ fn effective_body_has_its_own_flow() {
     let changed = effective.body(target.local_id).expect("effective body").stmt_count();
     let base_target = hir::MethodIdInput::new(&db, target);
     assert_ne!(changed, db.method_body_events(base_target).stmts().len());
+}
+
+/// The effective and weaving notification projections must resolve a receiver through
+/// the base module the same way their inference does: a call to a base sibling returns
+/// concrete data there, so the projection can prove the callback foreign, while the
+/// standalone extension query cannot and keeps it conservatively local.
+#[test]
+fn effective_and_weaving_notify_projections_resolve_base_siblings_for_receivers() {
+    use base_db::FileIdInput;
+    use hir::{
+        semantic_notify_candidates_effective_query, semantic_notify_candidates_query,
+        semantic_notify_candidates_weaving_query, NotifyCandidateReceiver,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let main_root = temp.path().join("src/cf");
+    let ext_root = temp.path().join("src/cfe/X");
+    for root in [&main_root, &ext_root] {
+        std::fs::create_dir_all(root.join("CommonModules/М/Ext")).unwrap();
+        std::fs::create_dir_all(root.join("CommonModules/В/Ext")).unwrap();
+    }
+
+    let mut db = RootDatabaseImpl::new();
+    db.set_all_config_paths(
+        vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
+
+    const BASE: &str =
+        "Функция ПолучитьМассив() Экспорт\n    Возврат Новый Массив;\nКонецФункции\n\n\
+                        Процедура Цель() Экспорт\nКонецПроцедуры\n";
+    const CAV_EXT: &str = "&ИзменениеИКонтроль(\"Цель\")\nПроцедура Расш_Цель()\n#Вставка\n    \
+                           О = Новый ОписаниеОповещения(\"Обработчик\", ПолучитьМассив());\n\
+                           #КонецВставки\nКонецПроцедуры\n";
+    const WEAVING_EXT: &str = "&Вместо(\"Цель\")\nПроцедура Расш_Цель()\n    \
+                               О = Новый ОписаниеОповещения(\"Обработчик\", ПолучитьМассив());\n\
+                               КонецПроцедуры\n";
+
+    let base_cav = FileId(0);
+    let cav_ext = FileId(1);
+    let base_weaving = FileId(2);
+    let weaving_ext = FileId(3);
+    let mut file_set = FileSet::new();
+    for (id, root, module, text) in [
+        (base_cav, &main_root, "М", BASE),
+        (cav_ext, &ext_root, "М", CAV_EXT),
+        (base_weaving, &main_root, "В", BASE),
+        (weaving_ext, &ext_root, "В", WEAVING_EXT),
+    ] {
+        let path = root.join(format!("CommonModules/{module}/Ext/Module.bsl"));
+        file_set.insert(id, VfsPath::new(path.to_string_lossy().into_owned()));
+        db.set_file_text(id, text);
+    }
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    for id in [base_cav, cav_ext, base_weaving, weaving_ext] {
+        db.set_file_source_root(id, SourceRootId(0));
+    }
+
+    fn callback(candidates: &[hir::NotifyCandidate]) -> &hir::NotifyCandidate {
+        candidates
+            .iter()
+            .find(|candidate| candidate.callback_name.as_str() == "Обработчик")
+            .unwrap_or_else(|| panic!("the registration must be projected: {candidates:#?}"))
+    }
+
+    // A standalone extension has no projection for its `#Вставка` text at all: the
+    // registration exists only in the effective module.
+    let cav_raw = semantic_notify_candidates_query(&db, FileIdInput::new(&db, cav_ext));
+    assert!(
+        cav_raw.iter().all(|candidate| candidate.callback_name.as_str() != "Обработчик"),
+        "the extension-only projection must not invent the insertion: {cav_raw:#?}"
+    );
+
+    let eid = hir::EffectiveModuleId::new(&db, base_cav, cav_ext);
+    let effective_facts = hir::semantic_notify_facts_effective_query(&db, eid);
+    assert!(
+        !effective_facts.summary.notify_projection_incomplete,
+        "the effective projection reports its own completeness"
+    );
+    let cav_effective = semantic_notify_candidates_effective_query(&db, eid);
+    let effective_candidate = callback(&cav_effective);
+    assert_eq!(
+        effective_candidate.receiver,
+        NotifyCandidateReceiver::Unknown,
+        "the base sibling returns concrete data in the effective module: {effective_candidate:#?}"
+    );
+    assert!(!effective_candidate.protects_local_method);
+    let registration = effective_candidate.registration.as_ref().expect("registration");
+    assert!(
+        !registration.range.is_empty(),
+        "the effective projection keeps the constructor's source range"
+    );
+
+    let weaving_raw = semantic_notify_candidates_query(&db, FileIdInput::new(&db, weaving_ext));
+    assert_eq!(callback(&weaving_raw).receiver, NotifyCandidateReceiver::LocalBinding);
+
+    let wid = hir::WeavingModuleId::new(&db, weaving_ext, base_weaving);
+    let weaving = semantic_notify_candidates_weaving_query(&db, wid);
+    let weaving_candidate = callback(&weaving);
+    assert_eq!(
+        weaving_candidate.receiver,
+        NotifyCandidateReceiver::Unknown,
+        "the base sibling resolves under weaving: {weaving_candidate:#?}"
+    );
+    assert!(!weaving_candidate.protects_local_method);
+    assert!(
+        !weaving_candidate.registration.as_ref().expect("registration").range.is_empty(),
+        "the weaving projection keeps the constructor's source range"
+    );
 }
