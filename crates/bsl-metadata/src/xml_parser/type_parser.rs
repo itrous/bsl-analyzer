@@ -208,10 +208,7 @@ fn parse_type_set(type_set: &str) -> Option<AttributeType> {
     }
 
     if let Some(name) = type_set.strip_prefix("cfg:Characteristic.") {
-        return Some(AttributeType::Ref {
-            mdo_type: MdoType::ChartOfCharacteristicTypes,
-            name: name.to_string(),
-        });
+        return Some(AttributeType::CharacteristicValue { name: name.to_string() });
     }
 
     if let Some((_, mdo_type)) = TYPE_SET_MAP.iter().find(|(k, _)| *k == type_set) {
@@ -548,6 +545,28 @@ mod tests {
                     AttributeType::UnknownNamed("cfg:AnotherFutureTypeSet".to_string()),
                 ],
             }
+        );
+    }
+
+    #[test]
+    fn characteristic_value_is_not_a_chart_reference() {
+        let value =
+            roxmltree::Document::parse("<Type><TypeSet>cfg:Characteristic.Виды</TypeSet></Type>")
+                .unwrap();
+        let reference = roxmltree::Document::parse(
+            "<Type><Type>cfg:ChartOfCharacteristicTypesRef.Виды</Type></Type>",
+        )
+        .unwrap();
+        assert_eq!(
+            parse_type_xml(value.root_element()).unwrap(),
+            AttributeType::CharacteristicValue { name: "Виды".to_string() },
+        );
+        assert_eq!(
+            parse_type_xml(reference.root_element()).unwrap(),
+            AttributeType::Ref {
+                mdo_type: MdoType::ChartOfCharacteristicTypes,
+                name: "Виды".to_string(),
+            },
         );
     }
 }

@@ -34,12 +34,10 @@ pub fn lower_form_attribute_to_typeid(
             FormDataFacet::Structure
         };
 
-        if let AttributeType::Ref { mdo_type, name: mdo_name } = &attr.attr_type {
-            if MetadataKind::object_kind_for(*mdo_type).is_some() {
-                return db.mk_form_data(
-                    kind,
-                    Some(MdoRefFacet::new(*mdo_type, mdo_name.as_str().to_string())),
-                );
+        if let Some((mdo_type, mdo_name)) = attr.attr_type.as_reference_target() {
+            if MetadataKind::object_kind_for(mdo_type).is_some() {
+                return db
+                    .mk_form_data(kind, Some(MdoRefFacet::new(mdo_type, mdo_name.to_string())));
             }
         }
         if matches!(&attr.attr_type, AttributeType::AnyObjectRef { .. }) {
@@ -85,11 +83,14 @@ pub(crate) fn form_attribute_value_typeid(
     resolver: &dyn MetadataResolver,
 ) -> Option<TypeId> {
     match &attr.attr_type {
-        AttributeType::Ref { mdo_type, name }
-            if attr.is_main || MetadataKind::ref_kind_for(*mdo_type).is_none() =>
+        attr_type
+            if attr_type.as_reference_target().is_some_and(|(mdo_type, _)| {
+                attr.is_main || MetadataKind::ref_kind_for(mdo_type).is_none()
+            }) =>
         {
-            let kind = MetadataKind::object_kind_for(*mdo_type)?;
-            Some(db.metadata_ref(kind, name.clone(), &RootConfigCtx))
+            let (mdo_type, name) = attr_type.as_reference_target()?;
+            let kind = MetadataKind::object_kind_for(mdo_type)?;
+            Some(db.metadata_ref(kind, name.to_string(), &RootConfigCtx))
         }
         AttributeType::Platform(
             bsl_metadata::PlatformValueType::ValueTable
@@ -174,10 +175,7 @@ pub(crate) fn lookup_form_additional_column(
     let column = form
         .attributes()
         .iter()
-        .filter(|attr| {
-            matches!(&attr.attr_type, AttributeType::Ref { mdo_type, name }
-                if *mdo_type == parent && stdx::case::eq_ignore_case(name, owner))
-        })
+        .filter(|attr| attribute_owns_tables_of(&attr.attr_type, parent, owner))
         .flat_map(|attr| {
             attr.additional_columns.iter().filter(|group| {
                 group.table.split_once('.').is_some_and(|(head, tail)| {
@@ -197,6 +195,14 @@ pub(crate) fn lookup_form_additional_column(
         value_ty: None,
         is_readonly: false,
         origin: FieldOrigin::FormAttribute,
+    })
+}
+
+/// Whether an attribute of this type is the owner object (`owner` of kind `parent`) whose
+/// tabular sections a form's additional columns attach to.
+fn attribute_owns_tables_of(attr_type: &AttributeType, parent: MdoType, owner: &str) -> bool {
+    attr_type.as_reference_target().is_some_and(|(mdo_type, name)| {
+        mdo_type == parent && stdx::case::eq_ignore_case(name, owner)
     })
 }
 
@@ -702,5 +708,81 @@ mod tests {
             let attr = main_attr("Объект", attr_type.clone());
             assert_eq!(value_of(&db, &attr), None, "{attr_type:?}");
         }
+    }
+
+    /// The attribute types that name the same chart: a genuine chart reference and a
+    /// characteristic value drawn from it.
+    fn chart_spellings(name: &str) -> [AttributeType; 2] {
+        [
+            AttributeType::Ref {
+                mdo_type: MdoType::ChartOfCharacteristicTypes,
+                name: name.to_string(),
+            },
+            AttributeType::CharacteristicValue { name: name.to_string() },
+        ]
+    }
+
+    #[test]
+    fn main_attribute_characteristic_value_projects_like_a_chart_reference() {
+        let db = InMemoryDb::new();
+        let [reference, value] = chart_spellings("Виды");
+        let lower = |attr_type| {
+            let attr = main_attr("Объект", attr_type);
+            lower_form_attribute_to_typeid(&db, &attr, &ConfigsObjectResolver(&[]))
+        };
+        let expected = Some((MdoType::ChartOfCharacteristicTypes, "Виды"));
+        assert_form_data(&db, lower(reference), FormDataFacet::Structure, expected);
+        assert_form_data(&db, lower(value), FormDataFacet::Structure, expected);
+    }
+
+    #[test]
+    fn main_attribute_characteristic_value_with_columns_keeps_the_collection_like_a_chart_reference(
+    ) {
+        let db = InMemoryDb::new();
+        let [reference, value] = chart_spellings("Виды");
+        let lower = |attr_type| {
+            let mut attr = main_attr("Объект", attr_type);
+            attr.columns = vec![FormAttributeColumn {
+                name: "Товары".to_string(),
+                attr_type: AttributeType::Unknown,
+            }];
+            lower_form_attribute_to_typeid(&db, &attr, &ConfigsObjectResolver(&[]))
+        };
+        let expected = Some((MdoType::ChartOfCharacteristicTypes, "Виды"));
+        assert_form_data(&db, lower(reference), FormDataFacet::StructureWithCollection, expected);
+        assert_form_data(&db, lower(value), FormDataFacet::StructureWithCollection, expected);
+    }
+
+    #[test]
+    fn main_attribute_characteristic_value_converts_to_the_chart_object_like_a_chart_reference() {
+        let db = InMemoryDb::new();
+        let [reference, value] = chart_spellings("Виды");
+        let by_reference = value_of(&db, &main_attr("Объект", reference)).expect("chart object");
+        let by_value = value_of(&db, &main_attr("Объект", value)).expect("chart object");
+        assert_eq!(by_value, by_reference);
+        assert_metadata_ref(&db, by_value, MetadataKind::ChartOfCharacteristicTypesObject, "Виды");
+    }
+
+    #[test]
+    fn plain_characteristic_value_stays_unconverted_like_a_chart_reference() {
+        let db = InMemoryDb::new();
+        let [reference, value] = chart_spellings("Виды");
+        assert_eq!(value_of(&db, &plain("Вид", reference)), None);
+        assert_eq!(value_of(&db, &plain("Вид", value)), None);
+    }
+
+    #[test]
+    fn characteristic_value_owns_additional_column_tables_like_a_chart_reference() {
+        let chart = MdoType::ChartOfCharacteristicTypes;
+        for attr_type in chart_spellings("Виды") {
+            assert!(attribute_owns_tables_of(&attr_type, chart, "виды"), "{attr_type:?}");
+            // The control: a different owner name or kind is still no owner.
+            assert!(!attribute_owns_tables_of(&attr_type, chart, "Другие"), "{attr_type:?}");
+            assert!(
+                !attribute_owns_tables_of(&attr_type, MdoType::Catalog, "Виды"),
+                "{attr_type:?}"
+            );
+        }
+        assert!(!attribute_owns_tables_of(&AttributeType::Boolean, chart, "Виды"));
     }
 }

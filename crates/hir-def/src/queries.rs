@@ -1023,16 +1023,26 @@ fn resolve_dereference_chains(
                 ),
                 other => Some(other.clone()),
             };
-            match next {
-                Some(AttributeType::Ref { mdo_type: next_type, name: next_name }) => {
+            match next.and_then(next_reference_hop) {
+                Some((next_type, next_name)) => {
                     mdo_type = next_type;
                     name = next_name;
                 }
-                _ => break,
+                None => break,
             }
         }
     }
     tables
+}
+
+/// The object a dereference chain continues into, when the attribute's type names it.
+/// A characteristic value does not: its type is decided by the data through the chart's
+/// `ТипЗначения`, so the attributes the next name could belong to are unknown.
+fn next_reference_hop(attribute_type: bsl_metadata::AttributeType) -> Option<(MdoType, String)> {
+    match attribute_type {
+        bsl_metadata::AttributeType::Ref { mdo_type, name } => Some((mdo_type, name)),
+        _ => None,
+    }
 }
 
 /// Project collected query reads ([`collect_module_query_refs`]) into `query_ref`
@@ -1423,7 +1433,29 @@ mod tests {
     use super::{unique_global_handler, QualifiedLookup};
     use crate::name::Name;
     use crate::{MethodId, ModuleId};
+    use bsl_metadata::MdoType;
     use vfs::FileId;
+
+    /// A dereference chain continues only into an object the attribute type names: a
+    /// characteristic value is constrained by a chart but is not that chart's reference,
+    /// so the attributes the next name could belong to are unknown.
+    #[test]
+    fn dereference_chain_continues_through_a_reference_and_not_a_characteristic_value() {
+        use super::next_reference_hop;
+        use bsl_metadata::AttributeType;
+
+        let chart = MdoType::ChartOfCharacteristicTypes;
+        assert_eq!(
+            next_reference_hop(AttributeType::Ref {
+                mdo_type: chart, name: "Виды".to_string()
+            }),
+            Some((chart, "Виды".to_string())),
+        );
+        assert_eq!(
+            next_reference_hop(AttributeType::CharacteristicValue { name: "Виды".to_string() }),
+            None,
+        );
+    }
 
     /// The unqualified idle-handler name has no module, so a name exported by two distinct
     /// global common modules is ambiguous and must NOT be guessed; a single exporter resolves.

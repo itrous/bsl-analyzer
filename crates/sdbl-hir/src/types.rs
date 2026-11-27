@@ -93,6 +93,12 @@ impl SdblType {
             AttributeType::Ref { mdo_type, name } => {
                 Self::Ref(MdoRef { mdo_type: *mdo_type, name: name.clone() })
             }
+            // Still modelled as the chart reference it used to be: the query-field verdicts
+            // must not move until a rule decides to treat the value's composition as unknown.
+            AttributeType::CharacteristicValue { name } => Self::Ref(MdoRef {
+                mdo_type: MdoType::ChartOfCharacteristicTypes,
+                name: name.clone(),
+            }),
             AttributeType::AnyRef => Self::AnyRef,
             AttributeType::AnyObjectRef { mdo_type } => Self::AnyObjectRef { mdo_type: *mdo_type },
             AttributeType::Uuid => Self::Uuid,

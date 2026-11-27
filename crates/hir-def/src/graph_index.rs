@@ -1417,31 +1417,8 @@ pub fn project_batch_form_edges<DB: ConfigsDatabase + Clone + Send>(
                     parent_id: element.parent_id,
                 })
                 .collect();
-            let mut attributes = Vec::new();
-            let mut seen_attr = FxHashSet::default();
-            let mut bindings = Vec::new();
-            // `Ref`-typed form attributes back an object; index the survivor of each
-            // name so a data path's first segment can resolve to its object, and emit
-            // an object-level binding for it.
-            let mut attr_backing: FxHashMap<String, (MdoType, String)> = FxHashMap::default();
-            for attr in &form.attributes {
-                let name = crate::name::Name::new(&attr.name);
-                let lower = name.as_str().fold_lower();
-                if seen_attr.insert(lower.clone()) {
-                    attributes.push(name.clone());
-                    if let bsl_metadata::AttributeType::Ref { mdo_type, name: obj } =
-                        &attr.attr_type
-                    {
-                        attr_backing.insert(lower, (*mdo_type, obj.clone()));
-                        bindings.push(CollectedBinding {
-                            from: BindingFrom::Attr(name),
-                            mdo: *mdo_type,
-                            obj: obj.clone(),
-                            field_path: Vec::new(),
-                        });
-                    }
-                }
-            }
+            let CollectedAttributes { names: attributes, backing: attr_backing, mut bindings } =
+                collect_form_attributes(&form.attributes);
             // A UI element whose data path is `<реквизит>.<поле>[.<колонка>]` binds to
             // that field of the form attribute's backing object. A leading `~` marks a
             // broken path; bare `<реквизит>` has no field.
@@ -2892,6 +2869,41 @@ mod role_rls_tests {
     }
 }
 
+/// What the attributes of one form contribute to the graph.
+struct CollectedAttributes {
+    /// Attribute names, the first spelling of each winning.
+    names: Vec<crate::name::Name>,
+    /// For the attributes that back an object, the survivor of each name, so a data
+    /// path's first segment can resolve to its object.
+    backing: FxHashMap<String, (MdoType, String)>,
+    /// An object-level binding for each backing attribute.
+    bindings: Vec<CollectedBinding>,
+}
+
+fn collect_form_attributes(form_attributes: &[bsl_metadata::FormAttribute]) -> CollectedAttributes {
+    let mut attributes = Vec::new();
+    let mut seen_attr = FxHashSet::default();
+    let mut bindings = Vec::new();
+    let mut attr_backing: FxHashMap<String, (MdoType, String)> = FxHashMap::default();
+    for attr in form_attributes {
+        let name = crate::name::Name::new(&attr.name);
+        let lower = name.as_str().fold_lower();
+        if seen_attr.insert(lower.clone()) {
+            attributes.push(name.clone());
+            if let Some((mdo_type, obj)) = attr.attr_type.as_reference_target() {
+                attr_backing.insert(lower, (mdo_type, obj.to_string()));
+                bindings.push(CollectedBinding {
+                    from: BindingFrom::Attr(name),
+                    mdo: mdo_type,
+                    obj: obj.to_string(),
+                    field_path: Vec::new(),
+                });
+            }
+        }
+    }
+    CollectedAttributes { names: attributes, backing: attr_backing, bindings }
+}
+
 #[cfg(test)]
 mod module_layout_hash_tests {
     use super::*;
@@ -3143,5 +3155,37 @@ mod module_layout_hash_tests {
         // Then: both declaration contracts change.
         assert_ne!(before.0, after.0);
         assert_ne!(before.1, after.1);
+    }
+}
+
+#[cfg(test)]
+mod form_attribute_backing_tests {
+    use super::*;
+    use bsl_metadata::{AttributeType, FormAttribute};
+
+    fn backing_of(attr_type: AttributeType) -> (usize, Vec<(MdoType, String)>) {
+        let attributes = [FormAttribute::new("Вид", attr_type)];
+        let collected = collect_form_attributes(&attributes);
+        assert_eq!(collected.names.len(), 1);
+        assert!(collected.bindings.iter().all(|binding| binding.field_path.is_empty()));
+        let bound =
+            collected.bindings.iter().map(|binding| (binding.mdo, binding.obj.clone())).collect();
+        (collected.backing.len(), bound)
+    }
+
+    #[test]
+    fn a_characteristic_value_attribute_backs_the_chart_like_a_chart_reference() {
+        let chart = MdoType::ChartOfCharacteristicTypes;
+        let as_reference =
+            backing_of(AttributeType::Ref { mdo_type: chart, name: "Виды".to_string() });
+        let as_value =
+            backing_of(AttributeType::CharacteristicValue { name: "Виды".to_string() });
+        assert_eq!(as_reference, (1, vec![(chart, "Виды".to_string())]));
+        assert_eq!(as_value, as_reference);
+    }
+
+    #[test]
+    fn a_scalar_attribute_backs_no_object() {
+        assert_eq!(backing_of(AttributeType::Boolean), (0, Vec::new()));
     }
 }
