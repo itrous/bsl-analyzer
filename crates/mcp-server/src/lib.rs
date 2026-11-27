@@ -248,7 +248,7 @@ pub use baseline::{
     resolve_project_baseline_diagnostics, BaselineConfigDiagnostics, BaselineResolutionSummary,
 };
 pub use cache::{
-    expected_scope_from_env, rotated_log_path, CacheOrigin, WorkspaceCacheLayout,
+    expected_scope_from_env, rotated_log_path, CacheOrigin, WorkspaceCacheLayout, LOG_ROTATE_BYTES,
     ROTATED_LOG_RETENTION, WORKSPACE_CACHE_BASE_ENV, WORKSPACE_CACHE_SCOPE_ENV,
 };
 pub use graph_db::{

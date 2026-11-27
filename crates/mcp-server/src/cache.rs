@@ -12,6 +12,9 @@ const DAEMON_LOG_FILE: &str = "bsl-analyzer-daemon.log";
 /// is what one reads to diagnose a crash that just happened, and may belong to a daemon that is
 /// still starting up; past this age no live run can still be reading the superseded copy.
 pub const ROTATED_LOG_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+/// Size above which a log is rotated to its `.prev` trail at startup. Shared by the daemon's cache log
+/// and an explicit `BSL_LOG_FILE`, so the two bounds cannot drift apart.
+pub const LOG_ROTATE_BYTES: u64 = 50 * 1024 * 1024;
 /// Bound on the work of one sweep: the family can hold thousands of directories.
 const SWEEP_ENTRY_LIMIT: usize = 10_000;
 /// Prefix of a family entry a sweep has claimed for removal. Cache directories are named by a
