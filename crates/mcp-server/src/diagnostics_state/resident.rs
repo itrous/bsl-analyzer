@@ -885,6 +885,7 @@ impl DiagnosticsResident {
                 files_total,
                 files_out_of_scope,
                 files_unread: self.holes.len(),
+                files_incomplete: 0,
                 findings_ignored_by_author: 0,
                 author_head: self.author_filter.as_ref().map(|filter| filter.short_identity()),
                 truncated,
@@ -898,8 +899,9 @@ impl DiagnosticsResident {
         // Compute the unfiltered candidates in parallel. Baseline classification happens
         // before severity/code/author shaping, so those presentation filters cannot hide
         // a new finding or manufacture a resolved entry.
-        // The last member is whether the deferred scope admits the finding. It travels with
-        // the candidate instead of filtering it: the classifier numbers the whole file.
+        // The last member is whether the analysis that produced the candidates ran to
+        // completion; a withheld file contributes none. It travels with the result
+        // instead of filtering it: the counters and the coverage set below read both.
         type Candidate =
             ide::diagnostics_baseline::BaselineDiagnosticCandidate<(FileId, ide::Diagnostic, bool)>;
         let late_scope = deferred_scope(config, &self.diagnostics_baseline);
@@ -921,7 +923,7 @@ impl DiagnosticsResident {
         // live at a time. Nothing to sweep makes no chunk and so raises no pool:
         // building one costs a thread per core, and a request that asked for no files
         // must not pay for it under the resident lock.
-        let mut prepared: Vec<Option<Vec<Candidate>>> = Vec::with_capacity(swept.len());
+        let mut prepared: Vec<Option<(Vec<Candidate>, bool)>> = Vec::with_capacity(swept.len());
         let chunks = stdx::batch::chunks_by_budget(
             swept,
             |file_id| {
@@ -989,7 +991,7 @@ impl DiagnosticsResident {
             cancel.register(salsa::Database::cancellation_token(seed.analysis.database()));
             seed.registered = true;
             seed.analysis.warm_configuration_inventory();
-            let chunk_results: Vec<Option<Vec<Candidate>>> =
+            let chunk_results: Vec<Option<(Vec<Candidate>, bool)>> =
                 self.sweep_pool.get_or_init(build_sweep_pool).install(move || {
                     chunk
                         .par_iter()
@@ -1010,8 +1012,18 @@ impl DiagnosticsResident {
                                 return None;
                             }
                             let caught = salsa::Cancelled::catch(AssertUnwindSafe(|| {
-                                let diagnostics =
-                                    worker.analysis.diagnostics(file_id, computation_config);
+                                let result =
+                                    worker.analysis.diagnostics_result(file_id, computation_config);
+                                // A file whose analysis did not finish (a rule's bounded
+                                // projection hit its work limit) yields a SUBSET of its
+                                // findings: classifying that subset would renumber the
+                                // file's findings and resolve its baseline entries on the
+                                // strength of the very findings the file never produced.
+                                // The file is withheld from the sweep and counted in
+                                // `files_incomplete` instead.
+                                let withheld =
+                                    result.completeness.incomplete_reason().is_some();
+                                let diagnostics = result.diagnostics;
                                 let text = worker.analysis.file_text(file_id);
                                 let path =
                                     path_of.get(&file_id).expect("swept file has a resident path");
@@ -1022,44 +1034,49 @@ impl DiagnosticsResident {
                                     .replace(std::path::MAIN_SEPARATOR, "/");
                                 let source_lines: Vec<_> = text.lines().collect();
                                 let line_index = line_index::LineIndex::new(&text);
-                                diagnostics
-                                    .into_iter()
-                                    .map(|d| {
-                                        let output = d.to_output_with_index(&text, &line_index);
-                                        let visible = late_scope.is_none_or(|scope| {
-                                            ide::diagnostic_in_scope(
-                                                Some(scope),
-                                                Some(Path::new(path)),
-                                                &line_index,
-                                                &d,
-                                            )
-                                        });
-                                        ide::diagnostics_baseline::BaselineDiagnosticCandidate {
-                                        diagnostic: (file_id, d, visible),
-                                        path: relative.clone(),
-                                        code: output.code,
-                                        snippet: Some(
-                                            ide::diagnostics_baseline::diagnostic_line_snippet(
-                                                &source_lines,
-                                                &line_index,
-                                                output.start_line,
-                                            ),
-                                        ),
-                                        message: output.message,
-                                        severity: output.severity,
-                                        range:
-                                            ide::diagnostics_baseline::DiagnosticsBaselineRange {
-                                                start_line: output.start_line as u32,
-                                                start_column: output.start_column as u32,
-                                                end_line: output.end_line as u32,
-                                                end_column: output.end_column as u32,
-                                            },
-                                    }
-                                    })
-                                    .collect()
+                                let candidates = if withheld {
+                                    Vec::new()
+                                } else {
+                                    diagnostics
+                                        .into_iter()
+                                        .map(|d| {
+                                            let output = d.to_output_with_index(&text, &line_index);
+                                            let visible = late_scope.is_none_or(|scope| {
+                                                ide::diagnostic_in_scope(
+                                                    Some(scope),
+                                                    Some(Path::new(path)),
+                                                    &line_index,
+                                                    &d,
+                                                )
+                                            });
+                                            ide::diagnostics_baseline::BaselineDiagnosticCandidate {
+                                                diagnostic: (file_id, d, visible),
+                                                path: relative.clone(),
+                                                code: output.code,
+                                                snippet: Some(
+                                                    ide::diagnostics_baseline::diagnostic_line_snippet(
+                                                        &source_lines,
+                                                        &line_index,
+                                                        output.start_line,
+                                                    ),
+                                                ),
+                                                message: output.message,
+                                                severity: output.severity,
+                                                range:
+                                                    ide::diagnostics_baseline::DiagnosticsBaselineRange {
+                                                        start_line: output.start_line as u32,
+                                                        start_column: output.start_column as u32,
+                                                        end_line: output.end_line as u32,
+                                                        end_column: output.end_column as u32,
+                                                    },
+                                            }
+                                            })
+                                            .collect()
+                                };
+                                (candidates, withheld)
                             }));
                             match caught {
-                                Ok(diags) => Some(diags),
+                                Ok((diags, withheld)) => Some((diags, withheld)),
                                 // Only the request's own cancellation may degrade to a skipped
                                 // file. A pending write means a file changed on disk after its
                                 // revision was recorded — the whole read is owed a retry — and a
@@ -1076,14 +1093,19 @@ impl DiagnosticsResident {
         }
 
         let cancelled = cancel.is_cancelled();
-        let files_swept = prepared.iter().filter(|result| result.is_some()).count();
+        let files_swept =
+            prepared.iter().filter(|result| matches!(result, Some((_, false)))).count();
+        let files_incomplete =
+            prepared.iter().filter(|result| matches!(result, Some((_, true)))).count();
         let completed_files: std::collections::BTreeSet<String> = if config.scope.is_some() {
             std::collections::BTreeSet::new()
         } else {
             swept
                 .iter()
                 .zip(&prepared)
-                .filter(|(_, result)| result.is_some())
+                // Only a file whose analysis ran to completion proves its baseline
+                // entries covered: an incomplete one never resolved anything.
+                .filter(|(_, result)| matches!(result, Some((_, false))))
                 .filter_map(|(file_id, _)| path_of.get(file_id))
                 .filter_map(|path| Path::new(path).strip_prefix(workspace_root).ok())
                 .map(|path| path.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"))
@@ -1110,13 +1132,15 @@ impl DiagnosticsResident {
             // and still yield only the diagnostics of its changed hunks. Calling that
             // full coverage would report every unmatched baseline entry as resolved.
             && config.scope.is_none()
+            && files_incomplete == 0
             && files_swept == files_total;
         let coverage = if complete {
             ide::diagnostics_baseline::DiagnosticsBaselineCoverage::Full
         } else {
             ide::diagnostics_baseline::DiagnosticsBaselineCoverage::Partial { completed_files }
         };
-        let candidates: Vec<_> = prepared.into_iter().flatten().flatten().collect();
+        let candidates: Vec<_> =
+            prepared.into_iter().flatten().flat_map(|(candidates, _)| candidates).collect();
         let snapshot = &self.diagnostics_baseline;
         let (active, baseline) = if let Some((set, plan, baseline_path)) = snapshot.ready_set() {
             let wrapped: Result<Vec<_>, _> = candidates
@@ -1318,6 +1342,7 @@ impl DiagnosticsResident {
             files_total,
             files_out_of_scope,
             files_unread: self.holes.len(),
+            files_incomplete,
             findings_ignored_by_author: author_ignored.load(std::sync::atomic::Ordering::Relaxed),
             author_head: author_filter.map(|f| f.short_identity()),
             truncated,

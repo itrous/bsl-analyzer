@@ -3,7 +3,9 @@
 //!
 //! The answer comes from the catalog's "available since" (`min_version`) strings.
 //! A member with no parseable version yields `None`, and the check says nothing
-//! about it: absence of data is never evidence that a member is new.
+//! about it: absence of data is never evidence that a member is new. Catalog dates
+//! contradicted by a running platform are corrected by the curated overlays of
+//! `bsl-platform`, so this module consumes already-corrected data.
 
 use bsl_platform::{PlatformDataInner, PlatformGlobalCatalog, PlatformVersion};
 
@@ -12,28 +14,6 @@ use bsl_platform::{PlatformDataInner, PlatformGlobalCatalog, PlatformVersion};
 /// оператор», 8.3.27.2214 compiles it in any 8.3.x compatibility mode.
 pub const ASYNC_INTRODUCED: PlatformVersion =
     PlatformVersion { major: 8, minor: 3, patch: 18, build: None };
-
-/// Catalog dates contradicted by running code, as (owner type in English, member in
-/// Russian): treated as undated, so the check stays silent on them. Only members
-/// proven live on the older platform belong here.
-/// - `ХешированиеДанных.ХешСумма` is dated 8.3.18 (the type 8.3.1). Probe
-///   07.10.2026: on 8.3.17.1549
-///   `Х = Новый ХешированиеДанных(ХешФункция.MD5); Х.Добавить("a"); Строка(Х.ХешСумма)`
-///   returns `0C C1 75 B9 … 26 61` (MD5 of "a"), as 8.3.27.2214 does. Four other
-///   members dated 8.3.18 on types of 8.0-8.3.1 fail on 8.3.17 in the same run with
-///   «Поле объекта не обнаружено» (`ХешФункция.SHA512`,
-///   `СписокПолнотекстовогоПоиска.ОграничиватьСтрокуПоиска`,
-///   `ТекстИнтернетПочтовогоСообщения.ПроизвольныйТипТекста`,
-///   `ТипТекстаПочтовогоСообщения.ПроизвольныйТекст`): the 8.3.18 dating holds in
-///   general and this property is the exception. The BSP (`ОбщегоНазначения`,
-///   `ПользователиСлужебный`) reads it on every 8.3.17 base.
-const MISDATED_MEMBERS: &[(&str, &str)] = &[("DataHashing", "ХешСумма")];
-
-fn is_misdated(owner_en: &str, member_ru: &str) -> bool {
-    MISDATED_MEMBERS.iter().any(|(owner, member)| {
-        owner.eq_ignore_ascii_case(owner_en) && member.to_lowercase() == member_ru.to_lowercase()
-    })
-}
 
 fn parse(value: Option<&str>) -> Option<PlatformVersion> {
     value.and_then(PlatformVersion::parse_catalog)
@@ -119,16 +99,11 @@ pub fn type_member(owner_type: &str, member: &str, is_property: bool) -> Option<
     if data.is_ambiguous_type_name(owner_type) {
         return None;
     }
-    let (type_en, name_ru, version) = if is_property {
-        let property = data.get_property(owner_type, member)?;
-        (&property.type_name, &property.name, property.min_version.as_deref())
+    let version = if is_property {
+        data.get_property(owner_type, member)?.min_version.as_deref()
     } else {
-        let method = data.get_method(owner_type, member)?;
-        (&method.type_name, &method.name, method.min_version.as_deref())
+        data.get_method(owner_type, member)?.min_version.as_deref()
     };
-    if is_misdated(type_en, name_ru) {
-        return None;
-    }
     let version = parse(version);
     with_owner(version, type_version(data, owner_type))
 }
@@ -172,10 +147,48 @@ mod tests {
 
     #[test]
     #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
-    fn a_misdated_member_reads_as_undated() {
-        assert_eq!(type_member("ХешированиеДанных", "ХешСумма", true), None);
-        assert_eq!(type_member("DataHashing", "HashSum", true), None);
+    fn a_misdated_member_reads_with_the_corrected_date() {
+        assert_eq!(type_member("ХешированиеДанных", "ХешСумма", true), Some(v("8.3.1")));
+        assert_eq!(type_member("DataHashing", "HashSum", true), Some(v("8.3.1")));
         assert_eq!(type_member("ХешированиеДанных", "Добавить", false), Some(v("8.3.1")));
+    }
+
+    #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
+    fn a_misdated_type_reads_with_the_corrected_date_in_both_languages() {
+        assert_eq!(platform_type("РежимРедактированияКолонки"), Some(v("8.0")));
+        assert_eq!(platform_type("ColumnEditMode"), Some(v("8.0")));
+    }
+
+    #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
+    fn a_value_of_a_misdated_type_keeps_its_own_date() {
+        assert_eq!(
+            type_member("РежимРедактированияКолонки", "Непосредственно", true),
+            Some(v("8.0"))
+        );
+        // The control: the value that really is new keeps its own date, so correcting
+        // the type does not swallow a genuine finding. A corpus older than 8.5.1 has no
+        // such value (the pinned contract corpus carries only the three 8.0 values), so
+        // this arm is skipped there rather than failing; a corpus that has it keeps its
+        // own date. The control that cannot pass vacuously is
+        // `a_type_version_correction_redates_the_type_and_only_the_type` in
+        // `crates/bsl-platform/src/overlays_tests.rs`: it runs the correction against a
+        // corpus that dates the type 8.5.1 and asserts a value dated 8.5.1 keeps its date.
+        if let Some(version) = type_member("РежимРедактированияКолонки", "Авто", true)
+        {
+            assert_eq!(version, v("8.5.1"));
+        }
+    }
+
+    #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
+    fn the_corrections_leave_neighbouring_entries_dated() {
+        assert_eq!(platform_type("ВидПоляФормы"), Some(v("8.2")));
+        assert_eq!(
+            type_member("ТаблицаФормы", "ПоведениеПриСжатииПоГоризонтали", true),
+            Some(v("8.3.12"))
+        );
     }
 
     #[test]

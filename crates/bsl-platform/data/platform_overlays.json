@@ -615,6 +615,23 @@
       "rationale": "With `ЗначениеXDTO` alone every object created by the factory is typed as a value, and a write to a property of the object that is spelled like a property of ЗначениеXDTO (`Объект.Значение = …`, `Объект.Value = …`) is reported as ReadOnlyPropertyAssignment although the platform accepts it. The call returns one of the two types depending on the kind of its `Тип` argument, so the result is their union; a write to `Значение` of a value that is known to be a ЗначениеXDTO (an element of `Список`, for instance) is still reported."
     }
   ],
+  "type_version_corrections": [
+    {
+      "type": "ColumnEditMode",
+      "min_version": "8.0",
+      "evidence_source": "Upstream issue #936. The platform help of 8.5.1.1343 dates the system enumeration РежимРедактированияКолонки 8.5.1, while the help of 8.3.17 states «Доступен, начиная с версии 8.0.» on shcntx_ru.hbk:objects/catalog2/catalog277/ColumnEditMode.html, and the pinned 8.3.27.2214 extract (data/platform_facts.json) dates the type 8.0. A runtime probe on 8.3.17.1549 (server context) prints `Непосредственно=Непосредственно; Вход=Вход; ВходПриВводе=Вход при вводе`, while `Авто` fails with «Поле объекта не обнаружено (Авто)».",
+      "rationale": "PlatformMemberNewerThanMinVersion raises a member to its owning type's date, so the 8.5.1 dating of the page makes every `РежимРедактированияКолонки.<old value>` a finding on a project whose minimum platform is 8.3.17. The likely cause of the re-dating is the new value `Авто`, which really is new in 8.5.1 and keeps its own 8.5.1 date, so it is still reported: one enumeration carries both halves of the control pair. The other three values keep 8.0 in the 8.5.1 help."
+    }
+  ],
+  "member_version_corrections": [
+    {
+      "type": "DataHashing",
+      "name": "ХешСумма",
+      "min_version": "8.3.1",
+      "evidence_source": "A runtime probe on 8.3.17.1549 (07.10.2026): `Х = Новый ХешированиеДанных(ХешФункция.MD5); Х.Добавить(\"a\"); Строка(Х.ХешСумма)` returns `0C C1 75 B9 … 26 61`, the MD5 of \"a\", as 8.3.27.2214 does. The 8.3.17 help carries the page shcntx_ru.hbk:objects/catalog63/DataHashing/properties/HashSum9443.html. In the extract the owning type ХешированиеДанных and its only other property ХешФункция are dated 8.3.1 while this property is dated 8.3.18.",
+      "rationale": "The BSP (`ОбщегоНазначения`, `ПользователиСлужебный`) reads the property on every 8.3.17 base, so the 8.3.18 dating is contradicted by running code. The property is dated with its owning type, which is the oldest date in evidence; the probe itself bounds it at no later than 8.3.17. The 8.3.18 dating holds in general and this property is the exception: four other members dated 8.3.18 on types of 8.0-8.3.1 DO fail on 8.3.17.1549 in the same run with «Поле объекта не обнаружено» (`ХешФункция.SHA512`, `СписокПолнотекстовогоПоиска.ОграничиватьСтрокуПоиска`, `ТекстИнтернетПочтовогоСообщения.ПроизвольныйТипТекста`, `ТипТекстаПочтовогоСообщения.ПроизвольныйТекст`), which is why the correction names one property instead of lifting the whole release."
+    }
+  ],
   "type_member_surface_attestations": [
     {
       "type": "SpreadsheetDocumentRange",

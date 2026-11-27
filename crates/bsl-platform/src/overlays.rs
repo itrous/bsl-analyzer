@@ -7,9 +7,10 @@ pub(crate) use overlay_schema::OverlayError;
 pub(crate) use overlay_schema::{call_value_effect_entries, require_only_fields, required_string};
 use overlay_schema::{
     parse_global_function_overrides, parse_member_surface_attestations,
-    parse_method_return_type_corrections, parse_overrides, parse_parameter_passing_attestations,
-    parse_property_additions, parse_property_corrections, validate_version_bounds,
-    AttestedMemberSet, MethodParameterOverride, TypeMemberSurfaceAttestation, TypePropertyAddition,
+    parse_member_version_corrections, parse_method_return_type_corrections, parse_overrides,
+    parse_parameter_passing_attestations, parse_property_additions, parse_property_corrections,
+    parse_type_version_corrections, validate_version_bounds, AttestedMemberSet,
+    MethodParameterOverride, TypeMemberSurfaceAttestation, TypePropertyAddition,
 };
 use serde_json::{Map, Value};
 use std::collections::HashSet;
@@ -351,6 +352,113 @@ pub(crate) fn apply_method_return_type_corrections(
             continue;
         };
         method.insert("return_type".to_owned(), Value::String(correction.return_types.join(", ")));
+    }
+
+    Ok(())
+}
+
+/// Corrects the `min_version` of platform types whose help page is dated later
+/// than the release that really introduced them, in place. Only the type record
+/// is written: the members of the type keep their own dates.
+///
+/// The overlay is applied to every corpus the analyzer loads, so a type the
+/// corpus does not have is not an error: the correction simply does not apply to
+/// it (an older corpus may lack the type altogether). The curated entries are
+/// guarded by `tests/bundled_facts.rs`, which fails if a target stops resolving
+/// in the built-in facts. Two entries resolving to one type record are refused.
+pub(crate) fn apply_type_version_corrections(
+    data: &mut Value,
+    overlay_source: &str,
+) -> Result<(), OverlayError> {
+    let corrections = parse_type_version_corrections(overlay_source)?;
+    if corrections.is_empty() {
+        return Ok(());
+    }
+
+    let type_keys = extracted_type_keys(data);
+    let mut corrected: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for correction in corrections {
+        let folded_type = correction.type_name.fold_lower();
+        let Some(canonical_type) = type_keys.get(folded_type.as_str()).cloned() else {
+            continue;
+        };
+        if let Some(previous) =
+            corrected.insert(canonical_type.fold_lower(), correction.type_name.clone())
+        {
+            return Err(OverlayError(format!(
+                "type version corrections {previous} and {} resolve to the same type {canonical_type}",
+                correction.type_name
+            )));
+        }
+        let Some(types) = data.get_mut("types").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let mut matching = types.iter_mut().filter_map(Value::as_object_mut).filter(|record| {
+            record
+                .get("english_name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| stdx::case::eq_ignore_case(name, &canonical_type))
+        });
+        let (Some(record), None) = (matching.next(), matching.next()) else {
+            continue;
+        };
+        record.insert("min_version".to_owned(), Value::String(correction.min_version));
+    }
+
+    Ok(())
+}
+
+/// Corrects the `min_version` of properties and methods whose help page is dated
+/// later than the release that really introduced them, in place. A name is
+/// looked up among the properties first and the methods second; a name that is
+/// both leaves the record uncorrected, because picking one would be an accident
+/// of order.
+///
+/// A type or member the corpus does not have is skipped rather than refused, for
+/// the reason given at [`apply_type_version_corrections`]; the curated entries are
+/// guarded by `tests/bundled_facts.rs`. Two entries resolving to one record are
+/// refused.
+pub(crate) fn apply_member_version_corrections(
+    data: &mut Value,
+    overlay_source: &str,
+) -> Result<(), OverlayError> {
+    let corrections = parse_member_version_corrections(overlay_source)?;
+    if corrections.is_empty() {
+        return Ok(());
+    }
+
+    let type_keys = extracted_type_keys(data);
+    let mut corrected: std::collections::HashMap<(&'static str, String, usize), String> =
+        std::collections::HashMap::new();
+    for correction in corrections {
+        let written = format!("{}.{}", correction.type_name, correction.member_name);
+        let folded_type = correction.type_name.fold_lower();
+        let Some(canonical_type) = type_keys.get(folded_type.as_str()).cloned() else {
+            continue;
+        };
+        let property = unique_property_index(data, &canonical_type, &correction.member_name);
+        let method = unique_method_index(data, &canonical_type, &correction.member_name);
+        let (section, index) = match (property, method) {
+            (Some(index), None) => ("properties", index),
+            (None, Some(index)) => ("methods", index),
+            _ => continue,
+        };
+        if let Some(previous) =
+            corrected.insert((section, canonical_type.clone(), index), written.clone())
+        {
+            return Err(OverlayError(format!(
+                "member version corrections {previous} and {written} resolve to the same member of {canonical_type}"
+            )));
+        }
+        let Some(record) = data
+            .get_mut(section)
+            .and_then(Value::as_array_mut)
+            .and_then(|records| records.get_mut(index))
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        record.insert("min_version".to_owned(), Value::String(correction.min_version));
     }
 
     Ok(())

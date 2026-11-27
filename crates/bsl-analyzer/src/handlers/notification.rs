@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Instant};
 
 use anyhow::Result;
 use base_db::FileIdInput;
-use ide::file_diagnostics_query;
+use ide::file_diagnostics_result_query;
 use line_index::LineIndex;
 use lsp_server::Notification;
 use lsp_types::{
@@ -156,24 +156,28 @@ pub fn schedule_diagnostics(state: &mut GlobalState, uri: &Url) {
         let result = salsa::Cancelled::catch(std::panic::AssertUnwindSafe(|| {
             let file_id_input = FileIdInput::new(&db, file_id);
             let config_id = base_db::DiagnosticsConfigId::new(&db, config);
-            let ide_diagnostics = file_diagnostics_query(&db, file_id_input, config_id);
-            let ide_diagnostics = crate::diagnostics_baseline::active_for_publication(
-                &diagnostics_baseline,
-                workspace_root.as_deref(),
-                path.as_deref(),
-                &text,
-                ide_diagnostics.iter().cloned().collect(),
-                late_scope.as_deref(),
-            );
-            let line_index = LineIndex::new(&text);
-            crate::lsp::diagnostics_with_encoding(
-                &line_index,
-                &text,
-                &ide_diagnostics,
-                position_encoding,
-                code_descriptions,
-                client_tags,
-            )
+            let result = file_diagnostics_result_query(&db, file_id_input, config_id);
+            if let Some(reason) = result.completeness.incomplete_reason() {
+                Err(reason)
+            } else {
+                let ide_diagnostics = crate::diagnostics_baseline::active_for_publication(
+                    &diagnostics_baseline,
+                    workspace_root.as_deref(),
+                    path.as_deref(),
+                    &text,
+                    result.diagnostics.to_vec(),
+                    late_scope.as_deref(),
+                );
+                let line_index = LineIndex::new(&text);
+                Ok(crate::lsp::diagnostics_with_encoding(
+                    &line_index,
+                    &text,
+                    &ide_diagnostics,
+                    position_encoding,
+                    code_descriptions,
+                    client_tags,
+                ))
+            }
         }));
         let compute_ms = started_at.elapsed().as_millis() as u64;
 
@@ -186,7 +190,7 @@ pub fn schedule_diagnostics(state: &mut GlobalState, uri: &Url) {
             completed_at: Instant::now(),
         };
         let task = match result {
-            Ok(diagnostics) => {
+            Ok(Ok(diagnostics)) => {
                 tracing::info!(
                     %uri,
                     queue_wait_ms,
@@ -202,6 +206,13 @@ pub fn schedule_diagnostics(state: &mut GlobalState, uri: &Url) {
                     completed_at: Instant::now(),
                 }
             }
+            Ok(Err(reason)) => Task::DiagnosticsIncomplete {
+                uri,
+                reason,
+                version,
+                generation,
+                completed_at: Instant::now(),
+            },
             Err(kind) => {
                 tracing::debug!(%uri, ?kind, queue_wait_ms, compute_ms, "diagnostics cancelled");
                 Task::DiagnosticsCancelled {

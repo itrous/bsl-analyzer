@@ -1,3 +1,4 @@
+use bsl_platform::{standard_attributes_for, MdoTemplateKind, ObjectView};
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -445,6 +446,26 @@ impl PredefinedItem {
     }
 }
 
+/// The standard-attribute template an object-family kind's own (object) surface is
+/// specified by, or `None` for kinds without such a surface (module kinds, constants,
+/// registers without an object, external roots). One mapping serves both parsing the
+/// attributes and judging which conditional names the kind declares at all, so the
+/// two cannot drift.
+pub(crate) fn object_standard_template(mdo_type: MdoType) -> Option<MdoTemplateKind> {
+    match mdo_type {
+        MdoType::Catalog => Some(MdoTemplateKind::Catalog),
+        MdoType::Document => Some(MdoTemplateKind::Document),
+        MdoType::BusinessProcess => Some(MdoTemplateKind::BusinessProcess),
+        MdoType::Task => Some(MdoTemplateKind::Task),
+        MdoType::ExchangePlan => Some(MdoTemplateKind::ExchangePlan),
+        MdoType::ChartOfCharacteristicTypes => Some(MdoTemplateKind::ChartOfCharacteristicTypes),
+        MdoType::ChartOfAccounts => Some(MdoTemplateKind::ChartOfAccounts),
+        MdoType::ChartOfCalculationTypes => Some(MdoTemplateKind::ChartOfCalculationTypes),
+        MdoType::InformationRegister => Some(MdoTemplateKind::InformationRegister),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataObject {
     pub mdo_type: MdoType,
@@ -499,6 +520,14 @@ pub struct MetadataObject {
     /// object's field set is then not known to be exhaustive.
     #[serde(default)]
     pub common_attributes_open: bool,
+    /// Conditional standard attributes whose absence is proven by an explicitly
+    /// readable object property. Old serialized metadata defaults to no such proof.
+    #[serde(default)]
+    pub known_absent_standard_attributes: Vec<String>,
+    /// Conditional standard attributes whose property was explicitly supplied but
+    /// could not be interpreted. This blocks inheriting an older absence proof.
+    #[serde(default)]
+    pub unknown_conditional_standard_attributes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -875,6 +904,8 @@ impl MetadataObject {
             extended_configuration_object: None,
             common_attributes: Vec::new(),
             common_attributes_open: false,
+            known_absent_standard_attributes: Vec::new(),
+            unknown_conditional_standard_attributes: Vec::new(),
         }
     }
 
@@ -906,6 +937,8 @@ impl MetadataObject {
             extended_configuration_object: None,
             common_attributes: Vec::new(),
             common_attributes_open: false,
+            known_absent_standard_attributes: Vec::new(),
+            unknown_conditional_standard_attributes: Vec::new(),
         }
     }
 
@@ -992,6 +1025,36 @@ impl MetadataObject {
         }
         if overlay.max_ext_dimension_count.is_some() {
             self.max_ext_dimension_count = overlay.max_ext_dimension_count;
+        }
+
+        for name in &overlay.unknown_conditional_standard_attributes {
+            self.known_absent_standard_attributes
+                .retain(|existing| !stdx::case::eq_ignore_case(existing, name));
+            if !self
+                .unknown_conditional_standard_attributes
+                .iter()
+                .any(|existing| stdx::case::eq_ignore_case(existing, name))
+            {
+                self.unknown_conditional_standard_attributes.push(name.clone());
+            }
+        }
+        for name in &overlay.known_absent_standard_attributes {
+            self.unknown_conditional_standard_attributes
+                .retain(|existing| !stdx::case::eq_ignore_case(existing, name));
+            self.attributes.retain(|attribute| !stdx::case::eq_ignore_case(&attribute.name, name));
+            if !self
+                .known_absent_standard_attributes
+                .iter()
+                .any(|existing| stdx::case::eq_ignore_case(existing, name))
+            {
+                self.known_absent_standard_attributes.push(name.clone());
+            }
+        }
+        for attribute in &overlay.attributes {
+            self.known_absent_standard_attributes
+                .retain(|name| !stdx::case::eq_ignore_case(name, &attribute.name));
+            self.unknown_conditional_standard_attributes
+                .retain(|name| !stdx::case::eq_ignore_case(name, &attribute.name));
         }
 
         crate::common_attribute::merge_common_attribute_fields(
@@ -1086,6 +1149,42 @@ impl MetadataObject {
         self.attributes.iter().find(|attr| stdx::case::eq_ignore_case(&attr.name, name))
     }
 
+    /// Whether this object's kind declares `name` as a conditional standard attribute
+    /// and this object's own properties refute its presence (a non-hierarchical
+    /// catalog's `ЭтоГруппа`, a zero-length code's `Код`). The object parse synthesizes
+    /// a conditional standard attribute exactly when the object's properties satisfy
+    /// its presence condition, so a conditionally declared standard name missing from
+    /// `attributes` is proven absent from the configuration's own metadata — no
+    /// platform member-surface attestation is involved. Names whose condition is
+    /// `Always` are not judged here: their absence from `attributes` is not evidence
+    /// (the kind may not carry them at all, or a layer's parse may be partial).
+    pub fn absent_conditional_standard_attribute(&self, name: &str) -> bool {
+        if self.attributes.iter().any(|attribute| {
+            stdx::case::eq_ignore_case(&attribute.name, name)
+                || attribute
+                    .name_en
+                    .as_deref()
+                    .is_some_and(|english| stdx::case::eq_ignore_case(english, name))
+        }) {
+            return false;
+        }
+        let Some(template) = object_standard_template(self.mdo_type) else { return false };
+        let specs = standard_attributes_for(template, ObjectView::Object);
+        !self.unknown_conditional_standard_attributes.iter().any(|unknown| {
+            stdx::case::eq_ignore_case(unknown, name)
+                || specs.iter().any(|spec| {
+                    stdx::case::eq_ignore_case(spec.kind.russian_name(), unknown)
+                        && stdx::case::eq_ignore_case(spec.kind.english_name(), name)
+                })
+        }) && self.known_absent_standard_attributes.iter().any(|known| {
+            stdx::case::eq_ignore_case(known, name)
+                || specs.iter().any(|spec| {
+                    stdx::case::eq_ignore_case(spec.kind.russian_name(), known)
+                        && stdx::case::eq_ignore_case(spec.kind.english_name(), name)
+                })
+        })
+    }
+
     pub fn find_tabular_section(
         &self,
         name: &str,
@@ -1154,6 +1253,15 @@ impl MetadataObject {
         bytes += self.constant_type.as_ref().map_or(0, AttributeType::estimated_heap_size);
         bytes += stdx::heap::vec_bytes::<(MdoType, Name)>(self.register_records.len())
             + self.register_records.iter().map(|(_, name)| name.capacity()).sum::<usize>();
+        bytes += stdx::heap::vec_bytes::<String>(self.known_absent_standard_attributes.len())
+            + self.known_absent_standard_attributes.iter().map(String::capacity).sum::<usize>();
+        bytes +=
+            stdx::heap::vec_bytes::<String>(self.unknown_conditional_standard_attributes.len())
+                + self
+                    .unknown_conditional_standard_attributes
+                    .iter()
+                    .map(String::capacity)
+                    .sum::<usize>();
         bytes += stdx::heap::vec_bytes::<crate::common_attribute::CommonAttributeField>(
             self.common_attributes.len(),
         ) + self
@@ -1216,6 +1324,146 @@ impl std::fmt::Display for AttributeType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absent_conditional_standard_attribute_requires_explicit_property_evidence() {
+        let synthetic = MetadataObject::new(MdoType::Catalog, "Synthetic");
+        assert!(!synthetic.absent_conditional_standard_attribute("ЭтоГруппа"));
+        assert!(!synthetic.absent_conditional_standard_attribute("Code"));
+
+        for properties in [
+            "<Name>Partial</Name>",
+            "<Name>Malformed</Name><Hierarchical>perhaps</Hierarchical><CodeLength>zero</CodeLength>",
+            "<Name>MalformedOwners</Name><Owners><Item/></Owners>",
+        ] {
+            let xml = format!(
+                r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20"><Catalog uuid="aaaaaaaa-0000-0000-0000-000000000001"><Properties>{properties}</Properties></Catalog></MetaDataObject>"#
+            );
+            let parsed = crate::xml_parser::parse_catalog_xml(&xml).unwrap();
+            for name in ["ЭтоГруппа", "Родитель", "Код", "Code", "Владелец"] {
+                assert!(
+                    !parsed.absent_conditional_standard_attribute(name),
+                    "{name} must remain unknown for {properties}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn absent_conditional_standard_attribute_reads_the_object_own_properties() {
+        let flat = crate::xml_parser::parse_catalog_xml(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <Catalog uuid="aaaaaaaa-0000-0000-0000-000000000001">
+        <Properties>
+            <Name>Плоский</Name>
+            <Hierarchical>false</Hierarchical>
+            <CodeLength>0</CodeLength>
+            <DescriptionLength>100</DescriptionLength>
+        </Properties>
+    </Catalog>
+</MetaDataObject>"#,
+        )
+        .unwrap();
+
+        // Refuted by this object's properties: hierarchy off, zero-length code.
+        assert!(flat.absent_conditional_standard_attribute("ЭтоГруппа"));
+        assert!(flat.absent_conditional_standard_attribute("Родитель"));
+        assert!(flat.absent_conditional_standard_attribute("Код"));
+        assert!(flat.absent_conditional_standard_attribute("код"));
+        // Present by the same properties — never judged absent.
+        assert!(!flat.absent_conditional_standard_attribute("Наименование"));
+        assert!(!flat.absent_conditional_standard_attribute("Ссылка"));
+        // Not a standard attribute of the kind at all — the miss stays a gap.
+        assert!(!flat.absent_conditional_standard_attribute("СовершеноНеизвестноеИмя"));
+
+        let hierarchical = crate::xml_parser::parse_catalog_xml(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <Catalog uuid="aaaaaaaa-0000-0000-0000-000000000002">
+        <Properties>
+            <Name>Иерархический</Name>
+            <Hierarchical>true</Hierarchical>
+            <CodeLength>9</CodeLength>
+            <DescriptionLength>25</DescriptionLength>
+        </Properties>
+    </Catalog>
+</MetaDataObject>"#,
+        )
+        .unwrap();
+
+        assert!(!hierarchical.absent_conditional_standard_attribute("ЭтоГруппа"));
+        assert!(!hierarchical.absent_conditional_standard_attribute("Код"));
+
+        // Serde data produced before explicit-absence evidence was introduced must
+        // deserialize with no proof rather than treating missing facts as false.
+        let mut old = serde_json::to_value(MetadataObject::new(MdoType::Catalog, "Old")).unwrap();
+        old.as_object_mut().unwrap().remove("known_absent_standard_attributes");
+        old.as_object_mut().unwrap().remove("unknown_conditional_standard_attributes");
+        let old: MetadataObject = serde_json::from_value(old).unwrap();
+        assert!(!old.absent_conditional_standard_attribute("ЭтоГруппа"));
+    }
+
+    #[test]
+    fn conditional_absence_evidence_merges_as_an_extension_overlay() {
+        let base = crate::xml_parser::parse_catalog_xml(
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20"><Catalog uuid="aaaaaaaa-0000-0000-0000-000000000001"><Properties><Name>Тест</Name><Hierarchical>true</Hierarchical><CodeLength>9</CodeLength></Properties></Catalog></MetaDataObject>"#,
+        ).unwrap();
+        let overlay = crate::xml_parser::parse_catalog_xml(
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20"><Catalog uuid="aaaaaaaa-0000-0000-0000-000000000002"><Properties><Name>Тест</Name><Hierarchical>false</Hierarchical><CodeLength>0</CodeLength></Properties></Catalog></MetaDataObject>"#,
+        ).unwrap();
+        let mut merged = base;
+        merged.apply_extension_overlay(&overlay);
+        for name in ["ЭтоГруппа", "Родитель", "Код", "Code"] {
+            assert!(merged.absent_conditional_standard_attribute(name), "{name}");
+        }
+
+        let partial = crate::xml_parser::parse_catalog_xml(
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20"><Catalog uuid="aaaaaaaa-0000-0000-0000-000000000003"><Properties><Name>Тест</Name></Properties></Catalog></MetaDataObject>"#,
+        ).unwrap();
+        merged.apply_extension_overlay(&partial);
+        assert!(merged.absent_conditional_standard_attribute("ЭтоГруппа"));
+        assert!(merged.absent_conditional_standard_attribute("Code"));
+    }
+
+    #[test]
+    fn malformed_extension_properties_clear_only_their_own_absence_proofs() {
+        let parse = |properties: &str| {
+            let xml = format!(
+                r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20"><Catalog uuid="aaaaaaaa-0000-0000-0000-000000000001"><Properties><Name>Тест</Name>{properties}</Properties></Catalog></MetaDataObject>"#
+            );
+            crate::xml_parser::parse_catalog_xml(&xml).unwrap()
+        };
+        let base = parse(
+            "<Hierarchical>false</Hierarchical><CodeLength>0</CodeLength><Owners/><DescriptionLength>0</DescriptionLength>",
+        );
+        assert!(base.absent_conditional_standard_attribute("ЭтоГруппа"));
+        assert!(base.absent_conditional_standard_attribute("Код"));
+        assert!(base.absent_conditional_standard_attribute("Владелец"));
+        assert!(base.absent_conditional_standard_attribute("Наименование"));
+
+        let malformed = parse(
+            "<Hierarchical>perhaps</Hierarchical><CodeLength>bad</CodeLength><Owners><Item/></Owners>",
+        );
+        let mut merged = base;
+        merged.apply_extension_overlay(&malformed);
+        for name in ["ЭтоГруппа", "Родитель", "Код", "Владелец"] {
+            assert!(
+                !merged.absent_conditional_standard_attribute(name),
+                "malformed explicit override must clear only its prior proof: {name}"
+            );
+        }
+        assert!(
+            merged.absent_conditional_standard_attribute("Наименование"),
+            "the unrelated omitted DescriptionLength inherits the base proof"
+        );
+
+        let malformed_owner_ref = parse("<Owners><Item>UnknownOwnerType.Owner</Item></Owners>");
+        let mut merged = parse("<Owners/>");
+        merged.apply_extension_overlay(&malformed_owner_ref);
+        assert!(!merged.absent_conditional_standard_attribute("Владелец"));
+        assert!(merged.find_attribute("Владелец").is_some());
+    }
 
     #[test]
     fn russian_plural_covers_exactly_the_manager_backed_kinds() {

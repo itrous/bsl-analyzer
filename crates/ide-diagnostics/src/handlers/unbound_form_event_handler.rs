@@ -8,6 +8,8 @@ use crate::define_metadata;
 use crate::metadata::*;
 use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
 use bsl_metadata::ModuleType;
+use intern::NormName;
+use rustc_hash::FxHashSet;
 use stdx::case::CaseExt;
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
@@ -72,11 +74,11 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
 
     let item_tree = ctx.item_tree();
 
-    let bound: Vec<String> = form
+    let bound: FxHashSet<NormName> = form
         .event_handlers()
         .iter()
-        .map(|h| h.handler_name.fold_lower())
-        .chain(form.command_handlers().iter().map(|h| h.fold_lower()))
+        .map(|h| NormName::intern(&h.handler_name))
+        .chain(form.command_handlers().iter().map(|h| NormName::intern(h)))
         .collect();
 
     // The form's own bindings settle most candidates; what follows walks the module and
@@ -92,8 +94,9 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
                 .map(|(_, f)| (f.name.as_str(), f.name_range)),
         )
         .map(|(name, range)| (name, name.fold_lower(), range))
-        .filter(|(_, lower, _)| {
-            FORM_EVENT_HANDLER_NAMES.contains(&lower.as_str()) && !bound.contains(lower)
+        .filter(|(name, lower, _)| {
+            FORM_EVENT_HANDLER_NAMES.contains(&lower.as_str())
+                && !bound.contains(&NormName::intern(name))
         })
         .collect();
 
@@ -107,8 +110,10 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         return Vec::new();
     };
 
-    let candidates: Vec<_> =
-        candidates.into_iter().filter(|(_, lower, _)| !called.contains(lower)).collect();
+    let candidates: Vec<_> = candidates
+        .into_iter()
+        .filter(|(name, _, _)| !called.contains(&NormName::intern(name)))
+        .collect();
 
     if candidates.is_empty() {
         return Vec::new();
@@ -119,9 +124,8 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
 
     let mut diagnostics = Vec::new();
 
-    for (name, lower, name_range) in candidates {
-        if literals.iter().any(|text| super::unused_local_method::mentions_identifier(text, &lower))
-        {
+    for (name, _lower, name_range) in candidates {
+        if literals.iter().any(|text| super::unused_local_method::mentions_identifier(text, name)) {
             continue;
         }
 

@@ -8,7 +8,7 @@ use syntax::{Parse, SyntaxNode, TextRange};
 use vfs::{FileId, VfsPath};
 
 use crate::input::{content_revision, FileIdInput, SourceRootInput};
-use crate::{ParseOutcome, ParseSnapshot, SourceDatabase};
+use crate::{FrozenFileContentSnapshot, ParseOutcome, ParseSnapshot, SourceDatabase};
 
 /// Read a file's text from disk verbatim — no BOM stripping, no normalization.
 ///
@@ -198,20 +198,38 @@ pub fn file_text_query<'db>(db: &'db dyn SourceDatabase, input: FileIdInput<'db>
 /// [`file_text_query`], each scanned text stays pinned until the next LRU trim, so
 /// the scan alone holds the whole root's source in memory.
 pub fn file_text_unmemoized(db: &dyn SourceDatabase, file_id: FileId) -> Cow<'_, str> {
-    let want = db.file_revision_input(file_id).revision(db);
+    let frozen = db.frozen_file_content_snapshot();
+    let want = db
+        .try_file_revision_input(file_id)
+        .map(|input| input.revision(db))
+        .or_else(|| frozen.and_then(|snapshot| snapshot.revision(file_id)))
+        .unwrap_or_else(|| db.file_revision_input(file_id).revision(db));
 
     if let Some(text_input) = db.try_file_text_input(file_id) {
         let text = text_input.text(db);
-        assert_revision(file_id, text, want);
+        assert_revision(file_id, text, want, frozen);
         return Cow::Borrowed(text.as_str());
     }
 
+    if let Some(text) = frozen.and_then(|snapshot| snapshot.open_text(file_id)) {
+        assert_revision(file_id, text, want, frozen);
+        return Cow::Borrowed(text);
+    }
+
     let path = disk_path(db, file_id);
-    let text = read_disk_text(&path).unwrap_or_else(|err| {
-        tracing::error!(?file_id, ?path, %err, "file_text: disk read failed");
-        panic!("file_text: cannot read {path:?} for {file_id:?}: {err}")
-    });
-    verify_disk_revision(db, file_id, &path, &text, want);
+    let text = match read_disk_text(&path) {
+        Ok(text) => text,
+        Err(err) => {
+            tracing::error!(?file_id, ?path, %err, "file_text: disk read failed");
+            if let Some(snapshot) = frozen.filter(|snapshot| snapshot.revision(file_id).is_some()) {
+                snapshot.note_drift();
+                db.note_disk_drift();
+                std::panic::resume_unwind(Box::new(salsa::Cancelled::PendingWrite));
+            }
+            panic!("file_text: cannot read {path:?} for {file_id:?}: {err}")
+        }
+    };
+    verify_disk_revision(db, file_id, &path, &text, want, frozen);
     Cow::Owned(text)
 }
 
@@ -225,9 +243,13 @@ fn verify_disk_revision(
     path: &Path,
     text: &str,
     want: u64,
+    frozen: Option<&FrozenFileContentSnapshot>,
 ) {
     let got = content_revision(text);
     if got != want {
+        if let Some(snapshot) = frozen {
+            snapshot.note_drift();
+        }
         // No panic message carries the values any more, and they are what tells an
         // empty read (a truncate-then-write caught halfway) from a real edit.
         tracing::warn!(
@@ -242,9 +264,17 @@ fn verify_disk_revision(
     }
 }
 
-fn assert_revision(file_id: FileId, text: &str, want: u64) {
+fn assert_revision(
+    file_id: FileId,
+    text: &str,
+    want: u64,
+    frozen: Option<&FrozenFileContentSnapshot>,
+) {
     let got = content_revision(text);
     if got != want {
+        if let Some(snapshot) = frozen {
+            snapshot.note_drift();
+        }
         panic!(
             "file_text revision mismatch for {file_id:?}: content changed under analysis \
              (recorded {want:#018x}, on-read {got:#018x})"

@@ -4,7 +4,7 @@ use crate::AnalysisContext;
 use crate::{Diagnostic, DiagnosticCode};
 use bsl_metadata::traits::MdObject;
 use hir::LocalRange;
-use hir::{AnnotationKind, AssignmentResolution, ExistingBindingKind, MethodId};
+use hir::{AssignmentResolution, DefWithBodyId, ExistingBindingKind, MethodId};
 use stdx::case::fold_lower_per_char;
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
@@ -50,7 +50,9 @@ pub fn from_hir(
         }
     }
 
-    if names_a_context_attribute(variable_name, method_id, ctx) {
+    let owner = method_id
+        .map_or(DefWithBodyId::ModuleCode, |method_id| DefWithBodyId::Method(method_id.local_id));
+    if names_a_context_attribute(variable_name, owner, ctx) {
         return None;
     }
 
@@ -81,19 +83,10 @@ pub fn from_hir(
 /// still reaches the module.
 fn names_a_context_attribute(
     variable_name: &str,
-    method_id: Option<MethodId>,
+    owner: DefWithBodyId,
     ctx: &AnalysisContext,
 ) -> bool {
-    let without_context =
-        method_id.and_then(|method_id| ctx.interface_method(method_id)).is_some_and(|method| {
-            method.directives.iter().any(|directive| {
-                matches!(
-                    directive,
-                    AnnotationKind::AtServerNoContext | AnnotationKind::AtClientAtServerNoContext
-                )
-            })
-        });
-    if without_context {
+    if !ctx.owner_has_form_context(owner) {
         return false;
     }
     let key = fold_lower_per_char(variable_name);
@@ -162,6 +155,28 @@ mod tests {
             .collect();
         expect![[r#""#]].assert_eq(&format_diags(code, &common_module_diags));
     }
+
+    #[test]
+    fn mock_provider_preserves_missing_declaration_form_context() {
+        let metadata = hir::ModuleMetadata::unknown(bsl_metadata::ModuleType::FormModule);
+        crate::test_utils::check_metadata_diagnostic(
+            metadata,
+            "&НаСервереБезКонтекста\nПроцедура БезКонтекста() КонецПроцедуры\n&НаСервере\nПроцедура СКонтекстом() КонецПроцедуры",
+            |_, ctx| {
+                assert!(!ctx.owner_has_form_context(hir::DefWithBodyId::Method(
+                    hir::MethodKey::first("БезКонтекста"),
+                )));
+                assert!(ctx.owner_has_form_context(hir::DefWithBodyId::Method(
+                    hir::MethodKey::first("СКонтекстом"),
+                )));
+                assert!(ctx.owner_has_form_context(hir::DefWithBodyId::Method(
+                    hir::MethodKey::first("Отсутствует"),
+                )));
+                Vec::new()
+            },
+        );
+    }
+
     const SERVER_MODULE_XML: &str = r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
     <CommonModule uuid="00000000-0000-0000-0000-000000000101">
         <Properties>
@@ -219,6 +234,10 @@ mod tests {
         );
         assert_eq!(
             form_assign_diags("&НаСервереБезКонтекста", Some("Модуль")),
+            ["Недопустимо присваивание значения общему модулю 'Модуль'"]
+        );
+        assert_eq!(
+            form_assign_diags("&НаКлиентеНаСервереБезКонтекста", Some("Модуль")),
             ["Недопустимо присваивание значения общему модулю 'Модуль'"]
         );
     }

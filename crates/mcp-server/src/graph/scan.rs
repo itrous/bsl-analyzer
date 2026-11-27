@@ -259,6 +259,7 @@ pub(crate) fn portable_fingerprint_of(
             digest.as_bytes()[..8].try_into().expect("blake3 yields >= 8 bytes"),
         ),
         topology,
+        platform_help: bsl_platform::PlatformDataInner::instance().snapshot_fingerprint(),
     })
 }
 
@@ -370,6 +371,15 @@ pub(crate) fn graph_matches_live_project(
     project.validated
         && project.search_roots.is_some()
         && fingerprint.topology == project.portable_topology
+}
+
+/// A stale graph may tolerate source-file drift, but not a different platform-help
+/// snapshot: its semantic answers were built from a different set of platform facts.
+pub(crate) fn graph_matches_platform_help(graph: &GraphDb) -> bool {
+    graph.freshness_token().is_ok_and(|(_, fingerprint, _)| {
+        fingerprint.platform_help
+            == bsl_platform::PlatformDataInner::instance().snapshot_fingerprint()
+    })
 }
 
 /// Strict variant used before handing a cached graph to a long-lived search context provider.

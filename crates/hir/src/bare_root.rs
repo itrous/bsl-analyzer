@@ -1,11 +1,8 @@
-//! Who owns a bare receiver name at a position.
+//! Who owns a bare receiver name at a position or outside the body.
 //!
 //! The decision itself is [`bare_global_name_claim`](crate::bare_global_name_claim) —
-//! this module only binds a position to the enclosing body so the predicate can
-//! be asked positionally. Every consumer that types a receiver from its
-//! identifier text must go through here; a consumer with its own guard set
-//! drifts from the diagnostic's verdict, which is how the shadowed-global
-//! suggestions kept coming back.
+//! this module binds body-sensitive lookups to the enclosing body and exposes
+//! nonlocal ownership without requiring a body scan.
 
 use hir_def::item_tree::{ItemTree, MethodItem};
 use hir_ty::db::HirDatabase;
@@ -55,6 +52,22 @@ pub fn claim_at<DB: HirDatabase>(
     let resolver = Resolver::with_builtins_and_workspace(module_id);
     let body_env = hir_ty::owner_body_env(db, file_id, owner);
     (bare_global_name_claim(db, &resolver, scope.as_ref(), name, body_env), owner)
+}
+
+/// Whether the nonlocal owner of `name` is a visible common module.
+///
+/// The caller handles names declared in the body. This lookup intentionally
+/// does not load the owner's body or source map.
+pub fn nonlocal_common_module_receiver(
+    db: &dyn HirDatabase,
+    file_id: FileId,
+    owner: DefWithBodyId,
+    name: &Name,
+) -> bool {
+    let module_id = ModuleId::new(file_id);
+    let resolver = Resolver::with_builtins_and_workspace(module_id);
+    let has_form_context = hir_ty::owner_has_form_context(db, file_id, owner);
+    hir_ty::nonlocal_common_module_receiver(db, &resolver, name, has_form_context)
 }
 
 /// Same, keyed off a receiver node: the read position is the node's own start.

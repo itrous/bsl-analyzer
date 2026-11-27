@@ -658,7 +658,15 @@ where
         }
         Err(err) => {
             tracing::error!("Request {} failed: {:?}", R::METHOD, err);
-            Response::new_err(id, ErrorCode::InternalError as i32, format!("{:#}", err))
+            let code = if err
+                .downcast_ref::<crate::handlers::request::IncompleteDiagnosticsError>()
+                .is_some()
+            {
+                ErrorCode::RequestFailed
+            } else {
+                ErrorCode::InternalError
+            };
+            Response::new_err(id, code as i32, format!("{:#}", err))
         }
     }
 }
@@ -850,6 +858,17 @@ mod tests {
             },
             work_done_progress_params: Default::default(),
         }
+    }
+
+    #[test]
+    fn incomplete_diagnostics_uses_lsp_request_failed_code() {
+        let error = anyhow::Error::new(crate::handlers::request::IncompleteDiagnosticsError::new(
+            ide::DiagnosticsIncompleteReason::NotifyProjection,
+        ));
+        let response =
+            result_to_response::<HoverRequest>(lsp_server::RequestId::from(1), Err(error));
+
+        assert_eq!(response.error.unwrap().code, lsp_server::ErrorCode::RequestFailed as i32);
     }
 
     #[test]

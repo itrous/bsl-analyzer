@@ -58,6 +58,7 @@ const MODULE_BODIES_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::TransferringParametersBetweenClientAndServer,
     DiagnosticCode::UnusedLocalMethod,
     DiagnosticCode::UnboundFormEventHandler,
+    DiagnosticCode::MissingNotifyHandler,
 ];
 
 const CONFIGURATION_DIAGNOSTICS: &[DiagnosticCode] = &[
@@ -336,6 +337,11 @@ pub fn collect_module_bodies_diagnostics(ctx: &DiagnosticsContext) -> Vec<Diagno
         "UnboundFormEventHandler",
         ctx,
         handlers::unbound_form_event_handler::check,
+    ));
+    diagnostics.extend(run_diagnostic(
+        "MissingNotifyHandler",
+        ctx,
+        handlers::missing_notify_handler::check,
     ));
     diagnostics.extend(run_diagnostic(
         "ServerCallsInFormEvents",

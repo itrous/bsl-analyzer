@@ -1527,6 +1527,29 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
                 tracing::debug!(generation, current, "discarding stale diagnostics");
             }
         }
+        Task::DiagnosticsIncomplete { uri, reason, version, generation, completed_at } => {
+            let is_current = state.diagnostics_generation.get(&uri) == Some(&generation)
+                && state.mem_docs.get_version(&uri) == Some(version);
+            if is_current {
+                state.diagnostics_tokens.remove(&uri);
+            }
+            if is_current {
+                tracing::warn!(
+                    %uri,
+                    ?reason,
+                    elapsed_ms = completed_at.elapsed().as_millis() as u64,
+                    "not publishing incomplete diagnostics; preserving the last complete result",
+                );
+                let params = lsp_types::LogMessageParams {
+                    typ: lsp_types::MessageType::WARNING,
+                    message: format!(
+                        "Diagnostics for {uri} are incomplete ({reason:?}); preserving the last complete result"
+                    ),
+                };
+                let notification = Notification::new("window/logMessage".to_string(), params);
+                state.sender.send(notification.into())?;
+            }
+        }
         Task::DiagnosticsCancelled { uri, version, generation, kind, dispatched, completed_at } => {
             tracing::debug!(
                 generation,
@@ -2376,6 +2399,23 @@ fn apply_workspace_batch_chunk(
         // Record every file this sweep reported, so the completion reconcile can clear
         // entries that vanished from scope (deleted / scope narrowed) between sweeps.
         state.batch_reported.insert(item.uri.clone());
+        if let Some(reason) = item.incomplete_reason {
+            tracing::warn!(
+                uri = %item.uri,
+                ?reason,
+                "workspace batch is incomplete; preserving the last complete diagnostics",
+            );
+            let params = lsp_types::LogMessageParams {
+                typ: lsp_types::MessageType::WARNING,
+                message: format!(
+                    "Workspace diagnostics for {} are incomplete ({reason:?}); preserving the last complete result",
+                    item.uri
+                ),
+            };
+            let notification = Notification::new("window/logMessage".to_string(), params);
+            state.sender.send(notification.into())?;
+            continue;
+        }
 
         // Handoff: a file opened mid-batch is served live by the interactive stream,
         // so the batch does not push it (that would double-report). The URI was
@@ -6762,6 +6802,39 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_diagnostics_is_logged_only_for_current_open_generation_and_version() {
+        let uri = crate::test_uri::file_uri("incomplete.bsl");
+
+        for (generation, current_generation, version, current_version, expected_log) in
+            [(7, 7, 42, 42, true), (6, 7, 42, 42, false), (7, 7, 41, 42, false)]
+        {
+            let (sender, receiver) = crossbeam_channel::unbounded();
+            let mut state = crate::global_state::GlobalState::new(sender);
+            state.mem_docs.insert(uri.clone(), "text".into(), current_version);
+            state.diagnostics_generation.insert(uri.clone(), current_generation);
+
+            handle_task(
+                &mut state,
+                Task::DiagnosticsIncomplete {
+                    uri: uri.clone(),
+                    reason: ide::DiagnosticsIncompleteReason::NotifyProjection,
+                    version,
+                    generation,
+                    completed_at: std::time::Instant::now(),
+                },
+            )
+            .unwrap();
+
+            if expected_log {
+                let message = recv_log_message(&receiver);
+                assert!(message.contains(uri.as_str()));
+                assert!(message.contains("NotifyProjection"));
+            }
+            assert!(receiver.try_recv().is_err(), "stale incomplete results must not notify");
+        }
+    }
+
+    #[test]
     fn diagnostics_cancelled_by_writer_requeue_only_current_open_version() {
         let (sender, _receiver) = crossbeam_channel::unbounded();
         let mut state = crate::global_state::GlobalState::new(sender);
@@ -7052,6 +7125,19 @@ mod tests {
         }
     }
 
+    fn recv_log_message(receiver: &crossbeam_channel::Receiver<Message>) -> String {
+        match receiver.try_recv().expect("expected a logMessage notification") {
+            Message::Notification(notification) => {
+                assert_eq!(notification.method, "window/logMessage");
+                let params: lsp_types::LogMessageParams =
+                    serde_json::from_value(notification.params).unwrap();
+                assert_eq!(params.typ, lsp_types::MessageType::WARNING);
+                params.message
+            }
+            other => panic!("expected a notification, got {other:?}"),
+        }
+    }
+
     fn dummy_diagnostic() -> lsp_types::Diagnostic {
         lsp_types::Diagnostic {
             range: lsp_types::Range::default(),
@@ -7069,6 +7155,7 @@ mod tests {
             uri: uri.clone(),
             result_id: result_id.to_string(),
             diagnostics,
+            incomplete_reason: None,
         }
     }
 
@@ -7155,6 +7242,35 @@ mod tests {
     }
 
     #[test]
+    fn workspace_batch_incomplete_logs_and_preserves_last_published_result() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let mut state = crate::global_state::GlobalState::new(sender);
+        install_test_plan(&mut state, 100);
+        let uri = crate::test_uri::file_uri("partial.bsl");
+        state.batch_pushed.insert(
+            uri.clone(),
+            crate::global_state::BatchPush {
+                result_id: "last-complete".to_string(),
+                file_id: None,
+            },
+        );
+        let mut item = batch_item(&uri, "", Vec::new());
+        item.incomplete_reason = Some(ide::DiagnosticsIncompleteReason::NotifyProjection);
+
+        let chunk = current_chunk(&state, vec![item]);
+        handle_task(&mut state, chunk).unwrap();
+
+        let message = recv_log_message(&receiver);
+        assert!(message.contains(uri.as_str()));
+        assert!(message.contains("NotifyProjection"));
+        assert!(receiver.try_recv().is_err(), "incomplete batch must not publish an empty result");
+        assert_eq!(
+            state.batch_pushed.get(&uri).map(|entry| entry.result_id.as_str()),
+            Some("last-complete")
+        );
+    }
+
+    #[test]
     fn workspace_batch_chunk_from_a_stale_generation_is_dropped() {
         let (sender, receiver) = crossbeam_channel::unbounded();
         let mut state = crate::global_state::GlobalState::new(sender);
@@ -7163,15 +7279,13 @@ mod tests {
 
         // A chunk tagged with an older generation (its sweep was superseded by a
         // config reset) must never publish or record anything.
+        let mut item = batch_item(&uri, "", Vec::new());
+        item.incomplete_reason = Some(ide::DiagnosticsIncompleteReason::NotifyProjection);
         handle_task(
             &mut state,
             Task::WorkspaceBatchChunk {
                 generation: 4,
-                outcome: crate::global_state::WorkspaceBatchOutcome::Computed(vec![batch_item(
-                    &uri,
-                    "h1",
-                    vec![dummy_diagnostic()],
-                )]),
+                outcome: crate::global_state::WorkspaceBatchOutcome::Computed(vec![item]),
             },
         )
         .unwrap();

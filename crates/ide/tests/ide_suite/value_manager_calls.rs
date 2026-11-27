@@ -232,7 +232,9 @@ fn call_hierarchy_treats_the_value_manager_call_like_a_catalog_object_call() {
     assert_eq!(vmm_target, Some(ids[VMM]));
 
     // ...while the call hierarchy lists only the syntactic edge, for both alike.
-    let outgoing = analysis.call_hierarchy_outgoing(ids[CALLER], at(caller, "Прогон", 0, 2));
+    let outgoing = analysis
+        .call_hierarchy_outgoing(ids[CALLER], at(caller, "Прогон", 0, 2))
+        .expect("a complete projection publishes the outgoing answer");
     let callees: Vec<(FileId, String)> =
         outgoing.iter().map(|c| (c.item.file_id, c.item.name.clone())).collect();
     assert_eq!(callees, vec![(ids[CALLER], "Помощник".to_string())]);

@@ -1319,8 +1319,8 @@ mod tests {
         )
     }
 
-    /// An owner over a configuration with one catalog form whose module assigns a
-    /// variable that only the form's dialog data can make "used".
+    /// An owner over a catalog form whose module assigns a name that is unresolved
+    /// until the form's dialog metadata supplies its attribute surface.
     fn form_stand() -> FormStand {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("workspace");
@@ -1372,15 +1372,28 @@ mod tests {
             .collect()
     }
 
+    fn form_has_attribute(view: &EditorView, module_id: FileId, name: &str) -> bool {
+        use hir::DefDatabase;
+
+        view.analysis()
+            .database()
+            .module_metadata(hir::ModuleId::new(module_id))
+            .form
+            .as_ref()
+            .is_some_and(|form| form.find_attribute(name).is_some())
+    }
+
     #[test]
     fn a_changed_form_dialog_reaches_a_caught_up_view() {
         let mut stand = form_stand();
         let mut view = EditorView::new(stand.backend.snapshot());
 
         let baseline = module_diagnostics(&view, stand.module_id);
-        if !baseline.iter().any(|line| line.starts_with("UnusedLocalVariable")) {
-            panic!("stand is wrong, baseline lacks UnusedLocalVariable: {baseline:#?}");
-        }
+        assert!(!form_has_attribute(&view, stand.module_id, "СостояниеПриемки"));
+        assert!(
+            !baseline.iter().any(|line| line.starts_with("UnusedLocalVariable")),
+            "an unresolved form assignment is not proven local: {baseline:#?}"
+        );
         let root = stand.root.to_string_lossy().into_owned();
         let revision_before = view.database().config_revision(&root);
 
@@ -1404,8 +1417,12 @@ mod tests {
         );
         let after = module_diagnostics(&view, stand.module_id);
         assert!(
+            form_has_attribute(&view, stand.module_id, "СостояниеПриемки"),
+            "form attribute added on disk did not reach the caught-up view"
+        );
+        assert!(
             !after.iter().any(|line| line.starts_with("UnusedLocalVariable")),
-            "form attribute added on disk did not reach the caught-up view; baseline: {baseline:#?}; after: {after:#?}"
+            "an indeterminate form assignment was reported as a local: {baseline:#?}; after: {after:#?}"
         );
     }
 

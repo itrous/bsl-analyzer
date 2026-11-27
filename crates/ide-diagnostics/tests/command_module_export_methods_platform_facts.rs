@@ -1,0 +1,53 @@
+#[path = "support/command_module_export_methods.rs"]
+mod command_module_export_methods;
+
+use bsl_platform::{install_platform_help, InstallOutcome, PlatformHelp, PlatformHelpRequest};
+use ide_diagnostics::DiagnosticCode;
+
+fn reported_export_names<'a>(
+    source: &'a str,
+    diagnostics: &[ide_diagnostics::Diagnostic],
+) -> Vec<&'a str> {
+    diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == DiagnosticCode::CommandModuleExportMethods)
+        .map(|diagnostic| {
+            let start: usize = diagnostic.range.start().into();
+            let end: usize = diagnostic.range.end().into();
+            &source[start..end]
+        })
+        .collect()
+}
+
+#[test]
+fn platform_facts_exempt_the_registered_handler_but_report_ordinary_exports() {
+    assert_eq!(
+        install_platform_help(
+            PlatformHelp::without_io(&PlatformHelpRequest::Bundled)
+                .expect("bundled facts need no I/O")
+        ),
+        Ok(InstallOutcome::Installed)
+    );
+
+    let (diagnostics, source) = command_module_export_methods::command_module_export_diagnostics();
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    let range = diagnostics[0].range;
+    let start: usize = range.start().into();
+    let end: usize = range.end().into();
+    assert_eq!(&source[start..end], "ОбычныйЭкспорт");
+
+    let (chain_diagnostics, chain_source) =
+        command_module_export_methods::dynamic_alias_chain_export_diagnostics();
+    assert!(
+        chain_diagnostics.is_empty(),
+        "the reachable A→B→C array callback is not an ordinary export: {chain_diagnostics:#?}\n{chain_source}"
+    );
+
+    let (bare_diagnostics, bare_source) =
+        command_module_export_methods::command_module_bare_receiver_callback_guard_diagnostics();
+    assert_eq!(
+        reported_export_names(&bare_source, &bare_diagnostics),
+        ["ОбычныйЭкспорт"],
+        "a bare receiver bound to the current object keeps the callback exempt: {bare_diagnostics:#?}"
+    );
+}

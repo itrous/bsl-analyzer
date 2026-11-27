@@ -218,13 +218,13 @@ fn a_longer_name_in_a_string_does_not_block_the_fix() {
 }
 
 #[test]
-fn notification_handler_gets_no_diagnostic() {
+fn notification_on_an_unproven_receiver_does_not_keep_local_handler_alive() {
     let source = "Процедура Спросить() Экспорт\n\
                   \tОповещение = Новый ОписаниеОповещения(\"ПослеОтвета\", Сервис);\n\
                   \tПоказатьВопрос(Оповещение, \"Продолжить?\", РежимДиалогаВопрос.ДаНет);\n\
                   КонецПроцедуры\n\n\
                   Процедура ПослеОтвета(Ответ, Параметры)\nКонецПроцедуры\n";
-    assert_eq!(delete_fix(source), "");
+    assert_eq!(delete_fix(source), "UnusedLocalMethod @ 6:11 no fix");
 }
 
 #[test]

@@ -5,14 +5,10 @@ use crate::tabular_section::{TabularSection, TabularSectionAttribute};
 use std::str::FromStr;
 
 use super::helpers::{child_text, child_u32, find_child, find_mdo_element, parse_uuid, parse_xml};
-use super::standard_attributes::{
-    add_business_process_standard_attributes, add_catalog_standard_attributes,
-    add_chart_of_accounts_standard_attributes, add_chart_of_calculation_types_standard_attributes,
-    add_chart_of_characteristic_types_standard_attributes, add_document_standard_attributes,
-    add_exchange_plan_standard_attributes, add_information_register_standard_attributes_as_attrs,
-    add_task_standard_attributes, MdoProperties,
-};
+use super::standard_attributes::{add_standard_attributes_from_spec, MdoProperties};
 use super::type_parser::parse_type_xml;
+use crate::metadata_object::object_standard_template;
+use bsl_platform::ObjectView;
 
 pub fn parse_catalog_xml(xml: &str) -> Result<MetadataObject> {
     let _span = tracing::debug_span!("parse_catalog_xml").entered();
@@ -103,47 +99,31 @@ fn parse_metadata_object_xml(xml: &str, mdo_type: MdoType) -> Result<MetadataObj
     let mut attributes = Vec::new();
     let mut tabular_sections = Vec::new();
 
-    match mdo_type {
-        MdoType::Catalog => {
-            add_catalog_standard_attributes(&mut attributes, &properties, mdo_type);
-        }
-        MdoType::Document => {
-            add_document_standard_attributes(&mut attributes, &properties, mdo_type);
-        }
-        MdoType::BusinessProcess => {
-            add_business_process_standard_attributes(&mut attributes, &properties, mdo_type);
-        }
-        MdoType::Task => {
-            add_task_standard_attributes(&mut attributes, &properties, mdo_type);
-        }
-        MdoType::ExchangePlan => {
-            add_exchange_plan_standard_attributes(&mut attributes, &properties, mdo_type);
-        }
-        MdoType::ChartOfCharacteristicTypes => {
-            add_chart_of_characteristic_types_standard_attributes(
-                &mut attributes,
-                &properties,
-                mdo_type,
-            );
-        }
-        MdoType::ChartOfAccounts => {
-            add_chart_of_accounts_standard_attributes(&mut attributes, &properties, mdo_type);
-        }
-        MdoType::ChartOfCalculationTypes => {
-            add_chart_of_calculation_types_standard_attributes(
-                &mut attributes,
-                &properties,
-                mdo_type,
-            );
-        }
-        MdoType::InformationRegister => {
-            add_information_register_standard_attributes_as_attrs(
-                &mut attributes,
-                &properties,
-                mdo_type,
-            );
-        }
-        _ => {}
+    if let Some(template) = object_standard_template(mdo_type) {
+        add_standard_attributes_from_spec(
+            &mut attributes,
+            &properties,
+            mdo_type,
+            template,
+            ObjectView::Object,
+        );
+    }
+    if mdo_type == MdoType::ChartOfAccounts {
+        // `Вид` and `Забалансовый` are standard chart-of-accounts fields, but they are
+        // deliberately NOT StandardAttributeKind members: `is_standard_attribute_name`
+        // is a name-only global set, and «Вид» is a common user attribute name on other
+        // objects — listing it there would hide those user attributes from every
+        // standard-name filter (graph catalog, SDBL scope builder).
+        attributes.push(Attribute {
+            name: "Вид".to_string(),
+            name_en: Some("Type".to_string()),
+            attr_type: AttributeType::PlatformNamed("ВидСчета".to_string()),
+        });
+        attributes.push(Attribute {
+            name: "Забалансовый".to_string(),
+            name_en: Some("OffBalance".to_string()),
+            attr_type: AttributeType::Boolean,
+        });
     }
 
     let mut ext_dimension_flags = Vec::new();
@@ -185,6 +165,12 @@ fn parse_metadata_object_xml(xml: &str, mdo_type: MdoType) -> Result<MetadataObj
     }
 
     let mut mdo = MetadataObject::new(mdo_type, properties.name.clone());
+    if let Some(template) = object_standard_template(mdo_type) {
+        mdo.known_absent_standard_attributes =
+            properties.known_absent_conditional_attributes(template);
+        mdo.unknown_conditional_standard_attributes =
+            properties.unknown_conditional_attributes(template);
+    }
     mdo.read_properties = super::read_properties::parse_read_properties(mdo_node);
     if let Some(uuid_str) = mdo_node.attribute("uuid") {
         match parse_uuid(uuid_str, "MDO root") {
