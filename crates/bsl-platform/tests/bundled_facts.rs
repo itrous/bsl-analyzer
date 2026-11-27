@@ -6,7 +6,7 @@
 
 use bsl_platform::{
     MemberSurface, PlatformData, PlatformHelp, PlatformHelpRequest, PlatformHelpSourceKind,
-    PlatformHelpStatus, BUNDLED_PLATFORM_VERSION,
+    PlatformHelpStatus, PlatformType, BUNDLED_PLATFORM_VERSION,
 };
 use serde_json::Value;
 
@@ -28,6 +28,7 @@ fn surfaces_of(data: &PlatformData, name: &str) -> (bool, bool) {
 const BOTH: (bool, bool) = (true, true);
 const NEITHER: (bool, bool) = (false, false);
 const METHODS_ONLY: (bool, bool) = (true, false);
+const FIELDS_ONLY: (bool, bool) = (false, true);
 
 const RECORD_KEYS: &[(&str, &[&str])] = &[
     (
@@ -278,6 +279,168 @@ fn the_curated_overlays_reach_the_built_in_facts() {
     for name in ["ЗаписьJSON", "JSONWriter", "ТаблицаЗначений", "ValueTable"] {
         assert!(surfaces_of(&data, name) == BOTH, "{name} is attested");
     }
+    for name in [
+        "Массив",
+        "Array",
+        "Соответствие",
+        "Map",
+        "СписокЗначений",
+        "ValueList",
+        "ТекстовыйДокумент",
+        "TextDocument",
+        "ДеревоЗначений",
+        "ValueTree",
+        "Запрос",
+        "Query",
+        "СообщениеПользователю",
+        "UserMessage",
+    ] {
+        assert!(surfaces_of(&data, name) == BOTH, "{name} is attested");
+    }
+    // A structure's keys ARE its properties, so only its methods are attested.
+    for name in ["Структура", "Structure"] {
+        assert!(
+            surfaces_of(&data, name) == METHODS_ONLY,
+            "{name} is attested for its methods and not for its properties"
+        );
+    }
+    for name in ["Цвет", "Color"] {
+        assert!(surfaces_of(&data, name) == BOTH, "{name} is attested");
+    }
+    // A qualifier's method surface is deliberately unattested: only its properties are.
+    for name in [
+        "КвалификаторыЧисла",
+        "NumberQualifiers",
+        "КвалификаторыСтроки",
+        "StringQualifiers",
+        "КвалификаторыДаты",
+        "DateQualifiers",
+    ] {
+        assert!(
+            surfaces_of(&data, name) == FIELDS_ONLY,
+            "{name} is attested for its properties and not for its methods"
+        );
+    }
+    for name in ["ОписаниеТипов", "TypeDescription", "ТабличныйДокумент", "SpreadsheetDocument"]
+    {
+        assert!(surfaces_of(&data, name) == BOTH, "{name} is attested");
+    }
+    // A callback description has no methods, so only its properties are attested.
+    for name in ["ОписаниеОповещения", "CallbackDescription"] {
+        assert!(
+            surfaces_of(&data, name) == FIELDS_ONLY,
+            "{name} is attested for its properties and not for its methods"
+        );
+    }
+    // A value storage has no properties, so only its method is attested.
+    for name in ["ХранилищеЗначения", "ValueStorage"] {
+        assert!(
+            surfaces_of(&data, name) == METHODS_ONLY,
+            "{name} is attested for its methods and not for its properties"
+        );
+    }
+    assert_eq!(data.get_type_methods("TypeDescription").len(), 3);
+    assert_eq!(data.get_type_properties("TypeDescription").len(), 4);
+    assert!(data.get_type_methods("CallbackDescription").is_empty());
+    assert_eq!(data.get_type_properties("CallbackDescription").len(), 5);
+    assert_eq!(data.get_type_methods("ValueStorage").len(), 1);
+    assert!(data.get_type_properties("ValueStorage").is_empty());
+    assert_eq!(data.get_type_methods("SpreadsheetDocument").len(), 45);
+    assert_eq!(data.get_type_properties("SpreadsheetDocument").len(), 63);
+    // Ten more types attested from the cross-build oracle: both surfaces, or the one that has members.
+    for name in [
+        "МенеджерВременныхТаблиц",
+        "TempTablesManager",
+        "Файл",
+        "File",
+        "Шрифт",
+        "Font",
+        "ДиалогВыбораФайла",
+        "FileDialog",
+        "ЧтениеXML",
+        "XMLReader",
+        "ЗаписьXML",
+        "XMLWriter",
+        "Картинка",
+        "Picture",
+        "НастройкаПериода",
+        "PeriodSettings",
+    ] {
+        assert!(surfaces_of(&data, name) == BOTH, "{name} is attested");
+    }
+    // Keys of a fixed structure are properties, and the other two have no properties at all.
+    for name in [
+        "БлокировкаДанных",
+        "DataLock",
+        "ФиксированныйМассив",
+        "FixedArray",
+        "ФиксированнаяСтруктура",
+        "FixedStructure",
+        "ДвоичныеДанные",
+        "BinaryData",
+        "ФиксированноеСоответствие",
+        "FixedMap",
+        "КомпоновщикМакетаКомпоновкиДанных",
+        "DataCompositionTemplateComposer",
+        "ПроцессорКомпоновкиДанных",
+        "DataCompositionProcessor",
+        "КомпоновщикНастроекКомпоновкиДанных",
+        "DataCompositionSettingsComposer",
+    ] {
+        assert!(
+            surfaces_of(&data, name) == METHODS_ONLY,
+            "{name} is attested for its methods and not for its properties"
+        );
+    }
+    for name in [
+        "Линия",
+        "Line",
+        "Граница",
+        "Boundary",
+        "СистемнаяИнформация",
+        "SystemInfo",
+        "СтандартныйПериод",
+        "StandardPeriod",
+        "РеквизитФормы",
+        "FormAttribute",
+    ] {
+        assert!(
+            surfaces_of(&data, name) == FIELDS_ONLY,
+            "{name} is attested for its properties and not for its methods"
+        );
+    }
+    // `ChoiceParameter` is spelled the same as the XDTO alias of `DataCompositionChoiceParameter`, so the English
+    // name is ambiguous and the verdict refuses it; the Russian name, which code uses, is attested.
+    assert!(surfaces_of(&data, "ПараметрВыбора") == FIELDS_ONLY, "ПараметрВыбора is attested");
+    assert!(data.is_ambiguous_type_name("ChoiceParameter"));
+    assert!(surfaces_of(&data, "ChoiceParameter") == NEITHER);
+    for (name, methods, properties) in [
+        ("TempTablesManager", 1, 1),
+        ("File", 42, 5),
+        ("DataLock", 4, 0),
+        ("Line", 0, 3),
+        ("FixedArray", 4, 0),
+        ("FixedStructure", 2, 0),
+        ("Boundary", 0, 2),
+        ("Font", 1, 8),
+        ("ChoiceParameter", 0, 2),
+        ("BinaryData", 5, 0),
+        ("FileDialog", 3, 13),
+        ("XMLReader", 20, 24),
+        ("FixedMap", 2, 0),
+        ("DataCompositionTemplateComposer", 1, 0),
+        ("XMLWriter", 20, 3),
+        ("DataCompositionProcessor", 3, 0),
+        ("Picture", 13, 2),
+        ("PeriodSettings", 4, 11),
+        ("SystemInfo", 0, 8),
+        ("DataCompositionSettingsComposer", 8, 3),
+        ("StandardPeriod", 0, 3),
+        ("FormAttribute", 0, 5),
+    ] {
+        assert_eq!(data.get_type_methods(name).len(), methods, "{name} methods");
+        assert_eq!(data.get_type_properties(name).len(), properties, "{name} properties");
+    }
     // The collections that address their elements by name are attested for the
     // methods alone: an element name is answered as a property, so the property
     // surface stays open.
@@ -297,8 +460,8 @@ fn the_curated_overlays_reach_the_built_in_facts() {
     assert_eq!(data.get_type_methods("StandardAttributeDescriptions").len(), 1);
     assert!(data.get_type_properties("StandardAttributeDescriptions").is_empty());
     // ...and the types nobody attested stay open, however complete they look.
-    assert!(surfaces_of(&data, "ТабличныйДокумент") == NEITHER);
-    assert!(surfaces_of(&data, "Запрос") == NEITHER);
+    assert!(surfaces_of(&data, "ЧтениеJSON") == NEITHER);
+    assert!(surfaces_of(&data, "JSONReader") == NEITHER);
     assert!(surfaces_of(&data, "ЗаписьJSONНеТакой") == NEITHER);
 
     // The members the attestation covers are the ones the positive tests call
@@ -311,6 +474,9 @@ fn the_curated_overlays_reach_the_built_in_facts() {
     assert_eq!(data.get_type_properties("SpreadsheetDocumentRange").len(), 63);
     assert!(data.get_property("SpreadsheetDocumentRange", "ТекущаяОбласть").is_none());
     assert!(data.get_method("JSONWriter", "ЗаписатьНачалоТаблицы").is_none());
+    assert_eq!(data.get_type_methods("Array").len(), 9);
+    assert_eq!(data.get_type_methods("Structure").len(), 5);
+    assert!(data.get_type_properties("Structure").is_empty());
     assert_eq!(data.get_type_methods("ValueTable").len(), 19);
     assert_eq!(data.get_type_properties("ValueTable").len(), 2);
     assert!(data.get_method("ТаблицаЗначений", "Прочитать").is_none());
@@ -338,37 +504,95 @@ fn the_curated_return_type_correction_reaches_the_built_in_facts() {
     );
 }
 
+/// Name fragments of the types a configuration or a run extends with members the
+/// extract cannot know: the per-MDO and per-item extension types (`Расширение ...` /
+/// `... extension`) and the data-composition family. Compared on lowercase names with
+/// whitespace dropped, because the corpus spells these names both ways.
+const EXTENDED_TYPE_MARKERS: &[&str] =
+    &["extension", "расширение", "datacomposition", "компоновкаданных"];
+
+/// English names of the types whose property surface is open because a managed form
+/// widens it: the form context, the form's data (properties are the attribute names
+/// of a particular form) and the form's items (they gain properties from the
+/// "Form extension for a ..." types). A hand-kept list, not a name test: see the doc
+/// comment of `curated_attestations_stay_off_types_the_extract_cannot_complete`.
+const FORM_SURFACE_OPEN_TYPES: &[&str] = &[
+    "ClientApplicationForm",
+    "Form",
+    "FormAllItems",
+    "FormItems",
+    "FormCommands",
+    "FormCommand",
+    "FormField",
+    "FormGroup",
+    "FormTable",
+    "FormButton",
+    "FormDecoration",
+    "FormItemAddition",
+    "FormDataCollection",
+    "FormDataCollectionItem",
+    "FormDataStructure",
+    "FormDataStructureAndCollection",
+    "FormDataTree",
+    "FormDataTreeItem",
+    "FormDataTreeItemCollection",
+];
+
+fn normalized_type_name(name: &str) -> String {
+    name.to_lowercase().chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+fn carries_extended_marker(ty: &PlatformType) -> bool {
+    [ty.name.as_str(), ty.english_name.as_str()].iter().any(|alias| {
+        let folded = normalized_type_name(alias);
+        EXTENDED_TYPE_MARKERS.iter().any(|marker| folded.contains(marker))
+    })
+}
+
+/// Whether the type keeps its property surface open because a configuration or a
+/// form widens it: a marker in either spelling of the name, or a listed form type.
+fn has_open_property_surface(ty: &PlatformType) -> bool {
+    FORM_SURFACE_OPEN_TYPES.contains(&ty.english_name.as_str()) || carries_extended_marker(ty)
+}
+
 /// The curating rule of an attestation, held by a test rather than by prose in
 /// `OVERLAYS.md`, and it is a rule about surfaces. A type whose extract had to
 /// be patched has no surface the extract may call complete, so it is not
-/// attested at all. A type a configuration extends and a type that addresses its
-/// elements by name keep their properties open, while their methods are still the
-/// platform's own, so such a type may be attested for `["methods"]` only.
+/// attested at all. A type that is extended at run time and a type that addresses
+/// its elements by name keep their properties open, while their methods are still
+/// the platform's own, so such a type may be attested for `["methods"]` only.
 ///
-/// The form half is a name check with a stated limit: a managed form gains
-/// properties from its per-MDO extensions (`form_extension_property_names` in
-/// `crates/bsl-platform/src/db.rs`), and the extract knows nothing of them, so
-/// such a type must not be attested. The corpus spells those names both with and
-/// without a space (`DataComposition…`, `…КомпоновкиДанных`), so the comparison
-/// drops whitespace on both sides. A type whose name hides that it is extended
-/// would still slip through (the corpus names are not a classification), which is
-/// why the check is written down here as the rule's ceiling rather than as a
-/// proof of it.
+/// What counts as extended, and where the rule stops:
+/// - the form context (`ClientApplicationForm`, `Form`), the form's data
+///   (`FormData*`, whose properties are the attribute names of a particular form)
+///   and the form's items (`FormField`, `FormGroup`, `FormTable`, ..., which gain
+///   properties from the "Form extension for a ..." types) keep their property
+///   surface open;
+/// - the per-MDO and per-item extension types are caught by the
+///   `extension` / `расширение` markers, and the data-composition family by the
+///   `datacomposition` / `компоновкаданных` ones;
+/// - the separation between an extended form type and a plain descriptor object
+///   CANNOT be made lexically: `РеквизитФормы` / `FormAttribute` is spelled
+///   exactly like `ПолеФормы` / `FormField` but is a value object a configuration
+///   cannot widen. That is why the form half is a hand-kept list
+///   (`FORM_SURFACE_OPEN_TYPES`) and not a name test.
 ///
-/// The second list is the same kind of ceiling for the name-addressed collections:
-/// the corpus does not say that `КоллекцияРисунковТабличногоДокумента` answers
+/// Measured over the 2350 types of the bundled facts: the old six markers (with
+/// `form` / `форма`) caught 567 types; dropping those two releases 140, of which
+/// the 19 listed form types are kept open by name and the other 121 are incidental
+/// (`form` inside `Information` / `Transform`, the `Format*` family, system
+/// enumerations about forms such as `FormFieldType`); and the four remaining
+/// markers still catch every `Расширение ...` type (167 of them also spelled
+/// `... extension` in English; 176 types carry either marker).
+///
+/// The name-addressed collections are a second ceiling of the same kind: the corpus
+/// does not say that `КоллекцияРисунковТабличногоДокумента` answers
 /// `Рисунки.<имя рисунка>` as a property, a live run does, so the names are kept here by
-/// hand, as the markers are. Each entry carries the type's English canonical name.
+/// hand. Each entry carries the type's English canonical name.
 #[test]
 fn curated_attestations_stay_off_types_the_extract_cannot_complete() {
-    const EXTENDED_TYPE_MARKERS: &[&str] =
-        &["form", "форма", "extension", "расширение", "datacomposition", "компоновкаданных"];
     const ELEMENTS_ADDRESSED_BY_NAME: &[&str] =
         &["SpreadsheetDocumentDrawingCollection", "StandardAttributeDescriptions"];
-
-    fn normalized(name: &str) -> String {
-        name.to_lowercase().chars().filter(|c| !c.is_whitespace()).collect()
-    }
 
     let document: Value =
         serde_json::from_str(include_str!("../data/platform_overlays.json")).expect("overlay JSON");
@@ -391,6 +615,12 @@ fn curated_attestations_stay_off_types_the_extract_cannot_complete() {
             "{name} of the name-addressed list must exist in the built-in facts"
         );
     }
+    for name in FORM_SURFACE_OPEN_TYPES {
+        assert!(
+            data.get_type(name).is_some(),
+            "{name} of the form-surface list must exist in the built-in facts"
+        );
+    }
     for entry in entries {
         let name = entry["type"].as_str().expect("an attested type is named");
         let ty = data
@@ -409,10 +639,7 @@ fn curated_attestations_stay_off_types_the_extract_cannot_complete() {
                 .map(|surface| surface.as_str().expect("a surface is named by a string"))
                 .collect()
         });
-        let extended = [ty.name.as_str(), ty.english_name.as_str()].iter().any(|alias| {
-            let folded = normalized(alias);
-            EXTENDED_TYPE_MARKERS.iter().any(|marker| folded.contains(marker))
-        });
+        let extended = has_open_property_surface(ty);
         let addressed_by_name = ELEMENTS_ADDRESSED_BY_NAME.contains(&ty.english_name.as_str());
         if extended || addressed_by_name {
             assert_eq!(
@@ -426,36 +653,16 @@ fn curated_attestations_stay_off_types_the_extract_cannot_complete() {
 }
 
 /// The marker check is only worth its name if it catches the corpus spellings: the
-/// data-composition family is the biggest extended one (251 types), and its names are
+/// data-composition family is the biggest extended one (257 types), and its names are
 /// written without a space. The check is exercised on the corpus's own names, not on
-/// invented ones.
+/// invented ones. The form family is covered by the explicit list, not by a marker.
 #[test]
 fn the_extended_type_marker_check_catches_the_corpus_spellings() {
-    fn normalized(name: &str) -> String {
-        name.to_lowercase().chars().filter(|c| !c.is_whitespace()).collect()
-    }
-    const EXTENDED_TYPE_MARKERS: &[&str] =
-        &["form", "форма", "extension", "расширение", "datacomposition", "компоновкаданных"];
-
     let help = PlatformHelp::without_io(&PlatformHelpRequest::Bundled).unwrap();
     let data = PlatformData::from_help(help);
-    let is_extended = |name: &str| {
-        data.get_type(name).is_some_and(|ty| {
-            [ty.name.as_str(), ty.english_name.as_str()]
-                .iter()
-                .any(|alias| EXTENDED_TYPE_MARKERS.iter().any(|m| normalized(alias).contains(m)))
-        })
-    };
+    let is_extended = |name: &str| data.get_type(name).is_some_and(has_open_property_surface);
 
-    let marked = data
-        .all_types()
-        .iter()
-        .filter(|ty| {
-            [ty.name.as_str(), ty.english_name.as_str()]
-                .iter()
-                .any(|alias| EXTENDED_TYPE_MARKERS.iter().any(|m| normalized(alias).contains(m)))
-        })
-        .count();
+    let marked = data.all_types().iter().filter(|ty| carries_extended_marker(ty)).count();
     assert!(
         marked > 250,
         "the corpus names a whole extended family with these markers, found {marked}"
@@ -466,8 +673,6 @@ fn the_extended_type_marker_check_catches_the_corpus_spellings() {
     for name in [
         "DataCompositionSettings",
         "НастройкиКомпоновкиДанных",
-        "ФормаКлиентскогоПриложения",
-        "ClientApplicationForm",
         "Расширение табличного поля отбора",
         "Filter table box extension",
     ] {
@@ -476,6 +681,25 @@ fn the_extended_type_marker_check_catches_the_corpus_spellings() {
             "{name} must exist in the built-in facts for this check to mean anything"
         );
         assert!(is_extended(name), "{name} must be recognized as a type a configuration extends");
+    }
+
+    // The form context is covered through the list, and no marker catches it any more.
+    for name in ["ФормаКлиентскогоПриложения", "ClientApplicationForm"] {
+        let ty = data.get_type(name).unwrap_or_else(|| panic!("{name} must exist in the facts"));
+        assert!(
+            FORM_SURFACE_OPEN_TYPES.contains(&ty.english_name.as_str()),
+            "{name} must be covered by the form-surface list"
+        );
+        assert!(is_extended(name), "{name} must be recognized as a type a form widens");
+        assert!(
+            !carries_extended_marker(ty),
+            "{name} is covered by the list alone, not by a marker"
+        );
+    }
+
+    // The descriptor object spelled like a form item is a plain value object, not a form type.
+    for name in ["РеквизитФормы", "FormAttribute"] {
+        assert!(!is_extended(name), "{name} is a descriptor object a configuration cannot widen");
     }
 }
 

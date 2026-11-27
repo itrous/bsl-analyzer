@@ -4267,6 +4267,13 @@ impl<'db> InferenceContext<'db> {
         match self.db.lookup_type(ty) {
             TypeKind::PlatformObject(facet) => Some(facet.name.clone()),
             TypeKind::ValueTable(_) => Some("ТаблицаЗначений".to_string()),
+            // These kinds each denote exactly one platform type. The name is what the
+            // attestation list is keyed by; a kind with no attestation simply stays open.
+            TypeKind::Array(_) => Some("Массив".to_string()),
+            TypeKind::Map(_) => Some("Соответствие".to_string()),
+            TypeKind::Structure(_) => Some("Структура".to_string()),
+            TypeKind::ValueList(_) => Some("СписокЗначений".to_string()),
+            TypeKind::Query { .. } => Some("Запрос".to_string()),
             _ => None,
         }
     }
@@ -4491,7 +4498,7 @@ impl<'db> InferenceContext<'db> {
                 walk.resolved.insert(expr, types.clone());
                 types
             }
-            Expr::New { type_name: Some(_), args } if args.is_empty() => {
+            Expr::New { type_name: Some(_), .. } => {
                 Some(vec![self.expr_types.get(&expr).copied()?])
             }
             _ => None,
