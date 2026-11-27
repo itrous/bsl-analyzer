@@ -465,8 +465,8 @@ fn compute_chunk(
         .filter(|_| crate::diagnostics_baseline::defers_scope_line_gate(baseline.0, true));
     let config = config.clone().with_defer_scope_line_gate(late_scope.is_some());
     let computed = match pool {
-        Some(pool) => analysis.workspace_diagnostics_result_parallel(chunk, config, pool),
-        None => analysis.workspace_diagnostics_result(chunk, config),
+        Some(pool) => analysis.workspace_diagnostics_parallel(chunk, config, pool),
+        None => analysis.workspace_diagnostics(chunk, config),
     };
     computed
         .into_iter()

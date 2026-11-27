@@ -2,7 +2,6 @@ use crate::define_metadata;
 use crate::metadata::*;
 use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
 use ide_db::TextRange;
-use rustc_hash::FxHashMap;
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
     diagnostic_type: DiagnosticType::CodeSmell,
@@ -21,10 +20,7 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
 pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     let code = DiagnosticCode::CommandModuleExportMethods;
 
-    // Without a served platform snapshot no constructor knowledge can distinguish an
-    // ordinary export from a handler the platform calls by name, so silence is the only
-    // safe verdict. A partial snapshot still identifies ordinary exports.
-    if ctx.is_disabled_with_metadata(code) || !ctx.platform_help_available() {
+    if ctx.is_disabled_with_metadata(code) {
         return Vec::new();
     }
 
@@ -34,53 +30,21 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         return Vec::new();
     }
 
+    let Some(protected) = ctx.command_module_export_protection() else {
+        return Vec::new();
+    };
     let item_tree = ctx.item_tree();
     let module = hir::ModuleId::new(ctx.file_id);
-    let candidates = ctx.notify_candidates();
-    let symbol_tree = ctx.symbol_tree();
     let mut diagnostics = Vec::new();
 
-    let mut candidates_by_name: FxHashMap<hir::Name, Vec<&hir::NotifyCandidate>> =
-        FxHashMap::default();
-    let mut has_reachable_incomplete_candidate = false;
-    for (index, candidate) in candidates.iter().enumerate() {
-        if index & 0xff == 0 {
-            ctx.check_cancellation();
-        }
-        has_reachable_incomplete_candidate |=
-            hir::command_module_export_verdict(candidate).global_uncertainty;
-        candidates_by_name
-            .entry(hir::normalize_match_name(&candidate.callback_name))
-            .or_default()
-            .push(candidate);
-    }
-    // A reachable incomplete registration may name any local method, so no export can
-    // safely be classified as unregistered.
-    if has_reachable_incomplete_candidate {
-        return Vec::new();
-    }
-
-    let mut methods_by_name: FxHashMap<hir::Name, Vec<hir::MethodId>> = FxHashMap::default();
-    let mut exemptions_by_name: FxHashMap<hir::Name, LocalHandlerExemptions> = FxHashMap::default();
     for (index, (_, proc)) in item_tree.procedures().enumerate() {
         if index & 0xff == 0 {
             ctx.check_cancellation();
         }
-        if proc.is_export {
-            let key = hir::normalize_match_name(&proc.name);
-            let methods = methods_by_name.entry(key.clone()).or_insert_with(|| {
-                symbol_tree.find_methods(&proc.name).into_iter().map(|method| method.id).collect()
-            });
-            let exemptions = exemptions_by_name.entry(key.clone()).or_insert_with(|| {
-                local_handler_exemptions(
-                    ctx,
-                    candidates_by_name.get(&key).map_or(&[], Vec::as_slice),
-                    methods,
-                )
-            });
-            if !exemptions.protects(hir::MethodId { module, local_id: proc.key }) {
-                diagnostics.push(make_diagnostic(proc.name_range, code, ctx));
-            }
+        if proc.is_export
+            && !protected.protects(&proc.name, hir::MethodId { module, local_id: proc.key })
+        {
+            diagnostics.push(make_diagnostic(proc.name_range, code, ctx));
         }
     }
 
@@ -88,69 +52,14 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         if index & 0xff == 0 {
             ctx.check_cancellation();
         }
-        if func.is_export {
-            let key = hir::normalize_match_name(&func.name);
-            let methods = methods_by_name.entry(key.clone()).or_insert_with(|| {
-                symbol_tree.find_methods(&func.name).into_iter().map(|method| method.id).collect()
-            });
-            let exemptions = exemptions_by_name.entry(key.clone()).or_insert_with(|| {
-                local_handler_exemptions(
-                    ctx,
-                    candidates_by_name.get(&key).map_or(&[], Vec::as_slice),
-                    methods,
-                )
-            });
-            if !exemptions.protects(hir::MethodId { module, local_id: func.key }) {
-                diagnostics.push(make_diagnostic(func.name_range, code, ctx));
-            }
+        if func.is_export
+            && !protected.protects(&func.name, hir::MethodId { module, local_id: func.key })
+        {
+            diagnostics.push(make_diagnostic(func.name_range, code, ctx));
         }
     }
 
     diagnostics
-}
-
-#[derive(Default)]
-struct LocalHandlerExemptions {
-    registered_methods: rustc_hash::FxHashSet<hir::MethodId>,
-    syntax_protected: bool,
-}
-
-impl LocalHandlerExemptions {
-    fn protects(&self, method: hir::MethodId) -> bool {
-        self.syntax_protected || self.registered_methods.contains(&method)
-    }
-}
-
-// Registration environments are combined here, but method export/environment semantics stay
-// in HIR: the semantic facade computes the eligible method set in one pass per name.
-fn local_handler_exemptions(
-    ctx: &DiagnosticsContext,
-    matching: &[&hir::NotifyCandidate],
-    methods: &[hir::MethodId],
-) -> LocalHandlerExemptions {
-    if methods.is_empty() {
-        return LocalHandlerExemptions::default();
-    }
-
-    let mut registrations = Vec::new();
-    let mut syntax_protected = false;
-    for (index, candidate) in matching.iter().enumerate() {
-        if index & 0xff == 0 {
-            ctx.check_cancellation();
-        }
-        let verdict = hir::command_module_export_verdict(candidate);
-        if let Some(registration) = verdict.local_registration {
-            registrations.push(registration);
-        }
-        // A resolved local registration must not fall back after its environment
-        // verdict was negative; unresolved receiver protection is projected separately.
-        syntax_protected |= verdict.protects_export;
-    }
-
-    LocalHandlerExemptions {
-        registered_methods: ctx.notify_methods_exported_in_registrations(methods, &registrations),
-        syntax_protected,
-    }
 }
 
 fn make_diagnostic(range: TextRange, code: DiagnosticCode, ctx: &DiagnosticsContext) -> Diagnostic {
@@ -188,6 +97,13 @@ mod tests {
         code: &str,
         run: impl FnOnce(&DiagnosticsContext<'_>) -> Vec<Diagnostic>,
     ) -> Vec<Diagnostic> {
+        check_command_at_with_db(code, |_, ctx| run(ctx))
+    }
+
+    fn check_command_at_with_db(
+        code: &str,
+        run: impl FnOnce(&RootDatabaseImpl, &DiagnosticsContext<'_>) -> Vec<Diagnostic>,
+    ) -> Vec<Diagnostic> {
         let fixture = test_fixture::CfeFixtureBuilder::new("").build();
         crate::test_utils::check_cfe_at_with_db(
             COMMON_COMMAND,
@@ -209,12 +125,12 @@ mod tests {
                 )
                 .unwrap();
             },
-            |_, ctx| {
+            |db, ctx| {
                 assert_eq!(
                     ctx.module_metadata().module_type,
                     bsl_metadata::ModuleType::CommandModule
                 );
-                run(ctx)
+                run(db, ctx)
             },
         )
     }
@@ -654,12 +570,11 @@ mod tests {
     #[test]
     fn same_name_in_foreign_and_unknown_dynamic_slots_remains_uncertain() {
         let code = "&НаКлиенте\nПроцедура Callback() Экспорт\nКонецПроцедуры\n";
-        check_command_at_with(code, |ctx| {
+        check_command_at_with_db(code, |db, ctx| {
             let name = hir::Name::new("Callback");
             let symbol_tree = ctx.symbol_tree();
             let methods = symbol_tree.find_methods(&name);
             let method = methods.first().expect("exported callback method").id;
-            let method_ids = methods.iter().map(|method| method.id).collect::<Vec<_>>();
             let constructor_range = TextRange::new(0.into(), 10.into());
             let foreign_callback_expr = hir::ExprId::from_raw(0.into());
             let unknown_callback_expr = hir::ExprId::from_raw(1.into());
@@ -721,21 +636,41 @@ mod tests {
             incomplete_candidate.site_reachable = false;
             assert!(!hir::command_module_export_verdict(&incomplete_candidate).global_uncertainty);
 
-            let site_is_not_disproved_by_other_slot = local_handler_exemptions(
-                ctx,
-                &[&foreign_candidate, &unknown_candidate],
-                &method_ids,
-            )
-            .protects(method);
+            let protection = |candidates| {
+                hir::command_module_export_protection(
+                    db,
+                    || std::sync::Arc::new(candidates),
+                    || ctx.symbol_tree(),
+                )
+                .expect("complete semantic verdict")
+            };
+            let mixed = protection(vec![foreign_candidate.clone(), unknown_candidate]);
+            let site_is_not_disproved_by_other_slot = mixed.protects(&name, method);
+            let routed_method = hir::MethodId {
+                module: hir::ModuleId::new(FileId::from_raw(123)),
+                local_id: method.local_id,
+            };
+            assert!(mixed.protects(&name, routed_method), "uncertain name survives routed IDs");
             assert!(
                 site_is_not_disproved_by_other_slot,
                 "a foreign receiver in slot 1 must not prove an unknown slot 2"
             );
 
             // The exact same foreign receiver does disprove that particular slot.
-            assert!(
-                !local_handler_exemptions(ctx, &[&foreign_candidate], &method_ids).protects(method)
-            );
+            assert!(!protection(vec![foreign_candidate]).protects(&name, method));
+            assert!(hir::command_module_export_protection(
+                db,
+                || std::sync::Arc::new(vec![incomplete_candidate.clone()]),
+                || ctx.symbol_tree(),
+            )
+            .is_some());
+            incomplete_candidate.site_reachable = true;
+            assert!(hir::command_module_export_protection(
+                db,
+                || std::sync::Arc::new(vec![incomplete_candidate]),
+                || ctx.symbol_tree(),
+            )
+            .is_none());
             Vec::new()
         });
     }

@@ -380,14 +380,10 @@ impl<'a> AnalysisContext<'a> {
         self.query(|p| p.qualified_method_declarations(self.file_id, module_name, method_name))
     }
 
-    pub(crate) fn notify_methods_exported_in_registrations(
+    pub(crate) fn command_module_export_protection(
         &self,
-        methods: &[hir::MethodId],
-        registrations: &[&hir::call_graph::NotifyReg],
-    ) -> rustc_hash::FxHashSet<hir::MethodId> {
-        self.query(|p| {
-            p.notify_methods_exported_in_registrations(self.file_id, methods, registrations)
-        })
+    ) -> Option<hir::CommandModuleExportProtection> {
+        self.query(|p| p.command_module_export_protection(self.file_id))
     }
 
     pub(crate) fn notify_handler_availability_in_registration(

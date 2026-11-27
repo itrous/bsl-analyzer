@@ -24,8 +24,9 @@ pub use hir_ty::{
 pub use hir_ty::{is_form_items_collection_ty, FORM_ITEMS_TYPE_EN, FORM_ITEMS_TYPE_RU};
 pub use hir_ty::{
     method_has_form_context, notify_handler_availability_for_method_bodies_in_registration,
-    notify_handler_availability_in_registration, notify_method_is_exported_in_registration,
-    notify_methods_exported_in_registrations, owner_has_form_context, NotifyHandlerAvailability,
+    notify_handler_availability_in_registration, notify_handler_methods,
+    notify_method_is_exported_in_registration, notify_methods_exported_in_registrations,
+    owner_has_form_context, NotifyHandlerAvailability,
 };
 pub use hir_ty::{PlatformMethodHandle, PlatformMethodOrigin};
 pub use name_classify::{classify_token, NameClass};
@@ -235,7 +236,8 @@ pub use hir_ty::narrow::{
     NarrowState,
 };
 pub use hir_ty::notify_export_protection::{
-    command_module_export_verdict, CommandModuleExportVerdict,
+    command_module_export_protection, command_module_export_verdict, CommandModuleExportProtection,
+    CommandModuleExportVerdict,
 };
 pub use hir_ty::notify_targets::{
     semantic_module_call_summary_effective_query, semantic_module_call_summary_query,

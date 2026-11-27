@@ -96,6 +96,33 @@ fn an_exhausted_notify_projection_withholds_the_outgoing_answer_end_to_end() {
         summary.notify_dynamic_signature_analysis_incomplete.len(),
     );
 
+    let workspace =
+        analysis.workspace_diagnostics(&[big], ide::DiagnosticsConfig::all_enabled().to_input());
+    assert_eq!(workspace.len(), 1);
+    let expected = ide_diagnostics::DiagnosticsCompleteness::Incomplete {
+        reason: ide_diagnostics::DiagnosticsIncompleteReason::NotifyProjection,
+    };
+    assert_eq!(
+        workspace[0].1.completeness, expected,
+        "the public workspace API must preserve diagnostic completeness",
+    );
+    let result_alias = analysis
+        .workspace_diagnostics_result(&[big], ide::DiagnosticsConfig::all_enabled().to_input());
+    assert_eq!(result_alias[0].1.completeness, expected);
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+    let parallel = analysis.workspace_diagnostics_parallel(
+        &[big],
+        ide::DiagnosticsConfig::all_enabled().to_input(),
+        &pool,
+    );
+    assert_eq!(parallel[0].1.completeness, expected);
+    let parallel_alias = analysis.workspace_diagnostics_result_parallel(
+        &[big],
+        ide::DiagnosticsConfig::all_enabled().to_input(),
+        &pool,
+    );
+    assert_eq!(parallel_alias[0].1.completeness, expected);
+
     // The big module's anchor is withheld: `None` is distinguishable from the
     // empty complete answer a leaf method would legitimately produce.
     let big_text = db.file_text(big);

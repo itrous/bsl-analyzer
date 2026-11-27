@@ -1868,17 +1868,16 @@ pub fn handle_workspace_diagnostic(
     let mut done = 0usize;
     for chunk in file_ids.chunks(CHUNK) {
         let computed = if dirty_ids.is_empty() {
-            ctx.analysis.workspace_diagnostics_result(chunk, scoped_config.clone())
+            ctx.analysis.workspace_diagnostics(chunk, scoped_config.clone())
         } else {
             // Dirty buffers analyze without the scope (their disk hunks are
             // stale); everything else keeps the filtered config.
             let (dirty, clean): (Vec<vfs::FileId>, Vec<vfs::FileId>) =
                 chunk.iter().copied().partition(|file_id| dirty_ids.contains(file_id));
-            let mut computed =
-                ctx.analysis.workspace_diagnostics_result(&clean, scoped_config.clone());
+            let mut computed = ctx.analysis.workspace_diagnostics(&clean, scoped_config.clone());
             let mut unscoped = ctx.diagnostics_config.clone();
             unscoped.scope = None;
-            computed.extend(ctx.analysis.workspace_diagnostics_result(&dirty, unscoped));
+            computed.extend(ctx.analysis.workspace_diagnostics(&dirty, unscoped));
             computed
         };
         if let Some((_, result)) =

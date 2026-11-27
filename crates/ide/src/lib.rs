@@ -342,8 +342,9 @@ impl Analysis {
     /// Diagnostics for a whole set of files (the LSP `workspace/diagnostic` sweep).
     ///
     /// A thin loop over the per-file query: each file rides the same Salsa-memoized
-    /// `file_diagnostics_query` as push and single-document pull, so results are
-    /// identical and already-computed files are free. Peak memory is bounded by the
+    /// `file_diagnostics_result_query` as push and single-document pull, so results are
+    /// identical and already-computed files are free. Each entry preserves whether its
+    /// diagnostics are complete. Peak memory is bounded by the
     /// queries' own LRU caps (which evict at revision boundaries) — the caller must not
     /// force LRU eviction from a background worker, which would contend with the live
     /// database. Cancellation is automatic: a concurrent edit bumps the revision and the
@@ -351,17 +352,6 @@ impl Analysis {
     /// A file changed on disk under the sweep unwinds the same way, as
     /// `Cancelled::PendingWrite`, and the sweep is retried once the change is applied.
     pub fn workspace_diagnostics(
-        &self,
-        file_ids: &[FileId],
-        config: DiagnosticsConfigInput,
-    ) -> Vec<(FileId, Arc<Vec<Diagnostic>>)> {
-        self.workspace_diagnostics_result(file_ids, config)
-            .into_iter()
-            .map(|(file_id, result)| (file_id, Arc::new(result.diagnostics.clone())))
-            .collect()
-    }
-
-    pub fn workspace_diagnostics_result(
         &self,
         file_ids: &[FileId],
         config: DiagnosticsConfigInput,
@@ -392,6 +382,15 @@ impl Analysis {
                 }
             })
             .collect()
+    }
+
+    /// Compatibility alias for [`Self::workspace_diagnostics`].
+    pub fn workspace_diagnostics_result(
+        &self,
+        file_ids: &[FileId],
+        config: DiagnosticsConfigInput,
+    ) -> Vec<(FileId, Arc<ide_diagnostics::DiagnosticsResult>)> {
+        self.workspace_diagnostics(file_ids, config)
     }
 
     /// Load every configuration root ON THIS THREAD, before a parallel region opens.
@@ -439,7 +438,7 @@ impl Analysis {
     }
 
     /// Parallel variant of [`Self::workspace_diagnostics`] for the deferred whole-project
-    /// batch. Each file's Salsa-memoised `file_diagnostics_query` runs on the caller's
+    /// batch. Each file's Salsa-memoised `file_diagnostics_result_query` runs on the caller's
     /// bounded `pool`, each rayon worker on its own `db` snapshot (`db.clone()` shares the
     /// memo tables, so already-computed files stay free and interactive stays warm). The
     /// pool is the caller's — sized below the core count — so the batch never saturates the
@@ -449,18 +448,6 @@ impl Analysis {
     /// `salsa::Cancelled` (including a file changed on disk under analysis) unwinds out of
     /// the pool to abort the chunk, a per-file compute panic skips just that file.
     pub fn workspace_diagnostics_parallel(
-        &self,
-        file_ids: &[FileId],
-        config: DiagnosticsConfigInput,
-        pool: &rayon::ThreadPool,
-    ) -> Vec<(FileId, Arc<Vec<Diagnostic>>)> {
-        self.workspace_diagnostics_result_parallel(file_ids, config, pool)
-            .into_iter()
-            .map(|(file_id, result)| (file_id, Arc::new(result.diagnostics.clone())))
-            .collect()
-    }
-
-    pub fn workspace_diagnostics_result_parallel(
         &self,
         file_ids: &[FileId],
         config: DiagnosticsConfigInput,
@@ -510,6 +497,16 @@ impl Analysis {
                 .filter_map(|result| result)
                 .collect()
         })
+    }
+
+    /// Compatibility alias for [`Self::workspace_diagnostics_parallel`].
+    pub fn workspace_diagnostics_result_parallel(
+        &self,
+        file_ids: &[FileId],
+        config: DiagnosticsConfigInput,
+        pool: &rayon::ThreadPool,
+    ) -> Vec<(FileId, Arc<ide_diagnostics::DiagnosticsResult>)> {
+        self.workspace_diagnostics_parallel(file_ids, config, pool)
     }
 
     pub fn warm_caches_task(&self, file_ids: &[FileId]) -> WarmCachesTask {

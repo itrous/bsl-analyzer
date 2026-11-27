@@ -106,13 +106,15 @@ impl AnalysisProvider for SalsaProvider<'_> {
         hir::notify_method_is_exported_in_registration(self.db, registration, method, methods)
     }
 
-    fn notify_methods_exported_in_registrations(
+    fn command_module_export_protection(
         &self,
-        _file_id: FileId,
-        methods: &[hir::MethodId],
-        registrations: &[&hir::call_graph::NotifyReg],
-    ) -> rustc_hash::FxHashSet<hir::MethodId> {
-        hir::notify_methods_exported_in_registrations(self.db, methods, registrations)
+        file_id: FileId,
+    ) -> Option<hir::CommandModuleExportProtection> {
+        hir::command_module_export_protection(
+            self.db,
+            || self.notify_candidates(file_id),
+            || self.symbol_tree(ModuleId::new(file_id)),
+        )
     }
 
     fn configuration(&self) -> Option<Arc<Configuration>> {
@@ -194,48 +196,13 @@ impl AnalysisProvider for SalsaProvider<'_> {
     }
 
     fn notify_handler_methods(&self, file_id: FileId, name: &Name) -> Vec<MethodId> {
-        // The routed symbol tree is the spliced base for an effective module: methods the
-        // extension adds outside `&ИзменениеИКонтроль` are not part of that text, yet the
-        // platform still resolves a callback string against the combined object. Add them
-        // from the extension's own tree, skipping interceptors — their name belongs to the
-        // extension wrapper, not to a callable exported method.
-        let mut methods = self
-            .symbol_tree(ModuleId::new(file_id))
-            .find_methods(name)
-            .into_iter()
-            .map(|method| method.id)
-            .collect::<Vec<_>>();
-        if self.effective_for(file_id).is_some() {
-            methods.extend(
-                self.db
-                    .symbol_tree(ModuleId::new(file_id))
-                    .find_methods(name)
-                    .into_iter()
-                    .filter(|method| {
-                        self.db.interface_method(method.id).is_none_or(|declaration| {
-                            !declaration
-                                .directives
-                                .iter()
-                                .any(|directive| directive.is_interception())
-                        })
-                    })
-                    .map(|method| method.id),
-            );
-        }
-        if let Some(route) = self.weaving_for(file_id) {
-            methods.extend(
-                self.db
-                    .symbol_tree(ModuleId::new(route.base_file(self.db)))
-                    .find_methods(name)
-                    .into_iter()
-                    .map(|method| method.id),
-            );
-        }
-        // Effective and weaving routes can both contribute the base declaration; the
-        // registration verdict evaluates each declaration's environment once.
-        let mut seen = rustc_hash::FxHashSet::default();
-        methods.retain(|method| seen.insert(*method));
-        methods
+        hir::notify_handler_methods(
+            self.db,
+            file_id,
+            name,
+            self.effective_for(file_id),
+            self.weaving_for(file_id),
+        )
     }
 
     fn notify_handler_availability_in_registration(

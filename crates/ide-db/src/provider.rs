@@ -140,13 +140,13 @@ pub trait AnalysisProvider {
         false
     }
 
-    fn notify_methods_exported_in_registrations(
+    /// Command-module export protection, or `None` when semantic facts cannot
+    /// safely classify the module's exports.
+    fn command_module_export_protection(
         &self,
         _file_id: FileId,
-        _methods: &[MethodId],
-        _registrations: &[&NotifyReg],
-    ) -> rustc_hash::FxHashSet<MethodId> {
-        rustc_hash::FxHashSet::default()
+    ) -> Option<hir::CommandModuleExportProtection> {
+        None
     }
 
     /// Local declarations that may satisfy a callback on the current module object.

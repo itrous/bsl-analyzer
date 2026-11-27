@@ -12,6 +12,14 @@ fn platform_help_none_silences_registered_and_ordinary_command_exports() {
         Ok(InstallOutcome::Installed)
     );
 
+    let db = ide_db::RootDatabaseImpl::new();
+    assert!(hir::command_module_export_protection(
+        &db,
+        || panic!("missing platform facts must not evaluate candidates"),
+        || panic!("missing platform facts must not evaluate symbols"),
+    )
+    .is_none());
+
     let (diagnostics, _) = command_module_export_methods::command_module_export_diagnostics();
     assert!(
         diagnostics.is_empty(),

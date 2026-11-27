@@ -696,6 +696,17 @@ impl ide_db::provider::AnalysisProvider for MetadataTestProvider {
         hir::semantic_notify_candidates_query(&self.db, input)
     }
 
+    fn command_module_export_protection(
+        &self,
+        file_id: vfs::FileId,
+    ) -> Option<hir::CommandModuleExportProtection> {
+        hir::command_module_export_protection(
+            &self.db,
+            || self.notify_candidates(file_id),
+            || self.symbol_tree(hir::ModuleId::new(file_id)),
+        )
+    }
+
     fn call_summary(&self, module_id: hir::ModuleId) -> std::sync::Arc<hir::ModuleCallSummary> {
         use hir::DefDatabase;
 

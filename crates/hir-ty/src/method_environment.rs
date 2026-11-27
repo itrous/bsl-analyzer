@@ -1,6 +1,8 @@
 use hir_def::call_graph::NotifyReg;
+use hir_def::effective_module::EffectiveModuleId;
 use hir_def::execution_env::{self, EnvFlags, EnvOptions};
-use hir_def::MethodId;
+use hir_def::weaving::WeavingModuleId;
+use hir_def::{MethodId, ModuleId, Name};
 use rustc_hash::FxHashSet;
 
 use crate::db::HirDatabase;
@@ -54,6 +56,59 @@ pub(crate) fn possible_method_env(
         return None;
     }
     Some(environment & (decl.preproc_env | decl.preproc_undecided))
+}
+
+/// Local declarations that may satisfy a callback on the current module object,
+/// including paired base declarations for effective and weaving routes.
+pub fn notify_handler_methods(
+    db: &dyn HirDatabase,
+    file_id: vfs::FileId,
+    name: &Name,
+    effective: Option<EffectiveModuleId<'_>>,
+    weaving: Option<WeavingModuleId<'_>>,
+) -> Vec<MethodId> {
+    let mut methods: Vec<MethodId> = match effective {
+        Some(eid) => hir_def::effective_module::symbol_tree_effective(db, eid)
+            .find_methods(name)
+            .into_iter()
+            .map(|method| method.id)
+            .collect(),
+        None => db
+            .symbol_tree(ModuleId::new(file_id))
+            .find_methods(name)
+            .into_iter()
+            .map(|method| method.id)
+            .collect(),
+    };
+
+    if effective.is_some() {
+        // The splice omits extension additions outside change-and-validate methods. Those
+        // declarations remain visible on the combined object, except interceptors: their name
+        // identifies the wrapper rather than a callable callback handler.
+        methods.extend(
+            db.symbol_tree(ModuleId::new(file_id))
+                .find_methods(name)
+                .into_iter()
+                .filter(|method| {
+                    db.interface_method(method.id).is_none_or(|declaration| {
+                        !declaration.directives.iter().any(|directive| directive.is_interception())
+                    })
+                })
+                .map(|method| method.id),
+        );
+    }
+    if let Some(wid) = weaving {
+        methods.extend(
+            db.symbol_tree(ModuleId::new(wid.base_file(db)))
+                .find_methods(name)
+                .into_iter()
+                .map(|method| method.id),
+        );
+    }
+
+    let mut seen = FxHashSet::default();
+    methods.retain(|method| seen.insert(*method));
+    methods
 }
 
 /// Outcome of checking declarations provide an exported handler in every proven
