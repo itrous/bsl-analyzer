@@ -103,6 +103,7 @@ impl LoweringContext<'_> {
         }
 
         let mut ty = self.scope.resolve_column_type(table_alias_str, column_name_str);
+        let first_hop_ty = ty.clone();
 
         // `Алиас.Поле.ПодПоле…`: navigate through reference-typed fields so the
         // projected column carries the final attribute type, not the reference
@@ -172,6 +173,35 @@ impl LoweringContext<'_> {
             });
         }
 
+        // Hops past the first. The first hop's own existence is decided above; this runs only
+        // when it resolved to a type, so one reference never yields two `UnknownField`s.
+        if parts.len() >= 3 {
+            if let Some(alias) = table_alias_str {
+                // Provenance: the first hop's type must come from a declared attribute of a
+                // metadata table. A temporary table, a nested query or the select-list outputs
+                // carry types inferred from expressions (`ВЫРАЗИТЬ(... КАК Т).Поле` is typed as
+                // `Т`, not as `Поле`), and walking from such a type lands on the wrong object.
+                let declared_first_hop = self
+                    .scope
+                    .find_table(alias)
+                    .and_then(|table| table.metadata.as_ref())
+                    .is_some_and(|m| {
+                        matches!(
+                            m,
+                            crate::hir::ResolvedTable::Metadata { .. }
+                                | crate::hir::ResolvedTable::Register { .. }
+                        ) && !m.column_is_provisional(column_name_str)
+                    });
+                if declared_first_hop {
+                    if let Some(diagnostic) =
+                        self.check_nested_hops(&first_hop_ty, &parts, &ident_ranges)
+                    {
+                        self.diagnostics.push(diagnostic);
+                    }
+                }
+            }
+        }
+
         for (idx, (range, token_text)) in name_tokens.iter().enumerate() {
             if idx == 0 && parts.len() >= 2 {
                 self.source_map.add_token(
@@ -209,6 +239,86 @@ impl LoweringContext<'_> {
         }
 
         ExprHir::ColumnRef { parts, ty, range: ref_range }
+    }
+
+    /// Reports the first hop past the first that is provably absent from the object the previous
+    /// hop points at, or `None` whenever absence cannot be proven.
+    ///
+    /// The field set is built the way a FROM-clause table of that object is built, NOT with
+    /// `Scope::resolve_ref_fields`: that one omits the virtual query fields (`Представление`,
+    /// `МоментВремени`) and has no notion of completeness, so it would flag valid code.
+    fn check_nested_hops(
+        &self,
+        first_hop_ty: &SdblType,
+        parts: &[Name],
+        ident_ranges: &[TextRange],
+    ) -> Option<SdblDiagnostic> {
+        // Same cap as `Scope::resolve_nested_field_type`.
+        const MAX_DEPTH: usize = 10;
+        if parts.len() - 1 > MAX_DEPTH || ident_ranges.len() != parts.len() {
+            return None;
+        }
+
+        let mut current = first_hop_ty.clone();
+        for index in 2..parts.len() {
+            let mut fields = Vec::new();
+            let (complete, table_name) = match &current {
+                // `cfg:Characteristic.X` (a value typed by the chart's `ТипЗначения`, an open
+                // type) is lowered into the same `Ref` as a genuine reference to the chart, so
+                // the field model behind it is not provably complete.
+                SdblType::Ref(mdo_ref)
+                    if mdo_ref.mdo_type == bsl_metadata::MdoType::ChartOfCharacteristicTypes =>
+                {
+                    return None;
+                }
+                SdblType::Ref(mdo_ref) => {
+                    let table_name =
+                        format!("{}.{}", mdo_ref.mdo_type.russian_name(), mdo_ref.name);
+                    let complete = self.add_metadata_fields(
+                        mdo_ref.mdo_type,
+                        &mdo_ref.name,
+                        None,
+                        &table_name,
+                        &mut fields,
+                    );
+                    (complete, table_name)
+                }
+                SdblType::TabularSectionRef { parent_mdo_type, parent_mdo_name, ts_name } => {
+                    let table_name = format!(
+                        "{}.{}.{}",
+                        parent_mdo_type.russian_name(),
+                        parent_mdo_name,
+                        ts_name
+                    );
+                    let complete = self.add_tabular_section_fields(
+                        *parent_mdo_type,
+                        parent_mdo_name,
+                        ts_name,
+                        &table_name,
+                        &mut fields,
+                    );
+                    (complete, table_name)
+                }
+                _ => return None,
+            };
+            if !complete {
+                return None;
+            }
+
+            let name = parts[index].as_str();
+            let Some(field) = fields.iter().find(|f| f.matches_name(name)) else {
+                return Some(SdblDiagnostic::UnknownField {
+                    table_name,
+                    field_name: name.to_string(),
+                    range: ident_ranges[index],
+                });
+            };
+            if field.provisional {
+                return None;
+            }
+            current = field.ty.clone();
+        }
+        None
     }
 
     fn lower_literal(&mut self, node: &syntax::SyntaxNode) -> ExprHir {
