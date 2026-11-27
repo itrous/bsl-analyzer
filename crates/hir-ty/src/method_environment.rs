@@ -66,18 +66,28 @@ pub enum NotifyHandlerAvailability {
     Unknown,
 }
 
-/// Checks same-module callback declarations against one registration.
+/// Checks same-module callback declarations against one registration, accounting for
+/// form surfaces that are not represented by the supplied declarations.
 pub fn notify_handler_availability_in_registration(
     db: &dyn HirDatabase,
+    module: hir_def::ModuleId,
     registration: &NotifyReg,
     methods: &[MethodId],
 ) -> NotifyHandlerAvailability {
-    notify_handler_availability_for_method_bodies_in_registration(
-        db,
-        registration,
-        &[methods.to_vec()],
-        false,
-    )
+    let metadata = db.module_metadata(module);
+    // A base form can supply a handler outside the local declaration surface.
+    if !notify_form_is_eligible(&metadata)
+        || metadata.form.as_deref().is_some_and(|form| form.has_base_form())
+    {
+        return NotifyHandlerAvailability::Unknown;
+    }
+    notify_handler_availability_for_bodies(db, registration, &[methods.to_vec()], false)
+}
+
+fn notify_form_is_eligible(metadata: &hir_def::ModuleMetadata) -> bool {
+    // Ordinary and unreadable forms cannot be judged by the managed-form contract.
+    metadata.module_type != bsl_metadata::ModuleType::FormModule
+        || metadata.form.as_deref().is_some_and(|form| form.is_managed())
 }
 
 /// Whether this exported declaration participates in a registration.
@@ -133,8 +143,22 @@ pub fn notify_methods_exported_in_registrations(
 /// declarations are combined because conditional declarations may provide complementary
 /// runtime surfaces. A later body is considered only in environments where earlier bodies
 /// have no possible declaration. `incomplete_tail` keeps unread or unmapped expected bodies
-/// from being mistaken for a definitive absence.
+/// from being mistaken for a definitive absence. Form eligibility is determined from the
+/// module containing the registration; a base form does not affect a foreign module's surface.
 pub fn notify_handler_availability_for_method_bodies_in_registration(
+    db: &dyn HirDatabase,
+    module: hir_def::ModuleId,
+    registration: &NotifyReg,
+    method_bodies: &[Vec<MethodId>],
+    incomplete_tail: bool,
+) -> NotifyHandlerAvailability {
+    if !notify_form_is_eligible(&db.module_metadata(module)) {
+        return NotifyHandlerAvailability::Unknown;
+    }
+    notify_handler_availability_for_bodies(db, registration, method_bodies, incomplete_tail)
+}
+
+fn notify_handler_availability_for_bodies(
     db: &dyn HirDatabase,
     registration: &NotifyReg,
     method_bodies: &[Vec<MethodId>],

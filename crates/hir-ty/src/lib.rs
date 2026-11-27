@@ -26,6 +26,7 @@ pub mod min_platform;
 pub mod module_implicit;
 pub mod narrow;
 pub(crate) mod notify_array;
+pub mod notify_export_protection;
 pub mod notify_targets;
 pub mod object_resolver;
 pub mod platform_global_lookup;
@@ -88,6 +89,7 @@ pub use method_environment::{
 pub use method_lookup::{lookup_method, MethodInfo};
 pub use method_resolution::{resolve_qualified_call, MethodResolution};
 pub use module_implicit::module_implicit_fields;
+pub use notify_export_protection::{command_module_export_verdict, CommandModuleExportVerdict};
 pub use object_resolver::{
     ConfigsObjectResolver, DbObjectResolver, MetadataResolution, ObjectResolver,
 };

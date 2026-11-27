@@ -5,6 +5,7 @@ use bsl_metadata::MdObject;
 use bsl_platform::PlatformDataInner;
 use bsl_types::kind::TypeKind;
 use hir_def::body::Body;
+pub use hir_def::call_graph::NotifyCallbackSlot;
 use hir_def::call_graph::{
     CallerId, DynamicNotifySignatureAnalysisGap, ModuleCallSummary, NotifyConstructorCandidate,
     NotifyReceiverSyntax, NotifyReg, NotifyTarget,
@@ -38,13 +39,6 @@ pub enum NotifyCandidateKind {
     Static,
     Dynamic,
     DynamicArray,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NotifyCallbackSlot {
-    Handler,
-    ErrorHandler,
-    Unknown,
 }
 
 /// Semantic verdict for `UnusedParameters`: may the platform invoke this callback with
@@ -944,7 +938,6 @@ fn syntax_only_static_candidates(
     let protect_source_fallback = !bsl_platform::has_callback_description_constructor_facts(
         bsl_platform::PlatformData::instance(),
     );
-    let slots = bsl_platform::bundled_callback_description_slots();
     let mut source_names: FxHashSet<NormName> = FxHashSet::default();
     for source in summary
         .notify_signature_handlers
@@ -986,22 +979,11 @@ fn syntax_only_static_candidates(
         if !bsl_platform::is_callback_description_type_name(type_name) {
             continue;
         }
-        for (slot, handler_arg, receiver_arg) in [
-            (
-                NotifyCallbackSlot::Handler,
-                slots.handler + slot_offset,
-                slots.receiver + slot_offset,
-            ),
-            (
-                NotifyCallbackSlot::ErrorHandler,
-                slots.error_handler + slot_offset,
-                slots.error_receiver + slot_offset,
-            ),
-        ] {
+        for (handler_arg, receiver_arg, slot) in NotifyCallbackSlot::callback_description_slots() {
             if !budget.spend() {
                 return result;
             }
-            let Some(&handler_expr) = args.get(handler_arg) else { continue };
+            let Some(&handler_expr) = args.get(handler_arg + slot_offset) else { continue };
             let Expr::Literal(Literal::String(name)) = body.expr_idx(handler_expr) else {
                 continue;
             };
@@ -1014,13 +996,9 @@ fn syntax_only_static_candidates(
             if classified_keys.contains(&key) {
                 continue;
             }
-            let receiver_syntax =
-                args.get(receiver_arg).map_or(NotifyReceiverSyntax::Other, |&receiver| match body
-                    .expr_idx(receiver)
-                {
-                    Expr::Path(name) => NotifyReceiverSyntax::for_bare_name(name),
-                    _ => NotifyReceiverSyntax::Other,
-                });
+            let receiver =
+                args.get(receiver_arg + slot_offset).map(|&receiver| ExprId::from_idx(receiver));
+            let receiver_syntax = NotifyReceiverSyntax::for_receiver(body, receiver);
             if !receiver_syntax.may_name_local_callback() {
                 continue;
             }
@@ -1407,7 +1385,7 @@ fn normalize_owner_candidates(
             };
             let Some(callback_name) = string_literal_id(body, callback_expr) else { continue };
             let receiver = receiver_argument.and_then(argument_expr);
-            let receiver_syntax = receiver_syntax(body, receiver);
+            let receiver_syntax = NotifyReceiverSyntax::for_receiver(body, receiver);
             let registration = build_notify_registration(
                 db,
                 candidate,
@@ -1555,13 +1533,6 @@ fn string_literal_id(body: &Body, expr: ExprId) -> Option<&str> {
     match body.expr(expr) {
         Expr::Literal(Literal::String(value)) => Some(value),
         _ => None,
-    }
-}
-
-fn receiver_syntax(body: &Body, receiver: Option<ExprId>) -> NotifyReceiverSyntax {
-    match receiver.map(|expr| body.expr(expr)) {
-        Some(Expr::Path(name)) => NotifyReceiverSyntax::for_bare_name(name),
-        _ => NotifyReceiverSyntax::Other,
     }
 }
 

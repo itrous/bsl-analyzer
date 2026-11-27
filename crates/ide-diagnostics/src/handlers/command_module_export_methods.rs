@@ -48,7 +48,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
             ctx.check_cancellation();
         }
         has_reachable_incomplete_candidate |=
-            candidate.site_reachable && candidate.analysis_incomplete;
+            hir::command_module_export_verdict(candidate).global_uncertainty;
         candidates_by_name
             .entry(hir::normalize_match_name(&candidate.callback_name))
             .or_default()
@@ -138,23 +138,13 @@ fn local_handler_exemptions(
         if index & 0xff == 0 {
             ctx.check_cancellation();
         }
-        if candidate.receiver == hir::NotifyCandidateReceiver::ThisObject {
-            if let Some(registration) = candidate.registration.as_ref() {
-                registrations.push(registration);
-            }
+        let verdict = hir::command_module_export_verdict(candidate);
+        if let Some(registration) = verdict.local_registration {
+            registrations.push(registration);
         }
-        // Syntax-only candidates, unresolved dynamic arrays and local bindings of
-        // unknown value are conservative; only a proven foreign receiver at this exact
-        // expression can rule them out. A resolved ThisObject registration must not fall
-        // back after its environment verdict was negative.
-        syntax_protected |= candidate.site_reachable
-            && candidate.protects_local_method
-            && (candidate.registration.is_none()
-                || matches!(
-                    candidate.receiver,
-                    hir::NotifyCandidateReceiver::Unknown
-                        | hir::NotifyCandidateReceiver::LocalBinding
-                ));
+        // A resolved local registration must not fall back after its environment
+        // verdict was negative; unresolved receiver protection is projected separately.
+        syntax_protected |= verdict.protects_export;
     }
 
     LocalHandlerExemptions {
@@ -276,6 +266,10 @@ mod tests {
                 hir::NotifySignatureProtection::NotProtected,
                 "uncertainty must not become a proven-foreign verdict"
             );
+            assert!(
+                hir::command_module_export_verdict(candidate).protects_export,
+                "uncertainty must protect the export"
+            );
             let mut diagnostics = super::check(ctx);
             diagnostics.extend(crate::handlers::unused_parameters::check(ctx));
             diagnostics
@@ -322,6 +316,7 @@ mod tests {
                 "{candidate:#?}"
             );
             assert!(!candidate.protects_local_method);
+            assert!(!hir::command_module_export_verdict(candidate).protects_export);
             let mut diagnostics = super::check(ctx);
             diagnostics.extend(crate::handlers::unused_parameters::check(ctx));
             diagnostics
@@ -706,6 +701,26 @@ mod tests {
                 analysis_incomplete: false,
                 registration: None,
             };
+            let unknown_verdict = hir::command_module_export_verdict(&unknown_candidate);
+            assert!(!unknown_verdict.global_uncertainty);
+            assert!(unknown_verdict.local_registration.is_none());
+            assert!(unknown_verdict.protects_export);
+
+            let mut unreachable_local_registration = foreign_candidate.clone();
+            unreachable_local_registration.receiver = hir::NotifyCandidateReceiver::ThisObject;
+            unreachable_local_registration.site_reachable = false;
+            let unreachable_verdict =
+                hir::command_module_export_verdict(&unreachable_local_registration);
+            assert!(!unreachable_verdict.global_uncertainty);
+            assert!(unreachable_verdict.local_registration.is_some());
+            assert!(!unreachable_verdict.protects_export);
+
+            let mut incomplete_candidate = unknown_candidate.clone();
+            incomplete_candidate.analysis_incomplete = true;
+            assert!(hir::command_module_export_verdict(&incomplete_candidate).global_uncertainty);
+            incomplete_candidate.site_reachable = false;
+            assert!(!hir::command_module_export_verdict(&incomplete_candidate).global_uncertainty);
+
             let site_is_not_disproved_by_other_slot = local_handler_exemptions(
                 ctx,
                 &[&foreign_candidate, &unknown_candidate],

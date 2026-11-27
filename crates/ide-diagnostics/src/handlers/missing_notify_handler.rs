@@ -36,18 +36,6 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         return Vec::new();
     }
 
-    let metadata = ctx.module_metadata();
-    // The rule is established for managed forms only; missing metadata cannot
-    // prove either the form kind or whether a base form supplies the handler.
-    if metadata.module_type == bsl_metadata::ModuleType::FormModule
-        && !metadata.form.as_deref().is_some_and(|form| form.is_managed())
-    {
-        return Vec::new();
-    }
-
-    // A borrowed form exposes its base module, which is not in this file's symbol tree.
-    let local_unprovable = metadata.form.as_deref().is_some_and(|form| form.has_base_form());
-
     let mut diagnostics = Vec::new();
     let mut reported_slots = FxHashSet::default();
     let mut module_verdicts = FxHashMap::default();
@@ -77,7 +65,6 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
                     (v, format!("{}.{}", module_name.as_str(), reg.callback_name.as_str()))
                 })
             }
-            hir::NotifyCandidateReceiver::ThisObject if local_unprovable => None,
             hir::NotifyCandidateReceiver::ThisObject => {
                 let key = (hir::normalize_match_name(&reg.callback_name), reg.environments);
                 let verdict = *local_verdicts
@@ -975,6 +962,58 @@ mod tests {
         let diagnostics =
             run_with_form_xml(source, BASE_FORM_XML, CfeFixtureBuilder::new("").build());
         assert!(diagnostics.is_empty(), "the base form's module is unseen: {diagnostics:#?}");
+    }
+
+    #[test]
+    fn local_handler_availability_accounts_for_the_base_form() {
+        use hir::NotifyHandlerAvailability as Availability;
+
+        let source = client_context_source(
+            "Процедура Тест()\n\
+             О1 = Новый ОписаниеОповещения(\"Отсутствует\", ЭтотОбъект);\n\
+             О2 = Новый ОписаниеОповещения(\"Локальный\", ЭтотОбъект);\n\
+             О3 = Новый ОписаниеОповещения(\"Экспортный\", ЭтотОбъект);\n\
+             КонецПроцедуры\n\
+             Процедура Локальный()\nКонецПроцедуры\n\
+             Процедура Экспортный() Экспорт\nКонецПроцедуры\n",
+        );
+        for (form_xml, has_base) in [(BASE_FORM_XML, true), (PLAIN_FORM_XML, false)] {
+            let diagnostics = crate::test_utils::check_cfe_at_with_db(
+                CALLER,
+                &source,
+                CfeFixtureBuilder::new("").build(),
+                &[],
+                crate::DiagnosticsConfig::all_enabled(),
+                |fixture| {
+                    let path = fixture.root().join("CommonForms/Форма1/Ext/Form.xml");
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    std::fs::write(path, form_xml).unwrap();
+                },
+                |_, ctx| {
+                    let candidates = ctx.notify_candidates();
+                    assert_eq!(candidates.len(), 3);
+                    for candidate in candidates.iter() {
+                        let registration = candidate.registration.as_ref().unwrap();
+                        let methods = ctx.notify_handler_methods(&registration.callback_name);
+                        let verdict =
+                            ctx.notify_handler_availability_in_registration(registration, &methods);
+                        let expected = if has_base {
+                            Availability::Unknown
+                        } else {
+                            match registration.callback_name.as_str() {
+                                "Отсутствует" => Availability::NotFound,
+                                "Локальный" => Availability::NotExported,
+                                "Экспортный" => Availability::Exported,
+                                name => panic!("unexpected handler {name}"),
+                            }
+                        };
+                        assert_eq!(verdict, expected, "{registration:?}");
+                    }
+                    check(ctx)
+                },
+            );
+            assert_eq!(diagnostics.len(), if has_base { 0 } else { 2 }, "{diagnostics:#?}");
+        }
     }
 
     /// Control for the case above: the same form without `<BaseForm>`.

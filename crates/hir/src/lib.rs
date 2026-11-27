@@ -234,6 +234,9 @@ pub use hir_ty::narrow::{
     narrow_or_base, narrow_or_base_indexed, narrow_query, narrowed_type_at, NarrowExprIndex,
     NarrowState,
 };
+pub use hir_ty::notify_export_protection::{
+    command_module_export_verdict, CommandModuleExportVerdict,
+};
 pub use hir_ty::notify_targets::{
     semantic_module_call_summary_effective_query, semantic_module_call_summary_query,
     semantic_module_call_summary_weaving_query, semantic_notify_candidates_effective_query,

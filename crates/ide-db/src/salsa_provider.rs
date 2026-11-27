@@ -240,22 +240,28 @@ impl AnalysisProvider for SalsaProvider<'_> {
 
     fn notify_handler_availability_in_registration(
         &self,
-        _file_id: FileId,
+        file_id: FileId,
         registration: &NotifyReg,
         methods: &[MethodId],
     ) -> hir::NotifyHandlerAvailability {
-        hir::notify_handler_availability_in_registration(self.db, registration, methods)
+        hir::notify_handler_availability_in_registration(
+            self.db,
+            ModuleId::new(file_id),
+            registration,
+            methods,
+        )
     }
 
     fn notify_handler_availability_for_method_bodies_in_registration(
         &self,
-        _file_id: FileId,
+        file_id: FileId,
         registration: &NotifyReg,
         method_bodies: &[Vec<MethodId>],
         incomplete_tail: bool,
     ) -> hir::NotifyHandlerAvailability {
         hir::notify_handler_availability_for_method_bodies_in_registration(
             self.db,
+            ModuleId::new(file_id),
             registration,
             method_bodies,
             incomplete_tail,

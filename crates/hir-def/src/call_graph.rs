@@ -454,6 +454,14 @@ pub enum NotifyReceiverSyntax {
 }
 
 impl NotifyReceiverSyntax {
+    /// Classify the syntax of a receiver expression without assuming what a name resolves to.
+    pub fn for_receiver(body: &Body, receiver: Option<ExprId>) -> Self {
+        match receiver.map(|expr| body.expr(expr)) {
+            Some(Expr::Path(name)) => Self::for_bare_name(name),
+            _ => Self::Other,
+        }
+    }
+
     /// Classify a bare receiver without assuming what the name resolves to.
     pub fn for_bare_name(name: &Name) -> Self {
         if is_this_receiver(&name.as_str().fold_lower()) {
@@ -468,6 +476,25 @@ impl NotifyReceiverSyntax {
     /// therefore never guesses it into the protected or the foreign side.
     pub fn may_name_local_callback(self) -> bool {
         matches!(self, Self::SelfName | Self::Other)
+    }
+}
+
+/// A callback-description signature slot, shared by syntactic and semantic projections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NotifyCallbackSlot {
+    Handler,
+    ErrorHandler,
+    Unknown,
+}
+
+impl NotifyCallbackSlot {
+    /// Bundled callback-description handler and receiver argument positions.
+    pub fn callback_description_slots() -> [(usize, usize, Self); 2] {
+        let slots = bsl_platform::bundled_callback_description_slots();
+        [
+            (slots.handler, slots.receiver, Self::Handler),
+            (slots.error_handler, slots.error_receiver, Self::ErrorHandler),
+        ]
     }
 }
 
@@ -1376,13 +1403,9 @@ fn extract_notify_handlers(
     if !is_compatibility_name && !is_additional_name {
         return;
     }
-    let slots = bsl_platform::bundled_callback_description_slots();
-
     // Preserve the syntax-only signature protection even for invalid arity. Semantic
     // registration, unlike this compatibility path, requires constructor binding.
-    for (handler_slot, receiver_slot) in
-        [(slots.handler, slots.receiver), (slots.error_handler, slots.error_receiver)]
-    {
+    for (handler_slot, receiver_slot, _) in NotifyCallbackSlot::callback_description_slots() {
         let Some(&handler_idx) = args.get(handler_slot + slot_offset) else { continue };
         let handler = match body.expr_idx(handler_idx) {
             Expr::Literal(Literal::String(handler)) => handler,
@@ -1392,13 +1415,8 @@ fn extract_notify_handlers(
                 continue;
             }
         };
-        let receiver_syntax =
-            args.get(receiver_slot + slot_offset).map_or(NotifyReceiverSyntax::Other, |&idx| {
-                match body.expr_idx(idx) {
-                    Expr::Path(name) => NotifyReceiverSyntax::for_bare_name(name),
-                    _ => NotifyReceiverSyntax::Other,
-                }
-            });
+        let receiver_expr = args.get(receiver_slot + slot_offset).map(|&idx| ExprId::from_idx(idx));
+        let receiver_syntax = NotifyReceiverSyntax::for_receiver(body, receiver_expr);
         if receiver_syntax.may_name_local_callback() {
             if is_compatibility_name {
                 compatibility_handlers.push(Name::new(handler));
@@ -2265,10 +2283,7 @@ fn extract_dynamic_notify_handlers(
         return true;
     }
 
-    let slots = bsl_platform::bundled_callback_description_slots();
-    for (handler_slot, receiver_slot) in
-        [(slots.handler, slots.receiver), (slots.error_handler, slots.error_receiver)]
-    {
+    for (handler_slot, receiver_slot, _) in NotifyCallbackSlot::callback_description_slots() {
         if !alias_resolver.spend(cancel) {
             return false;
         }
@@ -2280,13 +2295,8 @@ fn extract_dynamic_notify_handlers(
         if !is_identifier_like(&handler) {
             continue;
         }
-        let receiver_syntax =
-            values.get(receiver_slot).map_or(NotifyReceiverSyntax::Other, |&idx| {
-                match body.expr_idx(idx) {
-                    Expr::Path(name) => NotifyReceiverSyntax::for_bare_name(name),
-                    _ => NotifyReceiverSyntax::Other,
-                }
-            });
+        let receiver_expr = values.get(receiver_slot).map(|&idx| ExprId::from_idx(idx));
+        let receiver_syntax = NotifyReceiverSyntax::for_receiver(body, receiver_expr);
         if receiver_syntax.may_name_local_callback() {
             push_dynamic_notify_handler(
                 &handler,
@@ -3685,6 +3695,18 @@ EndProcedure
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn callback_description_slots_share_the_bundled_handler_receiver_pairs() {
+        let slots = bsl_platform::bundled_callback_description_slots();
+        assert_eq!(
+            NotifyCallbackSlot::callback_description_slots(),
+            [
+                (slots.handler, slots.receiver, NotifyCallbackSlot::Handler),
+                (slots.error_handler, slots.error_receiver, NotifyCallbackSlot::ErrorHandler,),
+            ]
+        );
     }
 
     #[test]
