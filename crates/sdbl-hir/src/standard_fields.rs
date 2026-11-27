@@ -2,6 +2,61 @@ use bsl_metadata::MdoType;
 use std::fmt;
 use stdx::case::CaseExt;
 
+use crate::hir::FieldDef;
+use crate::types::SdblType;
+
+const POINT_IN_TIME: &str = "МоментВремени";
+
+/// Query-only fields of a reference table that `StandardAttributeKind` does not list: present
+/// on every reference table (ITS ch.18 / §8.3), and `МоментВремени` (date + ref) on documents
+/// only, with no BSL object-model counterpart.
+const REFERENCE_VIRTUAL_QUERY_FIELDS: [(&str, &str); 3] = [
+    ("Представление", "Presentation"),
+    ("ВерсияДанных", "DataVersion"),
+    (POINT_IN_TIME, "PointInTime"),
+];
+
+/// Whether `name` is one of the query-only virtual fields of a reference table, in either language.
+pub(crate) fn is_document_virtual_query_field(name: &str) -> bool {
+    REFERENCE_VIRTUAL_QUERY_FIELDS.iter().any(|(ru, en)| {
+        stdx::case::eq_ignore_case(ru, name) || stdx::case::eq_ignore_case(en, name)
+    })
+}
+
+/// Whether `mdo_type` is a reference table kind exposing query-only virtual fields.
+pub(crate) fn is_reference_table_mdo_type(mdo_type: MdoType) -> bool {
+    matches!(
+        mdo_type,
+        MdoType::Catalog
+            | MdoType::Document
+            | MdoType::BusinessProcess
+            | MdoType::Task
+            | MdoType::ExchangePlan
+            | MdoType::ChartOfCharacteristicTypes
+            | MdoType::ChartOfAccounts
+            | MdoType::ChartOfCalculationTypes
+    )
+}
+
+/// Appends the query-only virtual fields of a reference table (`Представление`, `ВерсияДанных`,
+/// and `МоментВремени` for documents) to `fields`, skipping any already present.
+pub(crate) fn push_reference_virtual_query_fields(mdo_type: MdoType, fields: &mut Vec<FieldDef>) {
+    if !is_reference_table_mdo_type(mdo_type) {
+        return;
+    }
+    for (name, name_en) in REFERENCE_VIRTUAL_QUERY_FIELDS {
+        let is_point_in_time = name == POINT_IN_TIME;
+        if is_point_in_time && mdo_type != MdoType::Document {
+            continue;
+        }
+        if fields.iter().any(|field| field.matches_name(name)) {
+            continue;
+        }
+        let ty = if is_point_in_time { SdblType::DateTime } else { SdblType::string() };
+        fields.push(FieldDef::standard(name, name_en, ty));
+    }
+}
+
 /// Every table a register exposes besides its main one, by the name the query writes after
 /// `<Вид>.<Имя>.`. Names follow the 1C:Enterprise syntax assistant («Работа с запросами →
 /// Таблицы запросов»); which kind of register owns which table is decided by

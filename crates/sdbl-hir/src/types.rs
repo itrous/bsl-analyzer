@@ -1,4 +1,6 @@
 use bsl_metadata::MdoType;
+use rustc_hash::FxHashSet;
+use stdx::case::CaseExt;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub enum SdblType {
@@ -116,6 +118,62 @@ impl SdblType {
             // A record manager is a form-side object, never a value a query yields.
             AttributeType::InformationRegisterRecordManager { .. } => Self::Unknown,
             AttributeType::Unknown => Self::Unknown,
+        }
+    }
+
+    /// Like [`Self::from_attribute_type`], additionally resolving [`AttributeType::DefinedType`]
+    /// (including arms inside a composite) through `resolver` with cycle detection.
+    pub(crate) fn from_attribute_type_resolved(
+        attr_type: &bsl_metadata::AttributeType,
+        resolver: Option<&dyn bsl_metadata::QueryMetadataResolver>,
+    ) -> Self {
+        Self::from_attribute_type(attr_type).resolve_defined_types(resolver)
+    }
+
+    /// Resolves any unresolved [`Self::DefinedType`] (including arms inside [`Self::Composite`])
+    /// through `resolver` with cycle detection.
+    pub(crate) fn resolve_defined_types(
+        self,
+        resolver: Option<&dyn bsl_metadata::QueryMetadataResolver>,
+    ) -> Self {
+        let mut visited = FxHashSet::default();
+        self.resolve_defined_types_in(resolver, &mut visited)
+    }
+
+    fn resolve_defined_types_in(
+        self,
+        resolver: Option<&dyn bsl_metadata::QueryMetadataResolver>,
+        visited: &mut FxHashSet<String>,
+    ) -> Self {
+        match self {
+            Self::DefinedType { name, underlying_type } => {
+                let key = name.fold_lower();
+                if !visited.insert(key.clone()) {
+                    return Self::DefinedType { name, underlying_type };
+                }
+                let resolved = match underlying_type {
+                    Some(inner) => {
+                        Some(Box::new(inner.resolve_defined_types_in(resolver, visited)))
+                    }
+                    None => {
+                        resolver.and_then(|r| r.resolve_defined_type(&name)).map(|underlying| {
+                            Box::new(
+                                Self::from_attribute_type(&underlying)
+                                    .resolve_defined_types_in(resolver, visited),
+                            )
+                        })
+                    }
+                };
+                visited.remove(&key);
+                Self::DefinedType { name, underlying_type: resolved }
+            }
+            Self::Composite { types } => Self::Composite {
+                types: types
+                    .into_iter()
+                    .map(|arm| arm.resolve_defined_types_in(resolver, visited))
+                    .collect(),
+            },
+            other => other,
         }
     }
 

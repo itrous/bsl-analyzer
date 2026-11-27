@@ -36,24 +36,6 @@ pub(super) fn declared_source_aliases(
     aliases
 }
 
-const POINT_IN_TIME: &str = "МоментВремени";
-
-/// Query-only fields of a reference table that `StandardAttributeKind` does not list: present
-/// on every reference table (ITS ch.18 / §8.3), and `МоментВремени` (date + ref) on documents
-/// only, with no BSL object-model counterpart.
-const DOCUMENT_VIRTUAL_QUERY_FIELDS: [(&str, &str); 3] = [
-    ("Представление", "Presentation"),
-    ("ВерсияДанных", "DataVersion"),
-    (POINT_IN_TIME, "PointInTime"),
-];
-
-/// Whether `name` is one of the query-only virtual fields of a reference table, in either language.
-pub(super) fn is_document_virtual_query_field(name: &str) -> bool {
-    DOCUMENT_VIRTUAL_QUERY_FIELDS.iter().any(|(ru, en)| {
-        stdx::case::eq_ignore_case(ru, name) || stdx::case::eq_ignore_case(en, name)
-    })
-}
-
 impl LoweringContext<'_> {
     pub(super) fn lower_from_clause(
         &mut self,
@@ -1131,15 +1113,7 @@ impl LoweringContext<'_> {
                         ));
                     }
 
-                    for (name, name_en) in DOCUMENT_VIRTUAL_QUERY_FIELDS {
-                        let is_point_in_time = name == POINT_IN_TIME;
-                        if is_point_in_time && mdo_type != MdoType::Document {
-                            continue;
-                        }
-                        let ty =
-                            if is_point_in_time { SdblType::DateTime } else { SdblType::string() };
-                        fields.push(FieldDef::standard(name, name_en, ty));
-                    }
+                    crate::standard_fields::push_reference_virtual_query_fields(mdo_type, fields);
 
                     for common in &obj.common_attributes {
                         fields.push(FieldDef::new_with_names(
@@ -1399,43 +1373,7 @@ impl LoweringContext<'_> {
         &self,
         attr_type: &bsl_metadata::AttributeType,
     ) -> SdblType {
-        let mut visited = std::collections::HashSet::new();
-        self.resolve_attribute_type_inner(attr_type, &mut visited)
-    }
-
-    fn resolve_attribute_type_inner(
-        &self,
-        attr_type: &bsl_metadata::AttributeType,
-        visited: &mut std::collections::HashSet<String>,
-    ) -> SdblType {
-        use bsl_metadata::AttributeType;
-
-        match attr_type {
-            AttributeType::DefinedType { name } => {
-                let key = name.fold_lower();
-                if !visited.insert(key.clone()) {
-                    return SdblType::DefinedType { name: name.clone(), underlying_type: None };
-                }
-                let underlying_type =
-                    self.resolver.and_then(|r| r.resolve_defined_type(name)).map(|underlying| {
-                        Box::new(self.resolve_attribute_type_inner(&underlying, visited))
-                    });
-                visited.remove(&key);
-                SdblType::DefinedType { name: name.clone(), underlying_type }
-            }
-            AttributeType::Composite { types } => {
-                let arms: Vec<SdblType> =
-                    types.iter().map(|t| self.resolve_attribute_type_inner(t, visited)).collect();
-                if arms.is_empty() {
-                    SdblType::Unknown
-                } else if arms.len() == 1 {
-                    arms.into_iter().next().unwrap()
-                } else {
-                    SdblType::Composite { types: arms }
-                }
-            }
-            _ => SdblType::from_attribute_type(attr_type),
-        }
+        SdblType::from_attribute_type_resolved(attr_type, self.resolver)
     }
 
     fn check_virtual_table_params(

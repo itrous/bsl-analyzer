@@ -1,11 +1,11 @@
 use super::context::LoweringContext;
-use super::from_clause::is_document_virtual_query_field;
 use super::missing_row::{AliasMatch, MissingRowConditions, QueryFacts};
 use crate::diagnostics::{SdblDiagnostic, UnprotectedFieldRef};
 use crate::hir::{
     BinaryOp, ExprHir, FunctionKind, InValues, JoinHir, JoinType, Name, SdblHir, TableRef, UnaryOp,
     WhenClause,
 };
+use crate::standard_fields::is_document_virtual_query_field;
 use crate::standard_fields::{
     is_schedule_data_value_field, register_table_of_path, VirtualTableType,
 };
