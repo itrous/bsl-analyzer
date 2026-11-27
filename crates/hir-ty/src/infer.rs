@@ -6200,12 +6200,18 @@ impl<'db> InferenceContext<'db> {
         // A conditionally declared standard attribute whose presence this object's own
         // properties refute (`ЭтоГруппа` of a non-hierarchical catalog, `Код` of a
         // zero-length code) is a proven absence: the configuration metadata decides it,
-        // so no platform member-surface attestation is needed. Only a plain value read
-        // is owned here: a bare call keeps the call channel's conservative silence, and
-        // the unknown-name miss below stays gated on that attestation.
+        // so no platform member-surface attestation is needed. The same holds for a field
+        // the effective object has and the extension does not borrow: its absence from the
+        // lexical surface is stated by the configuration, not by a possibly incomplete
+        // platform snapshot. Only a plain value read is owned here: a bare call keeps the
+        // call channel's conservative silence, and the unknown-name miss below stays gated
+        // on that attestation.
         if usage == BareNameUse::ReadValue
             && !self.reading_bare_call_callee
-            && crate::this_object_attr::standard_member_known_absent(self.db, &resolver, name)
+            && (crate::this_object_attr::standard_member_known_absent(self.db, &resolver, name)
+                || crate::this_object_attr::this_object_member_known_unborrowed(
+                    self.db, &resolver, name,
+                ))
         {
             return BareNameResolution::Absent;
         }

@@ -69,6 +69,34 @@ pub(crate) fn resolve_this_record_set_member(
     crate::field_lookup::lookup_field(db, &obj_resolver, receiver_id, name).map(|info| info.ty)
 }
 
+/// Whether `name` is a field of the module's own object that the borrowing rule keeps
+/// out of the lexical surface (see [`lexical_object_field`]). The field is found on the
+/// effective object and the extension's own metadata does not borrow it, so the absence
+/// is decided by configuration metadata alone: it is not a platform member that a missing
+/// attestation could still add, and no member-surface attestation is required to prove it.
+/// Only reads are judged by it; calls and assignments keep the conservative channels they
+/// already have.
+pub(crate) fn this_object_member_known_unborrowed(
+    db: &dyn HirDatabase,
+    resolver: &Resolver,
+    name: &Name,
+) -> bool {
+    let Some((mdo_type, mdo_name)) = crate::this_object::resolve_this_object_owner(db, resolver)
+    else {
+        return false;
+    };
+    let Some(kind) = hir_def::ty::MetadataKind::object_kind_for(mdo_type) else { return false };
+    let Some(module_id) = resolver.module_id() else { return false };
+    let obj_resolver = crate::object_resolver::DbObjectResolver::new(db, module_id.file_id);
+    let receiver_id = db.metadata_ref(kind, mdo_name.as_str().to_string(), &RootConfigCtx);
+    let Some(field) = crate::field_lookup::lookup_field(db, &obj_resolver, receiver_id, name)
+    else {
+        return false;
+    };
+    let metadata = db.module_metadata(module_id);
+    metadata.mdo.as_ref().is_some_and(|owner| !lexical_object_field(owner, &field))
+}
+
 /// Whether the object module's own object declares `name` as a conditional standard
 /// attribute and the object's own properties refute its presence (`ЭтоГруппа` of a
 /// non-hierarchical catalog, `Код` of a zero-length code). The proof comes from the
