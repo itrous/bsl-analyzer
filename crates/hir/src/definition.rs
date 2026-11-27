@@ -78,6 +78,8 @@ impl Definition {
 pub enum ReferenceScope {
     FileLocal,
     ModuleSymbolWorkspace,
+    /// A source UUID and owner-context proof must precede its reference walk.
+    Metadata,
     Unknown,
 }
 
@@ -135,13 +137,14 @@ impl Definition {
                     ReferenceScope::FileLocal
                 }
             }
+            Definition::MdoObject { .. } | Definition::VirtualTableField { .. } => {
+                ReferenceScope::Metadata
+            }
             Definition::BuiltinFunction(_)
             | Definition::BuiltinMethodHandle { .. }
             | Definition::MdoCollectionType(_)
-            | Definition::MdoObject { .. }
             | Definition::MdoManagerModule { .. }
             | Definition::Module(_)
-            | Definition::VirtualTableField { .. }
             | Definition::Unresolved => ReferenceScope::Unknown,
         }
     }

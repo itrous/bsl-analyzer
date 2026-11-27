@@ -91,7 +91,7 @@ const TURNOVERS_REGISTER: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 const INFORMATION_REGISTER: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" version="2.10">
     <InformationRegister uuid="40000000-0000-0000-0000-000000000001">
-        <Properties><Name>Сведения1</Name><InformationRegisterPeriodicity>Day</InformationRegisterPeriodicity></Properties>
+        <Properties><Name>Сведения1</Name><InformationRegisterPeriodicity>Day</InformationRegisterPeriodicity><WriteMode>Independent</WriteMode></Properties>
         <ChildObjects>
             <Dimension uuid="40000000-0000-0000-0000-000000000002">
                 <Properties><Name>Измерение2</Name><Type><v8:Type>xs:string</v8:Type></Type></Properties>

@@ -941,6 +941,8 @@ mod tests {
 
         let paths = vec![(None, base.clone()), (Some("EXPORT".to_string()), export.clone())];
         db.set_workspace_configs_snapshot(WorkspaceConfigsSnapshot {
+            external_owners: Vec::new(),
+            compilation_overrides: Default::default(),
             extension_scopes: vec![None, None],
             canonical_paths: paths.iter().map(|(_, path)| path.clone()).collect(),
             kinds: vec![RootKind::Base, RootKind::External(kind)],

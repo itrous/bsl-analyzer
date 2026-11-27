@@ -5,12 +5,14 @@ use base_db::{FrozenFileContentSnapshot, SourceDatabase, SourceRoot, SourceRootI
 use ide::{GraphConfigCache, ModuleId, RootDatabaseImpl};
 use lsp_types::Url;
 use rustc_hash::FxHashMap;
+use salsa::Database as _;
 use vfs::FileId;
 
 use crate::mem_docs::FrozenMemDocs;
 
 #[derive(Debug, Clone)]
 pub struct CallHierarchyIndexFrozenSnapshot {
+    pub(crate) disk_read: ide_host_core::WorkspaceDiskRead,
     pub source_root_id: SourceRootId,
     pub file_set: Arc<FxHashMap<FileId, PathBuf>>,
     pub disk_revisions: Arc<FxHashMap<FileId, u64>>,
@@ -30,6 +32,7 @@ impl CallHierarchyIndexFrozenSnapshot {
         source_root_id: SourceRootId,
         mem_docs: &FrozenMemDocs,
         creation_generation: u64,
+        disk_read: ide_host_core::WorkspaceDiskRead,
     ) -> Self {
         let source_root = db.source_root_input(source_root_id).root(db).clone();
         let file_set: FxHashMap<_, _> = source_root
@@ -52,6 +55,7 @@ impl CallHierarchyIndexFrozenSnapshot {
             Arc::new(open_texts.clone()),
         ));
         Self {
+            disk_read,
             source_root_id,
             file_set: Arc::new(file_set),
             disk_revisions: Arc::new(disk_revisions),
@@ -78,6 +82,7 @@ impl CallHierarchyIndexFrozenSnapshot {
             Arc::clone(&open_texts),
         ));
         Self {
+            disk_read: self.disk_read.clone(),
             source_root_id: self.source_root_id,
             file_set: Arc::clone(&self.file_set),
             disk_revisions: Arc::clone(&self.disk_revisions),
@@ -112,6 +117,7 @@ impl CallHierarchyIndexFrozenSnapshot {
 
     pub fn open_batch(&self, batch: &[ModuleId]) -> RootDatabaseImpl {
         let mut db = RootDatabaseImpl::default();
+        self.disk_read.register_cancel(db.cancellation_token());
         db.set_graph_config_cache(Arc::clone(&self.config_cache));
         db.set_source_root(self.source_root_id, self.source_root.clone());
         db.set_file_source_root_fallback(self.source_root_id);

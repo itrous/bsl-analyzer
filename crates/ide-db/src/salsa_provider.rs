@@ -379,6 +379,13 @@ impl AnalysisProvider for SalsaProvider<'_> {
         HirDatabase::compatibility_mode(self.db)
     }
 
+    fn file_compilation_context(
+        &self,
+        file_id: FileId,
+    ) -> Option<Arc<hir::FileCompilationContext>> {
+        self.db.file_compilation_context(file_id)
+    }
+
     fn vendor_support_for_file(&self, file_id: FileId) -> Option<Arc<bsl_metadata::VendorSupport>> {
         self.db.vendor_support_for_file(file_id)
     }
@@ -389,6 +396,13 @@ impl AnalysisProvider for SalsaProvider<'_> {
 
     fn module_implicit_field_names(&self, file_id: FileId) -> Vec<String> {
         hir::module_implicit_field_names(self.db, file_id)
+    }
+
+    fn method_declaration_conflicts(
+        &self,
+        file_id: FileId,
+    ) -> Arc<hir::MethodDeclarationConflicts> {
+        hir::method_declaration_conflicts(self.db, file_id)
     }
 
     fn parse(&self, file_id: FileId) -> Parse<SyntaxNode> {
@@ -500,6 +514,50 @@ impl AnalysisProvider for SalsaProvider<'_> {
     fn method_syntax(&self, method_id: MethodId) -> Option<SyntaxNode> {
         let input = hir::MethodIdInput::new(self.db, method_id);
         hir::method_syntax_query(self.db, input).as_ref().map(|syntax| syntax.detached_root())
+    }
+
+    fn unshadowed_platform_global_calls(
+        &self,
+        file_id: FileId,
+        owner: DefWithBodyId,
+    ) -> rustc_hash::FxHashSet<hir::ExprId> {
+        hir::unshadowed_platform_global_calls(
+            self.db,
+            file_id,
+            owner,
+            self.effective_for(file_id),
+            self.weaving_for(file_id),
+        )
+    }
+
+    fn platform_call_effects(
+        &self,
+        file_id: FileId,
+        owner: DefWithBodyId,
+    ) -> rustc_hash::FxHashMap<hir::ExprId, hir::dataflow::catch_outcome::CallEffect> {
+        hir::platform_call_effects(
+            self.db,
+            file_id,
+            owner,
+            self.effective_for(file_id),
+            self.weaving_for(file_id),
+        )
+    }
+
+    fn replacement_applicability(
+        &self,
+        file_id: FileId,
+        owner: DefWithBodyId,
+        target: &str,
+    ) -> hir::ReplacementApplicability {
+        hir::replacement_applicability(
+            self.db,
+            file_id,
+            owner,
+            target,
+            self.effective_for(file_id),
+            self.weaving_for(file_id),
+        )
     }
 
     fn infer_owner(&self, file_id: FileId, owner: DefWithBodyId) -> hir::InferOwnerResult {
@@ -633,14 +691,20 @@ impl AnalysisProvider for SalsaProvider<'_> {
     }
 
     fn sdbl_hir_in_file(&self, file_id: FileId) -> crate::SdblHirEntries {
-        self.db.sdbl_hir_in_file(file_id)
+        match self.effective_for(file_id) {
+            Some(eid) => hir::sdbl_hir_for_effective_file(self.db, eid),
+            None => self.db.sdbl_hir_in_file(file_id),
+        }
     }
 
     fn all_sdbl_in_file(
         &self,
         file_id: FileId,
     ) -> Arc<Vec<(hir::SdblExprId, syntax::SdblQueryInfo)>> {
-        self.db.all_sdbl_in_file(file_id)
+        match self.effective_for(file_id) {
+            Some(eid) => hir::all_sdbl_in_effective_file(self.db, eid),
+            None => self.db.all_sdbl_in_file(file_id),
+        }
     }
 
     fn module_data(&self, module_id: ModuleId) -> Arc<hir::ModuleData> {

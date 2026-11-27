@@ -7,6 +7,10 @@ use super::*;
 use crate::call_hierarchy_index_state::CallHierarchyIndexSnapshotId;
 use crate::mem_docs::MemDocs;
 
+fn disk_read() -> ide_host_core::WorkspaceDiskRead {
+    ide_host_core::WorkspaceDiskGate::default().try_read().unwrap()
+}
+
 struct Fixture {
     _directory: tempfile::TempDir,
     db: RootDatabaseImpl,
@@ -43,6 +47,7 @@ fn call_hierarchy_index_edit_journal_catches_up_body_only_buffer_edit() {
         fixture.source_root,
         &fixture.mem_docs.freeze(),
         1,
+        disk_read(),
     );
     let lifecycle = CallHierarchyIndexState::default();
     assert!(lifecycle.start_build(fixture.source_root, 1, CallHierarchyIndexSnapshotId(1)));
@@ -75,6 +80,8 @@ fn call_hierarchy_index_edit_journal_catches_up_body_only_buffer_edit() {
         );
     };
     assert!(index.is_empty());
+    assert!(!lifecycle.is_ready_generation(fixture.source_root, 1));
+    assert!(lifecycle.publish(fixture.source_root, 1, index));
     assert!(lifecycle.is_ready_generation(fixture.source_root, 1));
 }
 
@@ -90,6 +97,7 @@ fn call_hierarchy_index_layout_edit_supersedes_instead_of_publishing() {
         fixture.source_root,
         &fixture.mem_docs.freeze(),
         1,
+        disk_read(),
     );
     let lifecycle = CallHierarchyIndexState::default();
     assert!(lifecycle.start_build(fixture.source_root, 1, CallHierarchyIndexSnapshotId(1)));
@@ -146,6 +154,7 @@ fn call_hierarchy_index_exhausted_catch_up_budget_names_itself() {
         fixture.source_root,
         &fixture.mem_docs.freeze(),
         1,
+        disk_read(),
     );
     let lifecycle = CallHierarchyIndexState::default();
     assert!(lifecycle.start_build(fixture.source_root, 1, CallHierarchyIndexSnapshotId(1)));

@@ -30,9 +30,15 @@ pub(crate) fn effective_method_env(
 ) -> EnvFlags {
     let metadata = db.module_metadata(method.module);
     let Some(decl) = db.interface_method(method) else {
-        return execution_env::body_env(&metadata, &[], options);
+        return db.file_compilation_context(method.module.file_id).map_or_else(
+            || execution_env::body_env(&metadata, &[], options),
+            |context| context.body_environment(&metadata, &[]),
+        );
     };
-    let environment = execution_env::body_env(&metadata, &decl.directives, options);
+    let environment = db.file_compilation_context(method.module.file_id).map_or_else(
+        || execution_env::body_env(&metadata, &decl.directives, options),
+        |context| context.body_environment(&metadata, &decl.directives),
+    );
     if environment.is_empty() {
         return environment;
     }
@@ -49,9 +55,21 @@ pub(crate) fn possible_method_env(
     method: MethodId,
     options: &EnvOptions,
 ) -> Option<EnvFlags> {
-    let decl = db.interface_method(method)?;
     let metadata = db.module_metadata(method.module);
-    let environment = execution_env::body_env(&metadata, &decl.directives, options);
+    possible_method_env_with_metadata(db, method, &metadata, options)
+}
+
+pub(crate) fn possible_method_env_with_metadata(
+    db: &dyn HirDatabase,
+    method: MethodId,
+    metadata: &hir_def::ModuleMetadata,
+    options: &EnvOptions,
+) -> Option<EnvFlags> {
+    let decl = db.interface_method(method)?;
+    let environment = db.file_compilation_context(method.module.file_id).map_or_else(
+        || execution_env::body_env(metadata, &decl.directives, options),
+        |context| context.body_environment(metadata, &decl.directives),
+    );
     if environment.is_empty() {
         return None;
     }

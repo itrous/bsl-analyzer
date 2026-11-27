@@ -106,6 +106,8 @@ pub fn main_loop(connection: Connection) -> Result<()> {
     tracing::info!("LSP server initialized");
 
     let mut state = GlobalState::new(connection.sender);
+    state.metadata_rename.supported =
+        crate::metadata_rename::runtime::client_supported(&raw_capabilities);
     state.position_encoding = position_encoding;
     state.supports_insert_text_mode_adjust_indentation =
         supports_insert_text_mode_adjust_indentation;
@@ -167,7 +169,29 @@ pub fn main_loop_shared(
     crate::panic_watch::install();
     let (initialize_id, initialize_value) =
         connection.initialize_start().context("Failed to start initialization")?;
-    run_shared_initialized(connection, workspace, initialize_value, Some(initialize_id), 1, 0, None)
+    run_shared_initialized(
+        connection,
+        workspace,
+        initialize_value,
+        Some(initialize_id),
+        1,
+        0,
+        None,
+        #[cfg(test)]
+        None,
+    )
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+pub(crate) fn main_loop_shared_with_probe(
+    connection: Connection,
+    workspace: impl FnOnce() -> Result<mcp_server::WorkspaceHandle>,
+    probe: std::sync::Arc<crate::metadata_rename::runtime::TransactionProbe>,
+) -> Result<()> {
+    crate::panic_watch::install();
+    let (id, value) = connection.initialize_start().context("LSP initialization")?;
+    run_shared_initialized(connection, workspace, value, Some(id), 1, 0, None, Some(probe))
 }
 
 /// Resume a private proxy-rebound session without sending another `initialize`.
@@ -188,9 +212,13 @@ pub fn main_loop_resumed(
         next_server_request_id,
         progress_generation,
         announced_capabilities,
+        #[cfg(test)]
+        None,
     )
 }
 
+// A per-session test probe avoids global state shared by concurrent LSP sessions.
+#[cfg_attr(test, allow(clippy::too_many_arguments))]
 fn run_shared_initialized(
     connection: Connection,
     workspace: impl FnOnce() -> Result<mcp_server::WorkspaceHandle>,
@@ -199,6 +227,9 @@ fn run_shared_initialized(
     next_server_request_id: i32,
     progress_generation: u64,
     announced_capabilities: Option<serde_json::Value>,
+    #[cfg(test)] transaction_probe: Option<
+        std::sync::Arc<crate::metadata_rename::runtime::TransactionProbe>,
+    >,
 ) -> Result<()> {
     let raw_capabilities = initialize_value.get("capabilities").cloned().unwrap_or_default();
     let initialize_params: InitializeParams =
@@ -249,6 +280,8 @@ fn run_shared_initialized(
     let workspace = workspace()?;
     platform_help::bootstrap(early_config.as_ref(), &help_root);
     let mut state = GlobalState::new_shared(connection.sender.clone(), workspace.clone());
+    #[cfg(test)]
+    crate::metadata_rename::runtime::install_transaction_probe(&mut state, transaction_probe);
     state.next_request_id.store(next_server_request_id.max(1), std::sync::atomic::Ordering::SeqCst);
     state.progress_generation = progress_generation;
     state.position_encoding = position_encoding;
@@ -258,6 +291,8 @@ fn run_shared_initialized(
         client_supports_code_description(&initialize_params.capabilities);
     state.supports_diagnostic_tags =
         crate::lsp::to_proto::ClientTags::from_capabilities(&initialize_params.capabilities);
+    state.metadata_rename.supported =
+        crate::metadata_rename::runtime::client_supported(&raw_capabilities);
     state.supports_workspace_edit_document_changes =
         client_supports_workspace_edit_document_changes(&initialize_params.capabilities);
     state.folding_range_limit = client_folding_range_limit(&initialize_params.capabilities);
@@ -587,6 +622,11 @@ fn hold_shared_test_gate(variable: &str) {
 
 fn run_event_loop(state: &mut GlobalState, receiver: &Receiver<Message>) -> Result<()> {
     loop {
+        let task_receiver = if state.metadata_rename.committing() {
+            crossbeam_channel::never()
+        } else {
+            state.task_pool.receiver.clone()
+        };
         select! {
             recv(receiver) -> msg => {
                 state.note_loop_activity();
@@ -600,10 +640,14 @@ fn run_event_loop(state: &mut GlobalState, receiver: &Receiver<Message>) -> Resu
                 handle_loader_msg(state, msg?)?;
             }
 
-            recv(&state.task_pool.receiver) -> task => {
+            recv(&task_receiver) -> task => {
                 state.note_loop_activity();
                 refresh_diagnostics_baseline(state);
                 handle_task(state, task?)?;
+            }
+
+            recv(&state.metadata_rename.completion_receiver) -> completion => {
+                finish_metadata_rename(state, completion?)?;
             }
 
             default(IDLE_TRIM_TICK) => {
@@ -613,8 +657,10 @@ fn run_event_loop(state: &mut GlobalState, receiver: &Receiver<Message>) -> Resu
 
         // Every wake services each ready source; a continuous request or task
         // producer cannot starve the other source or the disk writer.
-        for task in state.task_pool.receiver.clone().try_iter().take(16) {
-            handle_task(state, task)?;
+        if !state.metadata_rename.committing() {
+            for task in state.task_pool.receiver.clone().try_iter().take(16) {
+                handle_task(state, task)?;
+            }
         }
         if let Ok(message) = state.loader_receiver.try_recv() {
             handle_loader_msg(state, message)?;
@@ -626,6 +672,10 @@ fn run_event_loop(state: &mut GlobalState, receiver: &Receiver<Message>) -> Resu
         if state.shutdown_requested {
             state.call_hierarchy_index.shutdown();
             break;
+        }
+
+        if state.metadata_rename.committing() {
+            continue;
         }
 
         admit_pending_latency_retries(state)?;
@@ -779,6 +829,9 @@ fn answer_from_the_reloaded_baseline(state: &mut GlobalState) {
 /// retention. Runs on the event-loop thread, which owns `&mut` to the database; the
 /// quiescence gate guarantees no live snapshot, so the exclusive borrow cannot block.
 fn handle_idle_tick(state: &mut GlobalState) {
+    if state.workspace_disk_gate().is_frozen() {
+        return;
+    }
     state.idle_ticks = state.idle_ticks.saturating_add(1);
 
     // Ref-only git movement (fetch/rebase/reset) produces no file events; the
@@ -872,7 +925,38 @@ fn handle_lsp_msg(state: &mut GlobalState, msg: Message) -> Result<()> {
     Ok(())
 }
 
-fn handle_loader_msg(state: &mut GlobalState, msg: vfs::loader::Message) -> Result<()> {
+pub(crate) fn finish_metadata_rename(
+    state: &mut GlobalState,
+    completion: crate::metadata_rename::runtime::Completion,
+) -> Result<()> {
+    crate::metadata_rename::runtime::finish(state, completion)?;
+    if std::mem::take(&mut state.metadata_rename.needs_rescan) {
+        if let Some(root) = state.workspace_root.clone() {
+            state.set_workspace_root(root)?;
+            state.metadata_rename.rescan_version = Some(state.vfs_progress_config_version);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn handle_loader_msg(
+    state: &mut GlobalState,
+    mut msg: vfs::loader::Message,
+) -> Result<()> {
+    if state.metadata_rename.committing() {
+        state.metadata_rename.needs_rescan = true;
+        return Ok(());
+    }
+    let mut transaction_scan_finished = false;
+    if let Some(version) = state.metadata_rename.rescan_version {
+        msg = crate::metadata_rename::runtime::refresh_loader(msg);
+        if matches!(&msg, vfs::loader::Message::Progress {
+            n_done: vfs::loader::LoadingProgress::Finished, config_version, ..
+        } if *config_version == version)
+        {
+            transaction_scan_finished = true;
+        }
+    }
     match msg {
         vfs::loader::Message::Progress { n_total, n_done, config_version: _, dir: _ } => {
             use vfs::loader::LoadingProgress;
@@ -1036,12 +1120,19 @@ fn handle_loader_msg(state: &mut GlobalState, msg: vfs::loader::Message) -> Resu
             // arrive after a reload; the current exclusions decide.
             let mut resolved = stdx::path_exclusion::ResolvedDirs::default();
             let baseline_paths = state.diagnostics_baseline.observation_paths();
+            let dependency_roots = state
+                .project
+                .as_ref()
+                .map(|project| project.semantic_dependency_roots())
+                .unwrap_or_default();
             let files: Vec<_> = files
                 .into_iter()
                 .filter(|path| !state.is_source_excluded(path.as_ref(), &mut resolved))
                 .filter(|path| {
                     let path: &std::path::Path = path.as_ref();
                     project_model::is_metadata_path(path)
+                        || (project_model::is_bsl_source_path(path)
+                            && dependency_roots.iter().any(|root| path.starts_with(root)))
                         || baseline_paths.iter().any(|baseline| baseline == path)
                 })
                 .collect();
@@ -1128,6 +1219,25 @@ fn handle_loader_msg(state: &mut GlobalState, msg: vfs::loader::Message) -> Resu
                 tracing::info!(removed_paths = n, "processed removed directory subtree");
             }
         }
+    }
+    if transaction_scan_finished {
+        state.metadata_rename.rescan_version = None;
+        crate::handlers::notification::replay_open_documents_after_disk_transaction(state)?;
+        if let Some(writer) = state.metadata_rename.writer.take() {
+            if let Err(error) = crate::metadata_rename::runtime::finish_publication(state, writer) {
+                if let Some(response) = state.metadata_rename.pending_response.take() {
+                    state.respond(lsp_server::Response::new_err(
+                        response.id,
+                        lsp_server::ErrorCode::RequestFailed as i32,
+                        format!("recovery_required: {error}"),
+                    ));
+                }
+            }
+        }
+        if let Some(response) = state.metadata_rename.pending_response.take() {
+            state.respond(response);
+        }
+        crate::handlers::notification::refresh_after_shared_catch_up(state);
     }
     Ok(())
 }
@@ -1244,6 +1354,54 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
     use crate::global_state::Task;
 
     match task {
+        Task::DiskReadCompleted { epoch, task, cancelled } => {
+            let read = state.try_disk_read().ok();
+            if read.as_ref().is_some_and(|read| read.epoch() == epoch && read.is_current()) {
+                return handle_task(state, *task);
+            }
+            match &*cancelled {
+                Task::SharedMetadataWarmed { .. } => {
+                    state.shared_metadata_warm_in_flight = false;
+                    state.shared_metadata_warm_pending = true;
+                    state.shared_metadata_warm_parked_at = None;
+                    return Ok(());
+                }
+                Task::ForeignHandlerBindingsPrimed { .. } => {
+                    state.foreign_bindings_priming.in_flight = false;
+                    state.foreign_bindings_priming.pending = true;
+                    state.foreign_bindings_priming.parked_at = None;
+                    return Ok(());
+                }
+                Task::WorkspaceBatchChunk { .. } => {
+                    state.workspace_batch_in_flight = false;
+                    state.workspace_batch_token = None;
+                    return Ok(());
+                }
+                Task::SharedWorkspaceSeedReady { epoch } => {
+                    if *epoch == state.shared_view_epoch {
+                        *state.shared_seed_snapshot.lock().unwrap_or_else(|p| p.into_inner()) =
+                            None;
+                        state.shared_seed_running = false;
+                        state.shared_seed_queued = true;
+                    }
+                    return Ok(());
+                }
+                Task::AnalysisScopeReady { generation, .. } => {
+                    state.abort_scope_build(*generation);
+                    return Ok(());
+                }
+                Task::CallHierarchyIndexSuperseded { source_root, generation, .. }
+                    if state.call_hierarchy_index.is_building(*source_root, *generation)
+                        || state
+                            .call_hierarchy_index
+                            .is_ready_generation(*source_root, *generation) =>
+                {
+                    state.supersede_call_hierarchy_index(*source_root);
+                }
+                _ => {}
+            }
+            return handle_task(state, *cancelled);
+        }
         Task::SharedWorkspaceChanged { generation } => {
             state.shared_generation_pending.store(false, std::sync::atomic::Ordering::Release);
             tracing::debug!(generation, "shared disk workspace generation changed");
@@ -1254,7 +1412,7 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
                     apply_shared_project(state, root, project);
                 }
             }
-            let changed = state.analysis_host.catch_up();
+            let changed = state.shared_view_seeded && state.analysis_host.catch_up();
             if changed {
                 state.shared_view_seeded = true;
             }
@@ -1303,7 +1461,9 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
                         state.update_features_config();
                     }
                 }
-                state.analysis_host.catch_up();
+                if state.shared_view_seeded {
+                    state.analysis_host.catch_up();
+                }
                 refresh_shared_readiness(state);
                 // A frozen owner — kept on its last good configuration while a broken one
                 // is in place — can have no snapshot to give while it reloads. Asking again
@@ -1481,6 +1641,7 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
             handle_latency_request_finished(state, key, outcome)?;
         }
         Task::PreloadExternalFiles { files } => {
+            use salsa::Database as _;
             if files.is_empty() {
                 return Ok(());
             }
@@ -1490,6 +1651,7 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
                 tracing::debug!("task pool saturated; external preload skipped");
                 return Ok(());
             }
+            let Ok(disk_read) = state.prepare_disk_read() else { return Ok(()) };
             // Queued before a reload may have excluded some of them: an excluded file is
             // not warmed, whatever id it still carries.
             let mut resolved = stdx::path_exclusion::ResolvedDirs::default();
@@ -1505,7 +1667,9 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
             tracing::debug!(?file_ids, "preloading external files from semantic highlighting");
 
             let analysis = state.analysis_host.analysis();
+            disk_read.register_cancel(analysis.database().cancellation_token());
             let task = analysis.warm_caches_task(&files);
+            disk_read.register_cancel(task.cancellation_token());
             let first_file = files[0];
 
             if let Some(prev) = state.preload_external_tokens.remove(&first_file) {
@@ -1515,6 +1679,7 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
 
             let analysis_guard = state.note_analysis_spawned();
             let spawned = state.task_pool.pool.try_spawn(move || {
+                let _disk_read = disk_read;
                 let _analysis_guard = analysis_guard;
                 let count = match salsa::Cancelled::catch(std::panic::AssertUnwindSafe(|| {
                     task.run()
@@ -1597,6 +1762,14 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn background_task_ref(task: &crate::global_state::Task) -> &crate::global_state::Task {
+    match task {
+        crate::global_state::Task::DiskReadCompleted { task, .. } => background_task_ref(task),
+        task => task,
+    }
 }
 
 const MAX_LATENCY_ATTEMPTS: u8 = 3;
@@ -2419,7 +2592,7 @@ fn handle_vfs_msg(
     Ok(())
 }
 
-fn handle_request(state: &mut GlobalState, req: Request) -> Result<()> {
+pub(crate) fn handle_request(state: &mut GlobalState, req: Request) -> Result<()> {
     use lsp_types::request::{
         CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
         CodeActionRequest, Completion, DocumentDiagnosticRequest, DocumentHighlightRequest,
@@ -2430,6 +2603,18 @@ fn handle_request(state: &mut GlobalState, req: Request) -> Result<()> {
     };
 
     tracing::info!("INCOMING REQUEST: method={} id={:?}", req.method, req.id);
+
+    if crate::metadata_rename::runtime::is_request(&req.method) {
+        return crate::metadata_rename::runtime::handle_request(state, req);
+    }
+    if state.workspace_disk_gate().is_frozen() && req.method != "shutdown" {
+        state.respond(lsp_server::Response::new_err(
+            req.id,
+            lsp_server::ErrorCode::RequestFailed as i32,
+            "metadata rename commit is in progress".into(),
+        ));
+        return Ok(());
+    }
 
     // A whole-workspace sweep can run for minutes; keep at most one in-flight so several do not
     // monopolize the shared latency pool and starve interactive requests. A newer sweep cancels
@@ -2451,7 +2636,9 @@ fn handle_request(state: &mut GlobalState, req: Request) -> Result<()> {
 
     RequestDispatcher { req: Some(req), global_state: state }
         .on_sync_mut::<Shutdown>(|state, ()| {
-            state.shutdown_requested = true;
+            if !crate::metadata_rename::runtime::request_shutdown(state) {
+                state.shutdown_requested = true;
+            }
             Ok(())
         })
         .on_retryable_latency::<GotoDefinition>(crate::handlers::handle_goto_definition)
@@ -2492,15 +2679,33 @@ fn handle_request(state: &mut GlobalState, req: Request) -> Result<()> {
     Ok(())
 }
 
-fn handle_notification(state: &mut GlobalState, not: Notification) -> Result<()> {
+pub(crate) fn handle_notification(state: &mut GlobalState, not: Notification) -> Result<()> {
     use lsp_types::notification::{
         Cancel, DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument,
         DidOpenTextDocument, DidSaveTextDocument,
     };
 
+    crate::metadata_rename::runtime::observe_notification(state, &not);
+    let observed = matches!(
+        not.method.as_str(),
+        "textDocument/didOpen"
+            | "textDocument/didChange"
+            | "textDocument/didSave"
+            | "textDocument/didClose"
+    )
+    .then(|| {
+        not.params
+            .pointer("/textDocument/uri")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|uri| lsp_types::Url::parse(uri).ok())
+            .map(|uri| (not.method.clone(), uri))
+    })
+    .flatten();
     if not.method == Exit::METHOD {
         tracing::info!("Received exit notification");
-        state.shutdown_requested = true;
+        if !crate::metadata_rename::runtime::request_shutdown(state) {
+            state.shutdown_requested = true;
+        }
         return Ok(());
     }
 
@@ -2512,6 +2717,10 @@ fn handle_notification(state: &mut GlobalState, not: Notification) -> Result<()>
         .on_sync_mut::<DidChangeWatchedFiles>(crate::handlers::handle_did_change_watched_files)?
         .on_sync_mut::<Cancel>(crate::handlers::handle_cancel)?
         .finish();
+
+    if let Some((method, uri)) = observed {
+        crate::metadata_rename::runtime::observe_document_change(state, &method, &uri);
+    }
 
     Ok(())
 }
@@ -2542,6 +2751,11 @@ fn server_capabilities(
     });
 
     ServerCapabilities {
+        experimental: Some(serde_json::json!({"metadataRename": {
+            "protocolVersion": 1, "exclusiveSession": true, "requiresOwnReloadBuffering": true,
+            "previewMethod": "bsl/metadataRenamePreview", "commitMethod": "bsl/metadataRenameCommit",
+            "abortMethod": "bsl/metadataRenameAbort"
+        }})),
         diagnostic_provider,
 
         position_encoding: Some(position_encoding.as_lsp_kind()),
@@ -4407,7 +4621,14 @@ mod tests {
                             let remaining =
                                 deadline.saturating_duration_since(std::time::Instant::now());
                             match self.receiver.recv_timeout(remaining) {
-                                Ok(Task::WorkspaceBatchChunk { .. }) => break,
+                                Ok(task)
+                                    if matches!(
+                                        background_task_ref(&task),
+                                        Task::WorkspaceBatchChunk { .. }
+                                    ) =>
+                                {
+                                    break
+                                }
                                 Ok(_) => continue,
                                 Err(error) => {
                                     tracing::error!(
@@ -4945,7 +5166,7 @@ mod tests {
                     .receiver
                     .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(10)))
                     .expect("cancelled batch task timed out");
-                match &task {
+                match background_task_ref(&task) {
                     Task::WorkspaceBatchChunk {
                         generation,
                         outcome: crate::global_state::WorkspaceBatchOutcome::Cancelled,
@@ -5043,7 +5264,8 @@ mod tests {
                     .receiver
                     .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(10)))
                     .expect("active batch completion task timed out");
-                let completed_chunk = matches!(task, Task::WorkspaceBatchChunk { .. });
+                let completed_chunk =
+                    matches!(background_task_ref(&task), Task::WorkspaceBatchChunk { .. });
                 handle_task(&mut state, task).unwrap();
                 if completed_chunk {
                     tracing::info!(
@@ -6950,6 +7172,7 @@ mod tests {
         state.workspace_batch_in_flight = true;
         state.workspace_batch_plan = Some(crate::global_state::WorkspaceBatchPlan {
             generation: state.workspace_batch_generation,
+            disk_epoch: state.try_disk_read().unwrap().epoch(),
             file_ids: std::sync::Arc::new(Vec::new()),
             file_paths: crate::frozen_context::FrozenFilePaths::default(),
             supports_code_description: state.supports_code_description,
@@ -8263,7 +8486,10 @@ mod tests {
                 .receiver
                 .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(20)))
                 .expect("the first scope build finishes");
-            if matches!(task, crate::global_state::Task::AnalysisScopeReady { .. }) {
+            if matches!(
+                background_task_ref(&task),
+                crate::global_state::Task::AnalysisScopeReady { .. }
+            ) {
                 handle_task(&mut state, task).unwrap();
             }
         }
@@ -8508,7 +8734,19 @@ mod tests {
             + test_utils::wait::hang_guard(std::time::Duration::from_secs(60));
         loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
-            match state.task_pool.receiver.recv_timeout(left).expect("the priming job reports") {
+            let task =
+                state.task_pool.receiver.recv_timeout(left).expect("the priming job reports");
+            let task = match task {
+                Task::DiskReadCompleted { epoch, task, cancelled } => {
+                    if state.workspace_disk_gate().is_current(epoch) {
+                        *task
+                    } else {
+                        *cancelled
+                    }
+                }
+                task => task,
+            };
+            match task {
                 Task::ForeignHandlerBindingsPrimed { cut } => {
                     state.foreign_bindings_priming.in_flight = false;
                     return cut;
@@ -8840,6 +9078,118 @@ mod tests {
                 context.index()
             );
         });
+    }
+
+    #[test]
+    fn early_shared_events_leave_seeding_async_and_preserve_open_buffers() {
+        use base_db::SourceDatabase as _;
+
+        let root = tempfile::tempdir().expect("create shared workspace");
+        std::fs::write(root.path().join("bsl-analyzer.toml"), "[source]\nroot = \".\"\n")
+            .expect("write project config");
+        let first_path = root.path().join("First.bsl");
+        let kept_path = root.path().join("Kept.bsl");
+        let disk_text = "Procedure Disk() EndProcedure";
+        let editor_text = "Procedure Editor() EndProcedure";
+        std::fs::write(&first_path, disk_text).expect("write first source");
+        std::fs::write(&kept_path, disk_text).expect("write kept source");
+        let project = mcp_server::project::at(root.path()).expect("load project");
+        let cache_parent = tempfile::tempdir().expect("create disposable workspace cache");
+        let cache = mcp_server::WorkspaceCacheLayout::for_project(
+            &project,
+            Some(cache_parent.path()),
+            root.path(),
+            None,
+        )
+        .expect("create explicit disposable cache");
+        let backend = mcp_server::SharedState::shared_workspace_with_cache_and_prefixes(
+            root.path().to_path_buf(),
+            cache,
+            None,
+        )
+        .expect("create disk owner");
+        let owner = backend.workspace_handle();
+        let publications = owner.subscribe();
+        let generation = loop {
+            match owner.readiness() {
+                mcp_server::WorkspaceReadiness::Ready { generation } => break generation,
+                mcp_server::WorkspaceReadiness::Loading => {
+                    publications.recv().expect("the owner publishes its workspace");
+                }
+                other => panic!("the test workspace does not load: {other:?}"),
+            }
+        };
+        assert!(generation > 0, "the owner has a nonempty disk seed");
+
+        for event in ["workspace_changed", "seed_unavailable", "save", "close"] {
+            let (sender, _receiver) = crossbeam_channel::unbounded();
+            let mut state = GlobalState::new_shared(sender, owner.clone());
+            apply_shared_project(&mut state, root.path().to_path_buf(), project.clone());
+            refresh_shared_readiness(&mut state);
+            for path in [&first_path, &kept_path] {
+                let uri = lsp_types::Url::from_file_path(path).unwrap();
+                let vfs_path = vfs::VfsPath::new(path.clone());
+                let file_id = {
+                    let mut vfs = state.vfs.write();
+                    vfs.set_file_contents(vfs_path.clone(), Some(Arc::from(editor_text)));
+                    let file_id = vfs.file_id(&vfs_path).unwrap();
+                    let _ = vfs.take_changes();
+                    file_id
+                };
+                state.mem_docs.insert(uri.clone(), editor_text.into(), 7);
+                state.open_file_uri_ids.insert(uri, file_id);
+                state.open_files.insert(file_id);
+                state.analysis_host.view_mut().unwrap().open(
+                    file_id,
+                    path.clone(),
+                    Arc::from(editor_text),
+                );
+            }
+            assert!(!state.shared_view_seeded);
+            assert_eq!(state.analysis_host.view().unwrap().generation(), 0);
+            let first_uri = lsp_types::Url::from_file_path(&first_path).unwrap();
+            match event {
+                "workspace_changed" => {
+                    handle_task(&mut state, Task::SharedWorkspaceChanged { generation }).unwrap();
+                }
+                "seed_unavailable" => {
+                    state.shared_seed_running = true;
+                    state.shared_seed_queued = false;
+                    let epoch = state.shared_view_epoch;
+                    handle_task(&mut state, Task::SharedWorkspaceSeedReady { epoch }).unwrap();
+                }
+                "save" => {
+                    crate::handlers::notification::handle_did_save(
+                        &mut state,
+                        lsp_types::DidSaveTextDocumentParams {
+                            text_document: lsp_types::TextDocumentIdentifier { uri: first_uri },
+                            text: None,
+                        },
+                    )
+                    .unwrap();
+                }
+                "close" => {
+                    crate::handlers::notification::handle_did_close(
+                        &mut state,
+                        lsp_types::DidCloseTextDocumentParams {
+                            text_document: lsp_types::TextDocumentIdentifier { uri: first_uri },
+                        },
+                    )
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(!state.shared_view_seeded, "{event}");
+            assert!(!state.vfs_done, "{event}");
+            assert!(state.shared_seed_queued || state.shared_seed_running, "{event}");
+            let kept_uri = lsp_types::Url::from_file_path(&kept_path).unwrap();
+            assert_eq!(state.mem_docs.get(&kept_uri).as_deref(), Some(editor_text), "{event}");
+            assert_eq!(state.mem_docs.get_version(&kept_uri), Some(7), "{event}");
+            let kept_id = state.open_file_uri_ids[&kept_uri];
+            let view = state.analysis_host.view().unwrap();
+            assert_eq!(view.generation(), 0, "{event}: bulk seed stays off the actor");
+            assert_eq!(view.database().file_text(kept_id).as_ref(), editor_text, "{event}");
+        }
     }
 
     /// A shared session has no loader to report the load's end: the seed of its editor

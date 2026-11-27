@@ -475,7 +475,15 @@ pub fn body_env(
     annotations: &[AnnotationKind],
     opts: &EnvOptions,
 ) -> EnvFlags {
-    let base = module_base_env(metadata, opts);
+    body_env_with_base(metadata, annotations, opts, module_base_env(metadata, opts))
+}
+
+pub(crate) fn body_env_with_base(
+    metadata: &ModuleMetadata,
+    annotations: &[AnnotationKind],
+    opts: &EnvOptions,
+    base: EnvFlags,
+) -> EnvFlags {
     if base.is_empty() {
         return EnvFlags::EMPTY;
     }

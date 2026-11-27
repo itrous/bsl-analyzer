@@ -69,13 +69,25 @@ pub fn from_hir(
     range: LocalRange,
     ctx: &AnalysisContext,
 ) -> Option<Diagnostic<LocalRange>> {
+    if ctx.kernel_types_overlap(expected, actual) {
+        return None;
+    }
+    from_property_assignment_hir(expected, actual, range, ctx)
+}
+
+/// Render an incompatibility already established for a writable property in HIR.
+/// Shared optional members do not admit other incompatible assigned values.
+pub fn from_property_assignment_hir(
+    expected: TypeId,
+    actual: TypeId,
+    range: LocalRange,
+    ctx: &AnalysisContext,
+) -> Option<Diagnostic<LocalRange>> {
     let locale = ctx.locale();
     let expected_label = ctx.kernel_type_display(expected, locale);
     let actual_label = ctx.kernel_type_display(actual, locale);
-    // An overlapping set means some value of this expression is acceptable, so the analyzer
-    // cannot state a mismatch; only a disjoint set can. Two sides rendering identically in
-    // the message language make it self-contradictory whatever their members are.
-    if expected_label == actual_label || ctx.kernel_types_overlap(expected, actual) {
+    // Identical labels would make the message contradict itself.
+    if expected_label == actual_label {
         return None;
     }
     let (expected_label, actual_label) =
@@ -574,16 +586,20 @@ mod tests {
         expect![[""]].assert_eq(&format_diags(&source, &found));
     }
 
-    // KNOWN GAP, not the desired end state: the owner slot is not narrowed at all,
-    // so a number there is silent too. Judging the owner needs the object's
-    // `Владельцы` composition, which is a separate change.
+    // The owner slot is not narrowed to the receiver, yet it still takes only a catalog
+    // reference: a number there is reported. Which catalog is checked against
+    // `Владельцы` is a separate question.
     #[test]
-    fn a_number_in_the_owner_slot_is_silent_for_now() {
+    fn a_number_in_the_owner_slot_is_reported() {
         if !built_in_facts_are_served() {
             return;
         }
         let (source, found) = reference_call_mismatches("\"001\", , , 5");
-        expect![[""]].assert_eq(&format_diags(&source, &found));
+        expect![[r#"
+            TypeMismatch @ 2:58..2:59
+              message: Несоответствие типов: ожидалось 'СправочникСсылка', получено 'Число'
+              severity: Major"#]]
+        .assert_eq(&format_diags(&source, &found));
     }
 
     #[test]

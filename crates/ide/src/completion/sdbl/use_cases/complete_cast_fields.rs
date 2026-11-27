@@ -146,6 +146,7 @@ mod tests {
             mdo_type: MdoType::Document,
             name: "НачислениеИСписаниеБонусныхБаллов".to_string(),
             name_en: Some("BonusPointsAccrualAndWriteOff".to_string()),
+            read_properties: Default::default(),
             attributes: vec![
                 bsl_metadata::Attribute {
                     name: "ПричинаНачисленияИСписанияБонусныхБаллов".to_string(),

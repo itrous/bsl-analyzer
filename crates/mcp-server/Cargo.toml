@@ -9,6 +9,7 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
+epf-carrier = { path = "../epf-carrier" }
 bsl-conventions.workspace = true
 ide-host-core.workspace = true
 bsl-debug.workspace = true
@@ -83,11 +84,13 @@ widestring = "1.0"
 win-security-identifier = "0.1.1"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Environment",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }

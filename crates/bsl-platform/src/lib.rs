@@ -1,3 +1,4 @@
+mod call_effects;
 pub mod callback_description;
 pub mod capability;
 mod db;
@@ -24,6 +25,7 @@ pub use standard_mdo_attributes::{
     StandardAttrSpec, StandardKind,
 };
 
+pub use call_effects::{CallValueEffect, CallValueEffectTarget};
 pub use callback_description::{
     bundled_callback_description_slots, callback_description_slots_for_parameters,
     has_callback_description_constructor_facts, is_callback_description_compatibility_type_name,

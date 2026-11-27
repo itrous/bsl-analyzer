@@ -98,6 +98,7 @@ mod tests {
             mdo_type: bsl_metadata::MdoType::Catalog,
             name: "Валюты".to_string(),
             name_en: Some("Currencies".to_string()),
+            read_properties: Default::default(),
             attributes: vec![
                 bsl_metadata::Attribute {
                     name: "Ссылка".to_string(),

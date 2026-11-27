@@ -21,6 +21,7 @@ pub(crate) struct MdoProperties {
     pub number_type: Option<String>,
     pub description_length: Option<u32>,
     pub hierarchical: bool,
+    pub hierarchy_type: Option<String>,
     pub owners: Vec<String>,
     pub periodicity: Option<String>,
     pub check_unique: bool,
@@ -61,6 +62,7 @@ impl MdoProperties {
             }
         });
         let hierarchical = child_bool(props_node, "Hierarchical");
+        let hierarchy_type = child_text(props_node, "HierarchyType").map(str::to_owned);
         let check_unique = child_bool(props_node, "CheckUnique");
         let periodicity =
             child_text(props_node, "InformationRegisterPeriodicity").map(|s| s.to_string());
@@ -96,6 +98,7 @@ impl MdoProperties {
             number_type,
             description_length,
             hierarchical,
+            hierarchy_type,
             owners,
             periodicity,
             check_unique,
@@ -261,6 +264,12 @@ pub(crate) fn add_standard_attributes_from_spec(
     view: ObjectView,
 ) {
     for spec in standard_attributes_for(template, view) {
+        if mdo_type == MdoType::Catalog
+            && spec.kind == StandardKind::IsFolder
+            && properties.hierarchy_type.as_deref() != Some("HierarchyFoldersAndItems")
+        {
+            continue;
+        }
         if !condition_satisfied(spec.condition, properties) {
             continue;
         }
@@ -318,8 +327,11 @@ pub(crate) fn add_information_register_standard_attrs(
     attributes: &mut Vec<RegisterAttribute>,
     object_name: &str,
     periodicity: Option<&str>,
+    recorder_subordinate: bool,
 ) {
-    add_register_common_attrs(attributes, object_name, MdoType::InformationRegister);
+    if recorder_subordinate {
+        add_register_common_attrs(attributes, object_name, MdoType::InformationRegister);
+    }
     add_register_period_attr(attributes, object_name, MdoType::InformationRegister, periodicity);
 }
 

@@ -81,14 +81,14 @@ fn renameable_token<DB: RootDatabase>(
 
     match symbol.reference_scope(db) {
         ReferenceScope::FileLocal | ReferenceScope::ModuleSymbolWorkspace => Some(token),
-        ReferenceScope::Unknown => None,
+        ReferenceScope::Unknown | ReferenceScope::Metadata => None,
     }
 }
 
 /// A rename target must be spelled as one BSL identifier — not a keyword, not
 /// an expression, not padded with whitespace. Reuse the real lexer so the check
 /// tracks the language exactly (Cyrillic/Latin letters, digits, `_`).
-fn is_valid_identifier(name: &str) -> bool {
+pub(crate) fn is_valid_identifier(name: &str) -> bool {
     let tokens = tokenize(name);
     matches!(tokens.as_slice(), [token] if token.kind == TokenKind::Ident)
 }

@@ -7,6 +7,7 @@ use crate::types::{
     ConstructorDocs, GlobalFunction, MethodDocs, ParamPassing, PlatformConstructor, PlatformMethod,
     PlatformProperty, PlatformType, PropertyDocs,
 };
+use crate::{CallValueEffect, CallValueEffectTarget};
 use once_cell::sync::OnceCell;
 use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
@@ -71,6 +72,7 @@ pub struct PlatformDataInner {
     manager_methods_by_prefix: FxHashMap<SmolStr, Vec<usize>>,
     global_functions: Vec<GlobalFunction>,
     global_functions_by_name: FxHashMap<SmolStr, usize>,
+    call_value_effects: FxHashMap<CallValueEffectTarget, Vec<CallValueEffect>>,
     method_docs_by_id: FxHashMap<u32, usize>,
     global_function_docs_by_id: FxHashMap<u32, usize>,
     constructors: Vec<PlatformConstructor>,
@@ -204,6 +206,7 @@ impl PlatformDataInner {
             property_docs,
             member_surface_attestations,
             parameter_passing_attestations,
+            call_value_effects,
         } = snapshot;
 
         apply_docs_gap_iter_types_overlay(&mut types);
@@ -458,6 +461,7 @@ impl PlatformDataInner {
             manager_methods_by_prefix,
             global_functions,
             global_functions_by_name,
+            call_value_effects,
             method_docs_by_id,
             global_function_docs_by_id,
             constructors,
@@ -657,6 +661,11 @@ impl PlatformDataInner {
     pub fn get_constructor_docs(&self, constructor_id: u32) -> Option<ConstructorDocs> {
         let idx = *self.constructor_docs_by_id.get(&constructor_id)?;
         self.constructor_docs.get(idx).cloned()
+    }
+
+    /// Call effects proved by the served overlay for this signature.
+    pub fn call_value_effects(&self, target: CallValueEffectTarget) -> &[CallValueEffect] {
+        self.call_value_effects.get(&target).map_or(&[], Vec::as_slice)
     }
 
     pub fn get_global_function_docs(&self, function_id: u32) -> Option<MethodDocs> {

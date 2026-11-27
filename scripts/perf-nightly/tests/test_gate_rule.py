@@ -356,6 +356,83 @@ class MachineLoad(unittest.TestCase):
         self.assertEqual(gate.foreign_cores(1.0, 0.5, 0.0), math.inf)
         self.assertEqual(gate.foreign_cores(0.5, 0.5, 0.0), 0.0)
 
+    def test_interval_cores_keep_own_load_and_reject_a_spike_inside_a_calm_mean(self):
+        limit = verdict.GATE_FOREIGN_CORES
+        self.assertEqual(limit, 2.0)
+        self.assertIsNone(gate.interval_cores(1.0, 0.0, 3.0, 1.0, 0.0))
+        self.assertIsNone(gate.interval_cores(None, 0.0, 1.0, 0.0, 1.0))
+        # The same busy growth is not foreign when it is the run's own CPU, and is
+        # foreign when that CPU has no run marker and so is not in own.
+        self.assertEqual(gate.interval_cores(0.0, 0.0, 5.0, 5.0, 1.0), 0.0)
+        self.assertEqual(gate.interval_cores(0.0, 0.0, 5.0, 0.0, 1.0), 5.0)
+        self.assertFalse(gate._over_limit(2.0, limit))
+        self.assertTrue(gate._over_limit(2.01, limit))
+        probes = [{"t": float(i), "busy_s": float(i), "own_cpu_s": float(i), "error": None} for i in range(11)]
+        probes[3] = {"t": 3.0, "busy_s": probes[2]["busy_s"] + 4.0, "own_cpu_s": probes[2]["own_cpu_s"],
+                     "error": None}
+        for probe in probes[4:]:
+            probe["busy_s"] += 4.0
+            probe["own_cpu_s"] += 0.0
+        # Steady own load plus one 4-core second. The window mean stays under 2; the spike does not.
+        window = gate.measure_window("graph_resolve", probes, 0.0, limit, closed=True)
+        self.assertLess(window["mean"], limit)
+        self.assertGreater(window["max"], limit)
+        self.assertTrue(window["contaminated"])
+        self.assertGreater(window["samples"], 1)
+
+    def test_a_zero_dt_boundary_merges_into_the_following_window(self):
+        class Sampler:
+            def __init__(self):
+                self._probes = []
+                self.t = 0.0
+                self.busy = 0.0
+                self.own = 0.0
+
+            def probe(self):
+                rec = {"t": self.t, "busy_s": self.busy, "own_cpu_s": self.own, "error": None}
+                self._probes.append(rec)
+                return rec
+
+        sampler = Sampler()
+        watch = gate.LoadWatch(sampler, type("M", (), {})())
+        watch.begin()
+        sampler.busy = 4.0
+        watch.leave_call("between_calls")
+        sampler.t = 1.0
+        watch.leave_call("finish")
+        found = {w["name"]: w for w in watch.export() if w["name"] != "finish"}
+        self.assertIsNone(found["graph_ready"]["foreign_cores_mean"])
+        self.assertGreater(found["between_calls"]["foreign_cores_mean"], verdict.GATE_FOREIGN_CORES)
+        self.assertTrue(found["between_calls"]["contaminated"])
+        self.assertTrue(watch.contaminated)
+
+    def test_a_zero_dt_or_a_read_error_is_not_a_measured_zero(self):
+        limit = verdict.GATE_FOREIGN_CORES
+        same = [{"t": 1.0, "busy_s": 5.0, "own_cpu_s": 1.0, "error": None},
+                {"t": 1.0, "busy_s": 9.0, "own_cpu_s": 1.0, "error": None}]
+        window = gate.measure_window("references_1", same, 1.0, limit, closed=True)
+        self.assertEqual(window["samples"], 0)
+        self.assertIsNone(window["mean"])
+        self.assertIsNone(window["max"])
+        failed = [{"t": 0.0, "busy_s": 1.0, "own_cpu_s": 0.0, "error": None},
+                  {"t": 1.0, "busy_s": None, "own_cpu_s": 0.0, "error": "stat unreadable"}]
+        window = gate.measure_window("finish", failed, 0.0, limit, closed=True)
+        self.assertIsNone(window["mean"])
+        self.assertNotEqual(window["mean"], 0.0)
+        self.assertEqual(window["error"], "stat unreadable")
+        open_window = gate.measure_window("diagnostics_file", failed[:1], 0.0, limit, closed=False)
+        self.assertIsNone(open_window["end_t"])
+        self.assertIsNone(open_window["mean"])
+
+    def test_the_numeric_rules_are_the_ones_the_record_already_uses(self):
+        self.assertEqual(verdict.GATE_BAR, 0.05)
+        self.assertEqual(verdict.GATE_FOREIGN_CORES, 2.0)
+        self.assertEqual(verdict.GATE_HWM_LIMIT_KB, 7168 * 1024)
+        self.assertEqual(verdict.GATE_REFS_LIMITS_S, {"references_1_s": 67.7, "references_2_same_s": 32.3,
+                                                      "references_3_other_s": 59.5})
+        self.assertEqual(gate.RUNS, 3)
+        self.assertEqual(gate.BUSY_BUDGET_MIN, 60.0)
+
     def test_the_precondition_wants_memory_and_a_quiet_load(self):
         with open(os.path.join(self.root, "meminfo"), "w") as fh:
             fh.write(f"MemTotal: {64 << 20} kB\nMemAvailable: {13 << 20} kB\n")

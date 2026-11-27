@@ -51,6 +51,7 @@ pub struct WorkspaceSnapshot {
     pub files: Vec<SnapshotFile>,
     pub catalog: Vec<CatalogFile>,
     pub metadata: Vec<(PathBuf, MetadataListingSnapshot)>,
+    pub ordinary_form_fingerprints: Arc<Vec<ide_db::metadata::inspection::OrdinaryFormFingerprint>>,
 }
 
 struct CatalogState {
@@ -457,9 +458,10 @@ impl WorkspaceSnapshot {
         }
         let configs = db.workspace_configs_snapshot().as_ref().clone();
         let metadata = db
-            .all_config_paths()
+            .workspace_configs_snapshot()
+            .prepared_roots()
             .into_iter()
-            .filter_map(|(_, path)| {
+            .filter_map(|(_, path, _)| {
                 db.metadata_listing_snapshot(&path.to_string_lossy()).map(|data| (path, data))
             })
             .collect();
@@ -479,6 +481,7 @@ impl WorkspaceSnapshot {
             files,
             catalog,
             metadata,
+            ordinary_form_fingerprints: db.ordinary_form_fingerprints(),
         }
     }
 }
@@ -625,17 +628,31 @@ impl EditorView {
             changes.iter().flat_map(|c| c.file_ids.iter().copied()).collect();
         let next: HashMap<_, _> = snapshot.files.iter().map(|file| (file.file_id, file)).collect();
         if changes.iter().any(|change| change.metadata_changed) {
+            let previous_dependencies = self.disk.configs.prepared_roots();
+            let previous_dependencies = &previous_dependencies[self.disk.configs.paths.len()..];
+            let next_dependencies = snapshot.configs.prepared_roots();
+            let next_dependencies = &next_dependencies[snapshot.configs.paths.len()..];
             let previous_metadata: HashMap<_, _> = self
                 .disk
                 .files
                 .iter()
-                .filter(|file| file.root_id == base_db::METADATA_SOURCE_ROOT)
+                .filter(|file| {
+                    file.root_id == base_db::METADATA_SOURCE_ROOT
+                        || previous_dependencies.iter().any(|(_, configured, canonical)| {
+                            file.path.starts_with(configured) || file.path.starts_with(canonical)
+                        })
+                })
                 .map(|file| (file.file_id, file))
                 .collect();
             let next_metadata: HashMap<_, _> = snapshot
                 .files
                 .iter()
-                .filter(|file| file.root_id == base_db::METADATA_SOURCE_ROOT)
+                .filter(|file| {
+                    file.root_id == base_db::METADATA_SOURCE_ROOT
+                        || next_dependencies.iter().any(|(_, configured, canonical)| {
+                            file.path.starts_with(configured) || file.path.starts_with(canonical)
+                        })
+                })
                 .map(|file| (file.file_id, file))
                 .collect();
             changed.extend(previous_metadata.iter().filter_map(|(file_id, previous)| {
@@ -697,6 +714,7 @@ impl EditorView {
         for (root, listing) in &snapshot.metadata {
             self.db.set_metadata_listing_snapshot(&root.to_string_lossy(), listing.clone());
         }
+        self.db.set_ordinary_form_fingerprints(snapshot.ordinary_form_fingerprints.clone());
         // The whole-configuration loader reads the flag: rewriting the same value with
         // every publication would send each configuration back to be parsed.
         if self.db.workspace_load_complete() != snapshot.metadata_ready {
@@ -794,6 +812,7 @@ impl EditorView {
             }
             self.db.set_metadata_listing_snapshot(&root.to_string_lossy(), listing.clone());
         }
+        self.db.set_ordinary_form_fingerprints(snapshot.ordinary_form_fingerprints.clone());
         if cancelled() {
             return false;
         }

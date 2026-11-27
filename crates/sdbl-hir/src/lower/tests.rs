@@ -1722,6 +1722,7 @@ fn test_join_paren_field_resolution() {
         mdo_type: bsl_metadata::MdoType::Catalog,
         name: "Валюты".to_string(),
         name_en: None,
+        read_properties: Default::default(),
         attributes: vec![
             bsl_metadata::Attribute {
                 name: "Ссылка".to_string(),
@@ -2947,10 +2948,19 @@ fn every_virtual_table_shape_inherits_the_provisional_marks_of_its_register() {
 /// The metadata XML reader synthesises the register's object-model standard attributes into
 /// `attributes`; the query layer must not append a second copy of them (issue #83).
 fn config_with_information_register_from_xml(periodicity: &str) -> bsl_metadata::Configuration {
+    config_with_information_register_mode_from_xml(periodicity, Some("RecorderSubordinate"))
+}
+
+fn config_with_information_register_mode_from_xml(
+    periodicity: &str,
+    write_mode: Option<&str>,
+) -> bsl_metadata::Configuration {
+    let write_mode =
+        write_mode.map(|mode| format!("<WriteMode>{mode}</WriteMode>")).unwrap_or_default();
     let xml = format!(
         r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
 <InformationRegister uuid="59f8d329-f39c-4999-b470-ae9fc74511ac">
-<Properties><Name>Курсы</Name><InformationRegisterPeriodicity>{periodicity}</InformationRegisterPeriodicity></Properties>
+<Properties><Name>Курсы</Name><InformationRegisterPeriodicity>{periodicity}</InformationRegisterPeriodicity>{write_mode}</Properties>
 <ChildObjects>
 <Dimension uuid="532f2a7f-4c1e-4a49-8281-3c21232da2d7"><Properties><Name>Валюта</Name></Properties></Dimension>
 </ChildObjects>
@@ -3025,6 +3035,50 @@ fn information_register_standard_fields_are_offered_once() {
             resolved.find_field("Регистратор").expect("listed above").provisional,
             "[{periodicity}] recorder-mode fields of an information register must stay provisional",
         );
+    }
+}
+
+#[test]
+fn information_register_write_mode_preserves_unknown_and_confirmed_absence() {
+    for mode in [None, Some("FutureMode"), Some("Independent"), Some("RecorderSubordinate")] {
+        for names in
+            [["Регистратор", "Активность", "НомерСтроки"], ["Recorder", "Active", "LineNumber"]]
+        {
+            let config = config_with_information_register_mode_from_xml("Day", mode);
+            let register = config.find_register("Курсы").unwrap();
+            assert_eq!(register.read_properties().write_mode.as_deref(), mode);
+            for name in ["Регистратор", "Активность", "НомерСтроки"]
+            {
+                assert_eq!(
+                    register.attributes().iter().any(|field| field.name() == name),
+                    mode == Some("RecorderSubordinate")
+                );
+            }
+            let code = format!(
+                "ВЫБРАТЬ T.{}, T.{}, T.{} ИЗ РегистрСведений.Курсы КАК T",
+                names[0], names[1], names[2]
+            );
+            let ast = parser::parse_sdbl(&code);
+            let package = lower_sdbl_to_hir(&ast, Some(std::sync::Arc::new(config)));
+            assert_eq!(
+                resolved_main_table(&package).field_model_complete(),
+                matches!(mode, Some("Independent" | "RecorderSubordinate"))
+            );
+            let slice = super::LoweringContext::transform_for_virtual_table(
+                resolved_main_table(&package).clone(),
+                crate::standard_fields::VirtualTableType::SliceLast,
+            );
+            assert_eq!(
+                slice.field_model_complete(),
+                resolved_main_table(&package).field_model_complete()
+            );
+            let expected: Vec<String> = if mode == Some("Independent") {
+                names.iter().map(|name| name.to_string()).collect()
+            } else {
+                Vec::new()
+            };
+            assert_eq!(unknown_fields(&package), expected, "mode {mode:?}, names {names:?}");
+        }
     }
 }
 

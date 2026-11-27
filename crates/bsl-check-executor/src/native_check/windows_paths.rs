@@ -90,8 +90,10 @@ mod tests {
 
     #[test]
     fn ordinary_windows_profile_paths_accept_verbatim_canonicalization() {
-        validate_canonical(&std::env::current_exe().unwrap(), false).unwrap();
         let temp = super::super::tests::canonical_tempdir();
+        let executable = temp.path().join("platform.exe");
+        fs::write(&executable, b"platform fixture").unwrap();
+        validate_canonical(&executable, false).unwrap();
         validate_canonical(temp.path(), true).unwrap();
     }
 }

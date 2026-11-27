@@ -51,6 +51,8 @@ plans/
 
 # 1C platform auto-generated
 **/ConfigDumpInfo.xml
+!/crates/bsl-metadata/fixtures/rename/carrier-corpus/base/ConfigDumpInfo.xml
+!/crates/bsl-metadata/fixtures/rename/carrier-corpus/extension/ConfigDumpInfo.xml
 
 # Test data
 /data/

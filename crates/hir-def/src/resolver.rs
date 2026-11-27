@@ -93,9 +93,9 @@ impl Resolver {
 
     /// Like [`Self::with_builtins_and_workspace`], but same-module method/variable
     /// lookups resolve against `local_symbols` (the effective module's symbol tree)
-    /// instead of the module's declarations by name. Cross-module / metadata resolution still
-    /// keys on `module_id.file_id`, which is the base file — correct, because the
-    /// effective module *is* the base module with the extension's edits applied.
+    /// instead of the module's declarations by name. Cross-module / metadata resolution
+    /// keys on `module_id.file_id`, the compilation context supplied by the caller;
+    /// the effective declarations retain their original method identities.
     /// A name that misses in `local_symbols` retries against `extension_module`, the
     /// extension the effective module was spliced from (base shadows extension); `None`
     /// for a body the extension does not compile.
@@ -182,6 +182,12 @@ impl Resolver {
             }
         }
         None
+    }
+
+    /// The physical owner of the current body, including the base of an effective module.
+    /// `module_id` still supplies the compilation and visibility context.
+    pub fn body_module_id(&self) -> Option<ModuleId> {
+        self.module_local_symbols().map(|symbols| symbols.module_id()).or_else(|| self.module_id())
     }
 
     /// The effective module's symbol tree, when this resolver was built with one
@@ -1142,6 +1148,20 @@ mod tests {
     use crate::scope::{ExprScopes, ScopeDef};
     use crate::ModuleId;
     use vfs::FileId;
+
+    #[test]
+    fn effective_body_owner_keeps_the_extension_compilation_context() {
+        let base = ModuleId::new(FileId::from_raw(1));
+        let extension = ModuleId::new(FileId::from_raw(2));
+        let symbols = Arc::new(ModuleInterface::empty(base));
+        let effective =
+            Resolver::with_builtins_and_workspace_effective(extension, symbols, Some(extension));
+        assert_eq!(effective.module_id(), Some(extension));
+        assert_eq!(effective.body_module_id(), Some(base));
+        let ordinary = Resolver::with_builtins_and_workspace(extension);
+        assert_eq!(ordinary.module_id(), Some(extension));
+        assert_eq!(ordinary.body_module_id(), Some(extension));
+    }
 
     #[test]
     fn test_module_resolver() {

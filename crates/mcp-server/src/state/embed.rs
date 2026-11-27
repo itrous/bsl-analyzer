@@ -305,6 +305,12 @@ impl SharedState {
         dyn Fn(crate::graph::GraphPublishSignal) -> crate::graph::GraphPublishOutcome + Send + Sync,
     > {
         Arc::new(move |signal| {
+            let Ok(_disk_read) = search_engine.disk_gate.try_read() else {
+                return crate::graph::GraphPublishOutcome {
+                    topology_handled: false,
+                    roots_handled: false,
+                };
+            };
             // The transition must precede the context consume: the latter marks and refreshes
             // rows under the root keyspace that is current when it takes the engine lock.
             let (roots_handled, pending_collection_embeddings, pending_overlay_embeddings) =
@@ -707,6 +713,9 @@ impl SharedState {
         keep_going: &dyn Fn() -> bool,
         retry_transient: &mut dyn FnMut() -> bool,
     ) -> super::WorkspaceSearchApply<OverlayWarmupState, String> {
+        let Ok(_disk_read) = search_engine.disk_gate.try_read() else {
+            return super::WorkspaceSearchApply::TransientRefusal;
+        };
         let cloned = match search_engine.acquire_for_owner(stop) {
             Ok(guard) => match guard.as_ref() {
                 Some(engine) => {

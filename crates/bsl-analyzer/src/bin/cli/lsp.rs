@@ -357,7 +357,7 @@ async fn connect_backend(root: &Path, context: &LspContext) -> Result<BackendPip
     shared::prepare_platform_identity(&root)?;
     let identity = shared::identity(&root, &cache)?;
     let key = mcp_server::broker::SharedBackendKey::new(identity.clone());
-    let mut command = std::process::Command::new(std::env::current_exe()?);
+    let mut command = mcp_server::broker::proxy::BrokerCommand::new(std::env::current_exe()?);
     command
         .args(["mcp", "serve", "--profile", "workspace", "--mode", "daemon", "--source-dir"])
         .arg(&root)

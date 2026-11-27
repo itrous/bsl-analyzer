@@ -1431,7 +1431,9 @@ fn build_latency_ctx(env: &mut BenchEnv) -> LatencyRequestContext {
         .get_or_insert_with(|| FrozenFilePaths::freeze(&env.state.vfs.read()))
         .clone();
     let state = &env.state;
+    let disk_read = state.try_disk_read().expect("benchmark workspace has readable disk");
     let ctx = LatencyRequestContext {
+        disk_read,
         analysis: state.analysis_host.analysis(),
         workspace_root: state.workspace_root.clone(),
         project: state.project.clone(),

@@ -1,6 +1,7 @@
 use crate::call_hierarchy_index_overlay::CallHierarchyIndexFrozenSnapshot;
 use crate::call_hierarchy_index_state::CallHierarchyIndexSnapshotId;
 use crate::global_state::GlobalState;
+use salsa::Database as _;
 
 use super::BATCH_SIZE;
 
@@ -49,6 +50,14 @@ impl GlobalState {
                 continue;
             }
 
+            let disk_read = match self.prepare_disk_read() {
+                Ok(read) => read,
+                Err(_) => {
+                    self.call_hierarchy_index_rebuilds.insert(source_root);
+                    continue;
+                }
+            };
+
             let Some(generation) = lifecycle.next_generation(source_root) else {
                 tracing::error!(
                     ?source_root,
@@ -71,14 +80,22 @@ impl GlobalState {
                 phase = "freeze",
                 "call hierarchy compact index metadata capture started"
             );
-            let frozen = {
+            let frozen = match salsa::Cancelled::catch(std::panic::AssertUnwindSafe(|| {
                 let analysis = self.analysis_host.analysis();
+                disk_read.register_cancel(analysis.database().cancellation_token());
                 CallHierarchyIndexFrozenSnapshot::capture(
                     analysis.database(),
                     source_root,
                     &self.mem_docs.freeze(),
                     generation,
+                    disk_read.clone(),
                 )
+            })) {
+                Ok(frozen) => frozen,
+                Err(_) => {
+                    self.call_hierarchy_index_rebuilds.insert(source_root);
+                    continue;
+                }
             };
             tracing::debug!(
                 phase = "freeze",
@@ -104,7 +121,16 @@ impl GlobalState {
             let analysis_guard = self.note_analysis_spawned();
             let spawned = self.task_pool.pool.try_spawn(move || {
                 let _analysis_guard = analysis_guard;
-                super::worker::run_build(worker_lifecycle, mem_docs, frozen)
+                let task = super::worker::run_build(worker_lifecycle, mem_docs, frozen);
+                crate::global_state::Task::DiskReadCompleted {
+                    epoch: disk_read.epoch(),
+                    task: Box::new(task),
+                    cancelled: Box::new(crate::global_state::Task::CallHierarchyIndexSuperseded {
+                        source_root,
+                        generation,
+                        reason: "workspace_disk_epoch_changed",
+                    }),
+                }
             });
             if spawned.is_err() {
                 tracing::warn!(

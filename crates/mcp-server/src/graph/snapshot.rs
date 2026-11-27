@@ -25,6 +25,7 @@ pub(super) const WALK_VERIFY_INTERVAL: std::time::Duration = std::time::Duration
 /// stale topology under fresh file stats.
 #[derive(Default)]
 pub(super) struct FpMapState {
+    pub(super) dependency_fingerprint: Option<[u8; 32]>,
     /// The same durable file identity and complete byte hash used by the graph database.
     /// Physical paths and metadata are deliberately absent: a moved tree must reuse this map,
     /// while a same-stat byte edit must invalidate it.
@@ -1649,6 +1650,7 @@ impl GraphState {
     /// another — a verdict can be paired with a composition that never produced it, and the
     /// pairing is exactly what says an obligation has been answered.
     pub(super) fn walk_scan_receipt(&self) -> Option<(super::debt::RecoveryScope, bool)> {
+        let _disk_read = self.disk_gate.try_read().ok()?;
         let root = self.workspace_root.as_deref()?;
         // Counted where the tree is actually walked. A walk is the expensive half of a
         // recovery pass, and a cost nothing counts is a cost nobody can measure.
@@ -1689,6 +1691,7 @@ impl GraphState {
     pub(super) fn current_disk_fp_with_watermark(
         &self,
     ) -> Option<(crate::graph_db::GraphFp, bool, u64)> {
+        let _disk_read = self.disk_gate.try_read().ok()?;
         let root = self.workspace_root.as_deref()?;
         self.invalidate_scan_on_hub_drift();
         let mut cache = lock_recover(&self.scan);
@@ -1721,7 +1724,10 @@ impl GraphState {
                 (fp_state.map.as_ref(), fp_state.roots.as_ref(), fp_state.walked_at)
             {
                 if self.now().saturating_duration_since(walked_at) < WALK_VERIFY_INTERVAL {
-                    let fp = fold_portable_fingerprint(map, fp_state.topology);
+                    let fp = super::scan::with_dependency_fingerprint(
+                        fold_portable_fingerprint(map, fp_state.topology),
+                        fp_state.dependency_fingerprint,
+                    );
                     let clean = fp_state.clean && !roots.is_empty();
                     *cache =
                         Some(ScanCache { at: self.now(), disk_fp: fp, clean, observed_through });
@@ -1749,7 +1755,9 @@ impl GraphState {
                 .all(|stat| stat.key(roots).is_some() && stat.content_hash().is_some())
         });
         let topology = project.portable_topology;
-        let fp = super::scan::fingerprint_of_project(&universe.stats, &project);
+        let observed = super::scan::fingerprint_with_dependencies(&universe.stats, &project);
+        let dependency_fingerprint = observed.as_ref().and_then(|(_, dependencies)| *dependencies);
+        let fp = observed.map(|(fingerprint, _)| fingerprint);
         let portable_complete = keys_complete && fp.is_some();
         let clean = clean && portable_complete;
         let fp = fp.unwrap_or(crate::graph_db::GraphFp {
@@ -1770,6 +1778,7 @@ impl GraphState {
         {
             let mut fp_state = lock_recover(&self.fp_map);
             fp_state.map = map;
+            fp_state.dependency_fingerprint = dependency_fingerprint;
             fp_state.roots = project.search_roots.clone();
             fp_state.walked_at = Some(self.now());
             fp_state.topology = topology;

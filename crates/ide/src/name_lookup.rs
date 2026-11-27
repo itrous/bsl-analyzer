@@ -1302,7 +1302,8 @@ fn from_module_members(db: &RootDatabaseImpl, merge: &Merge<'_>) -> Vec<NameCand
 ///
 /// Each form is one `symbol_info` resolution path: a common module method is a
 /// pair, everything else a triple routed by metadata type.
-fn method_symbol(key: &ModuleKey, method: &str) -> String {
+/// The same method address is published by the resident and accepted by graph lookup.
+pub(crate) fn method_symbol(key: &ModuleKey, method: &str) -> String {
     match key {
         ModuleKey::Common { name } => format!("{name}.{method}"),
         ModuleKey::Manager { mdo_type, name }
@@ -1400,7 +1401,7 @@ mod tests {
         // A spelling the direct lookup misses, so the fallback table gets built.
         let mut places = PathPlaces::new(&db);
         let caught = salsa::Cancelled::catch(std::panic::AssertUnwindSafe(|| {
-            places.of("\\ws\\CommonModules\\Первый\\Ext\\Module.bsl")
+            places.of("/ws/CommonModules/Первый/Ext/Missing.bsl")
         }));
         assert!(
             matches!(caught, Err(salsa::Cancelled::Local)),

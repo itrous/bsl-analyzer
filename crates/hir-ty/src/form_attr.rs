@@ -117,22 +117,35 @@ pub(crate) fn resolve_form_attribute_value(
     form_attribute_value_typeid(db, attr, &obj_resolver)
 }
 
+pub(crate) fn lower_form_attribute_for_form(
+    db: &dyn TypeKernelDb,
+    form: &bsl_metadata::Form,
+    attr: &FormAttribute,
+    resolver: &dyn MetadataResolver,
+) -> TypeId {
+    if form.is_ordinary() {
+        form_attribute_value_typeid(db, attr, resolver)
+            .unwrap_or_else(|| attribute_type_to_typeid(db, &attr.attr_type, resolver))
+    } else {
+        lower_form_attribute_to_typeid(db, attr, resolver)
+    }
+}
+
 pub(crate) fn resolve_form_attribute(
     db: &dyn HirDatabase,
     resolver: &Resolver,
     name: &Name,
 ) -> Option<TypeId> {
-    if !crate::this_object::is_managed_form_module(db, resolver) {
-        return None;
-    }
-
     let module_id = resolver.module_id()?;
     let metadata = db.module_metadata(module_id);
+    if metadata.module_type != bsl_metadata::ModuleType::FormModule {
+        return None;
+    }
     let form = metadata.form.as_ref()?;
     let attr = form.find_attribute(name.as_str())?;
 
     let obj_resolver = crate::object_resolver::DbObjectResolver::new(db, module_id.file_id);
-    Some(lower_form_attribute_to_typeid(db, attr, &obj_resolver))
+    Some(lower_form_attribute_for_form(db, form, attr, &obj_resolver))
 }
 
 /// A column the managed form this module belongs to adds to the rows of a tabular

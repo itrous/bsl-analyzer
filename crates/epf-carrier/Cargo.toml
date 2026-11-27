@@ -1,0 +1,19 @@
+[package]
+name = "epf-carrier"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Internal synthetic server EPF module carrier"
+
+[dependencies]
+bsl-platform.workspace = true
+check-contract = { path = "../check-contract" }
+line-index.workspace = true
+parser.workspace = true
+stdx.workspace = true
+syntax.workspace = true
+flate2 = { version = "=1.1.9", default-features = false, features = ["rust_backend"] }
+
+[lints]
+workspace = true

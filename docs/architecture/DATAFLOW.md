@@ -37,7 +37,8 @@ HIR / Body
 Содержит generic engine и конкретные анализы:
 
 - reaching definitions;
-- liveness analysis.
+- liveness analysis;
+- анализ наблюдаемых результатов ветки `Исключение`.
 
 ### `ide-diagnostics`
 
@@ -62,6 +63,14 @@ collector.
 Это базовый инструмент для поиска неиспользуемых локальных переменных и других
 похожих задач.
 
+### Наблюдаемые результаты ветки `Исключение`
+
+`catch_outcome` отслеживает, доходят ли данные об ошибке из ветки `Исключение`
+до наблюдаемого результата на последующих путях выполнения. `hir-ty` передаёт
+доказанные для конкретных выражений эффекты вызовов из фактов платформы.
+`dataflow` применяет эти эффекты к потоку значений. Неизвестный вызов сам
+по себе не подтверждает обработку ошибки.
+
 ## Как это связано с Salsa
 
 Результаты dataflow не пересчитываются без необходимости. Они кэшируются как
@@ -79,7 +88,8 @@ collector.
 
 - `UnusedLocalVariable` — использует module-level liveness;
 - `IncorrectUseOfStrTemplate` — использует reaching definitions;
-- `RewriteMethodParameter` — использует module-level reaching definitions.
+- `RewriteMethodParameter` — использует module-level reaching definitions;
+- `MissingCodeTryCatchEx` — использует наблюдаемые результаты ветки `Исключение`.
 
 ### Диагностики, которые выполняются в flow-sensitive collector
 

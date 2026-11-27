@@ -32,7 +32,7 @@ fn deprecated_platform_diagnostic_families_match_current_replacements() {
               message: Use "StrFind" instead of deprecated "Find"
               severity: Warning
             DeprecatedPlatformApi @ 4:5..4:12
-              message: Use "CommonUse.MessageToUser" instead of deprecated "Message"
+              message: Deprecated API "Message"
               severity: Warning
             DeprecatedPlatformApi @ 5:21..5:49
               message: Method "GetShortApplicationCaption" is deprecated. You should use "ClientApplication.GetShortCaption".

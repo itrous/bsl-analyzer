@@ -140,6 +140,7 @@ mod tests {
             mdo_type: MdoType::Catalog,
             name: "Номенклатура".to_string(),
             name_en: Some("Items".to_string()),
+            read_properties: Default::default(),
             attributes: vec![],
             tabular_sections: vec![
                 TabularSection::new(Uuid::nil(), "Штрихкоды"),

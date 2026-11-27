@@ -666,6 +666,17 @@ impl TableRef {
         }
     }
 
+    /// The implicit alias of a physical Kind.Object source is its object name.
+    pub fn binding_name(&self) -> &str {
+        self.alias
+            .as_ref()
+            .map(|name| name.as_str())
+            .or_else(|| {
+                (self.parts.len() == 2 && !self.is_virtual_table).then(|| self.parts[1].as_str())
+            })
+            .unwrap_or(&self.full_name)
+    }
+
     pub fn effective_name(&self) -> &str {
         self.alias.as_ref().map(|a| a.as_str()).unwrap_or(&self.full_name)
     }

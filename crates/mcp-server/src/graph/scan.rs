@@ -267,7 +267,78 @@ pub(crate) fn fingerprint_of_project(
     stats: &[FileStat],
     project: &super::input::ProjectSnapshot,
 ) -> Option<crate::graph_db::GraphFp> {
-    portable_fingerprint_of(stats, project.search_roots.as_ref(), project.portable_topology)
+    fingerprint_with_dependencies(stats, project).map(|(fingerprint, _)| fingerprint)
+}
+
+pub(super) fn fingerprint_with_dependencies(
+    stats: &[FileStat],
+    project: &super::input::ProjectSnapshot,
+) -> Option<(crate::graph_db::GraphFp, Option<[u8; 32]>)> {
+    let fingerprint =
+        portable_fingerprint_of(stats, project.search_roots.as_ref(), project.portable_topology)?;
+    let dependencies = if project.semantic_dependency_roots().is_empty() {
+        None
+    } else {
+        Some(semantic_dependency_fingerprint(project)?)
+    };
+    Some((with_dependency_fingerprint(fingerprint, dependencies), dependencies))
+}
+
+pub(super) fn with_dependency_fingerprint(
+    mut fingerprint: crate::graph_db::GraphFp,
+    dependencies: Option<[u8; 32]>,
+) -> crate::graph_db::GraphFp {
+    if let Some(dependencies) = dependencies {
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"graph-subjects-and-semantic-dependencies-v1\0");
+        hash.update(&fingerprint.files.to_le_bytes());
+        hash.update(&dependencies);
+        fingerprint.files = u64::from_le_bytes(
+            hash.finalize().as_bytes()[..8].try_into().expect("digest has at least eight bytes"),
+        );
+    }
+    fingerprint
+}
+
+/// Byte freshness of owner dependencies. These inputs never acquire graph file keys.
+pub(crate) fn semantic_dependency_fingerprint(
+    project: &super::input::ProjectSnapshot,
+) -> Option<[u8; 32]> {
+    let roots = project.semantic_dependency_roots();
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"semantic-owner-inputs-v1\0");
+    if roots.is_empty() {
+        return Some(*hash.finalize().as_bytes());
+    }
+    let set = SourceSet::scan_in_scope(&roots, &project.excluded, &project.user_excluded);
+    if !set.clean() {
+        return None;
+    }
+    let content = super::universe::file_stats_with_content_errors(&set, &roots);
+    if content.content_unreadable != 0 {
+        return None;
+    }
+    let mut entries = content
+        .stats
+        .into_iter()
+        .map(|stat| {
+            let (index, root) = roots
+                .iter()
+                .enumerate()
+                .filter(|(_, root)| stat.walked.starts_with(root))
+                .max_by_key(|(_, root)| root.components().count())?;
+            let relative =
+                stat.walked.strip_prefix(root).ok()?.to_string_lossy().replace('\\', "/");
+            Some((index, relative, stat.content_hash()?))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    entries.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+    for (index, path, content) in entries {
+        hash.update(&(index as u64).to_le_bytes());
+        update_len_prefixed(&mut hash, path.as_bytes());
+        hash.update(&content);
+    }
+    Some(*hash.finalize().as_bytes())
 }
 
 fn update_len_prefixed(hasher: &mut blake3::Hasher, bytes: &[u8]) {

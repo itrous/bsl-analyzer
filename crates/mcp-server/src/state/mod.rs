@@ -504,7 +504,8 @@ impl SessionConfig {
         self.onec_client = Some(client);
     }
 
-    pub fn add_onec_connection(&mut self, name: String, connection: OnecConnection) {
+    pub fn add_onec_connection(&mut self, name: String, mut connection: OnecConnection) {
+        connection.client = connection.client.map(|client| client.with_connection_name(&name));
         self.onec_connections.insert(name, connection);
     }
 
@@ -519,6 +520,7 @@ pub struct OnecConnection {
     client: Option<OnecClient>,
     allow_execute: bool,
     check_executor: Option<CheckExecutorProfile>,
+    epf_module_check: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -551,7 +553,7 @@ pub struct CheckExecutorProfile {
 impl OnecConnection {
     /// Creates an HTTP-backed connection with the requested execution permission.
     pub fn new(client: OnecClient, allow_execute: bool) -> Self {
-        Self { client: Some(client), allow_execute, check_executor: None }
+        Self { client: Some(client), allow_execute, check_executor: None, epf_module_check: false }
     }
 
     /// Returns the configured HTTP client, if this connection has one.
@@ -575,7 +577,18 @@ impl OnecConnection {
         allow_execute: bool,
         check_executor: Option<CheckExecutorProfile>,
     ) -> Self {
-        Self { client, allow_execute, check_executor }
+        Self { client, allow_execute, check_executor, epf_module_check: false }
+    }
+
+    /// Explicitly enable the limited synthetic server Object module check route.
+    pub fn with_epf_module_check(mut self, enabled: bool) -> Self {
+        self.epf_module_check = enabled;
+        self
+    }
+
+    /// Whether the limited HTTP module checker is explicitly enabled.
+    pub fn epf_module_check(&self) -> bool {
+        self.epf_module_check
     }
 
     /// Reports whether execution tools are enabled for this connection.
@@ -665,6 +678,9 @@ impl SharedState {
         lease: &crate::workspace_lease::WorkspaceLease,
         apply: impl FnOnce(&mut bsl_search::SearchEngine) -> Result<T, bsl_search::SearchError>,
     ) -> WorkspaceSearchApply<T, bsl_search::SearchError> {
+        let Ok(_disk_read) = shared.disk_gate.try_read() else {
+            return WorkspaceSearchApply::TransientRefusal;
+        };
         let mut guard = match shared.acquire_for_owner(stop) {
             Ok(guard) => guard,
             // Leaving is not failing, and it is not a refusal either: an owner told to go must
@@ -714,6 +730,9 @@ impl SharedState {
             &mut dyn FnMut() -> std::ops::ControlFlow<()>,
         ) -> std::ops::ControlFlow<(), Result<T, bsl_search::SearchError>>,
     ) -> WorkspaceSearchApply<T, bsl_search::SearchError> {
+        let Ok(_disk_read) = shared.disk_gate.try_read() else {
+            return WorkspaceSearchApply::TransientRefusal;
+        };
         let mut guard = match shared.acquire_for_owner(stop) {
             Ok(guard) => guard,
             Err(crate::tools::search::OwnerLockRefused::Closing) => {
@@ -1190,7 +1209,8 @@ impl SharedState {
         self.onec_client.as_ref()
     }
 
-    pub fn add_onec_connection(&mut self, name: String, connection: OnecConnection) {
+    pub fn add_onec_connection(&mut self, name: String, mut connection: OnecConnection) {
+        connection.client = connection.client.map(|client| client.with_connection_name(&name));
         self.onec_connections.insert(name, connection);
     }
 
