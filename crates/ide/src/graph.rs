@@ -229,6 +229,10 @@ pub struct GraphOverview {
     pub nodes: usize,
     pub edges: usize,
     pub top_by_centrality: Vec<NodeRef>,
+    /// At least one module's semantic call projection was truncated. Counts and edges
+    /// describe only the known projection in that case.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub incomplete: bool,
     pub edge_provenance: BTreeMap<&'static str, usize>,
     pub client_to_server_edges: usize,
 }
@@ -245,6 +249,10 @@ pub struct NeighborsResult {
     pub root: NodeRef,
     pub nodes: Vec<NodeRef>,
     pub edges: Vec<EdgeRef>,
+    /// The backing in-memory graph has a truncated semantic call projection. No
+    /// edges are inferred to fill the missing portion.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub incomplete: bool,
     /// Total distinct neighbours discovered (excluding the root), before the
     /// `max_nodes` cap. Lets an agent see the true fan-out even when only the
     /// top-centrality slice is returned in `nodes`.
@@ -374,6 +382,10 @@ pub struct GraphContext {
     pub dispatch: Vec<&'static str>,
     /// The declaration header (collapsed to one line), when available.
     pub signature: Option<String>,
+    /// The module's semantic notify projection stopped at its work budget, so
+    /// `calls` omits notify references. An empty `calls` then does not prove the
+    /// method calls nothing; [`Self::render`] states the gap.
+    pub notify_projection_incomplete: bool,
     /// Names of the user methods this method calls (sorted, deduped by name).
     pub calls: Vec<String>,
     /// Metadata this method touches or reads, as `Тип.Объект[.Реквизит]` (Russian
@@ -409,6 +421,9 @@ impl GraphContext {
             out.push_str(sig);
             out.push('\n');
         }
+        if self.notify_projection_incomplete {
+            out.push_str("Incomplete: notify projection\n");
+        }
         render_capped_list(&mut out, "Calls", &self.calls);
         render_capped_list(&mut out, "Reads", &self.reads);
         out
@@ -419,6 +434,7 @@ impl GraphContext {
     pub fn is_empty(&self) -> bool {
         self.dispatch.is_empty()
             && self.signature.is_none()
+            && !self.notify_projection_incomplete
             && self.calls.is_empty()
             && self.reads.is_empty()
     }
@@ -480,7 +496,13 @@ impl Analysis {
         reads.sort();
         reads.dedup();
 
-        Some(GraphContext { dispatch: dispatch_labels(facts.dispatch), signature, calls, reads })
+        Some(GraphContext {
+            dispatch: dispatch_labels(facts.dispatch),
+            signature,
+            notify_projection_incomplete: facts.notify_projection_incomplete,
+            calls,
+            reads,
+        })
     }
 
     /// Cold-start overview: module/method/edge counts, the most-called methods,
@@ -916,7 +938,15 @@ fn emit_fused_chunks(
                 calls.dedup();
                 reads.sort();
                 reads.dedup();
-                let ctx = GraphContext { dispatch, signature, calls, reads };
+                // The build refuses a module whose notify projection stopped, so the
+                // projected edges were complete when the graph was published.
+                let ctx = GraphContext {
+                    dispatch,
+                    signature,
+                    notify_projection_incomplete: false,
+                    calls,
+                    reads,
+                };
                 ctx_by_name.insert(entry.name.as_str().fold_lower(), ctx.render());
             }
         }
@@ -1161,6 +1191,20 @@ pub fn build_workspace_graph_rows(
     for (i, &batch) in batches.iter().enumerate() {
         note("index", i, batch);
         let db = open_batch(batch);
+        // Screen before any sink write: a partial projection cannot establish that
+        // absent notify edges are really absent. Reuse the index pass's database so
+        // this safety check does not require another workspace-wide load.
+        if let Some(module) = batch
+            .iter()
+            .copied()
+            .find(|module| db.module_call_summary(*module).notify_projection_incomplete)
+        {
+            dropper.finish()?;
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("notify projection incomplete for module {module:?}; refusing persistent graph build"),
+            )));
+        }
         index.add_batch(&pool, &db, batch);
         dropper.send(db)?;
         clear_node_caches(&pool);
@@ -1260,6 +1304,12 @@ pub fn build_workspace_graph_rows(
         note("call_edges", i, batch);
         let db = open_batch(batch);
         let proj = project_batch_call_edges(&pool, &db, batch, &index, &mut state);
+        if let Some(module) = proj.notify_projection_incomplete.first() {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("notify projection incomplete for module {module:?}; refusing persistent graph build"),
+            )));
+        }
         if fused.is_some() {
             accumulate_method_edges(&proj.edges, &mut method_edge_facts, &index);
         }
@@ -1530,6 +1580,12 @@ pub fn reproject_changed_modules(
     let db = open_batch(changed);
     let mut state = GraphBuildState::new();
     let call_proj = project_batch_call_edges(&pool, &db, changed, &index, &mut state);
+    if let Some(module) = call_proj.notify_projection_incomplete.first() {
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("notify projection incomplete for module {module:?}; refusing persistent graph update"),
+        )));
+    }
     let mut projected = call_proj.edges;
     projected.extend(project_batch_query_edges(&pool, &db, changed, &mut state));
 
@@ -2494,6 +2550,7 @@ impl<'a> GraphCtx<'a> {
             nodes: node_count,
             edges: self.graph.edge_count(),
             top_by_centrality,
+            incomplete: self.graph.incomplete,
             edge_provenance,
             client_to_server_edges,
         }
@@ -2646,6 +2703,7 @@ impl<'a> GraphCtx<'a> {
             root: self.node_ref(root, params.detail),
             nodes,
             edges,
+            incomplete: self.graph.incomplete,
             total,
             returned,
             dropped_count: total - returned,
@@ -3418,6 +3476,234 @@ mod tests {
             db.set_file_text(fid, text);
         }
         Analysis::from_database(db)
+    }
+
+    fn exhausted_notify_projection_workspace() -> Analysis {
+        // These writes exhaust the lower alias resolver's bounded walk.
+        let mut code = String::from("Процедура Тест()\nПерем А;\n");
+        for _ in 0..5_000 {
+            code.push_str("А = НеизвестноеЗначение;\n");
+        }
+        code.push_str("О = Новый(\"CallbackDescription\", А);\nКонецПроцедуры\n");
+        workspace(&[("/src/CommonModules/Тест/Ext/Module.bsl", &code)])
+    }
+
+    #[test]
+    fn notify_gate_reuses_existing_batch_opens() {
+        let analysis = workspace(&[(
+            "/src/CommonModules/Тест/Ext/Module.bsl",
+            "Процедура Тест()\nКонецПроцедуры\n",
+        )]);
+        let module = ModuleId::new(FileId(0));
+        let modules = [module];
+        let batches = [modules.as_slice()];
+        let paths = FxHashMap::from_iter([(
+            module.file_id,
+            "CommonModules/Тест/Ext/Module.bsl".to_owned(),
+        )]);
+        let mdo_files = hir::graph_index::MdoFiles::default();
+        let mut opens = 0;
+        let mut open_batch = |_: &[ModuleId]| {
+            opens += 1;
+            analysis.database().clone()
+        };
+        let mut sink = |_: &[NodeRow], _: &[EdgeRow]| Ok(());
+
+        build_workspace_graph_rows(
+            &modules,
+            &paths,
+            None,
+            &mdo_files,
+            &batches,
+            &mut open_batch,
+            &mut sink,
+            None,
+            None,
+        )
+        .expect("complete projection builds");
+        assert_eq!(
+            opens, 9,
+            "notify screening reuses the index pass instead of reopening the batch"
+        );
+
+        opens = 0;
+        let mut open_batch = |_: &[ModuleId]| {
+            opens += 1;
+            analysis.database().clone()
+        };
+        reproject_changed_modules(
+            &modules,
+            &modules,
+            &paths,
+            None,
+            &mdo_files,
+            &batches,
+            &mut open_batch,
+            None,
+        )
+        .expect("complete projection updates");
+        assert_eq!(opens, 2, "index and changed-module projection each open the batch once");
+    }
+
+    #[test]
+    fn call_batch_projection_reports_exhausted_notify_projection() {
+        let analysis = exhausted_notify_projection_workspace();
+        let module = ModuleId::new(FileId(0));
+        let modules = [module];
+        let index = GraphIndex::build(analysis.database(), &modules);
+        let pool = rayon::ThreadPoolBuilder::new().build().unwrap();
+        let mut state = GraphBuildState::new();
+
+        let projection =
+            project_batch_call_edges(&pool, analysis.database(), &modules, &index, &mut state);
+
+        assert_eq!(projection.notify_projection_incomplete, vec![module]);
+    }
+
+    #[test]
+    fn public_in_memory_graph_queries_mark_truncated_projection_without_inventing_edges() {
+        let analysis = exhausted_notify_projection_workspace();
+
+        let overview = analysis.graph_overview(ROOT, None, 10);
+        assert!(overview.incomplete, "overview must disclose the truncated projection");
+        assert_eq!(overview.edges, 0, "missing callback edges are not synthesized");
+        assert_eq!(serde_json::to_value(&overview).unwrap()["incomplete"], serde_json::json!(true));
+
+        let params = NeighborsParams {
+            id: "method/common/Тест/Тест",
+            dir: Direction::Both,
+            depth: 1,
+            max_nodes: 10,
+            detail: GraphDetail::Names,
+            provenance_filter: Vec::new(),
+            edge_kind_filter: Vec::new(),
+            call_sites: false,
+            max_call_sites: 0,
+        };
+        let neighbors = analysis.graph_neighbors(ROOT, None, &params).expect("method resolves");
+        assert!(neighbors.incomplete, "neighbors must disclose the truncated projection");
+        assert!(neighbors.edges.is_empty(), "unknown callbacks must not become graph edges");
+        assert_eq!(
+            serde_json::to_value(&neighbors).unwrap()["incomplete"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn complete_in_memory_graph_omits_incomplete_marker() {
+        let analysis = workspace(&[(
+            "/src/CommonModules/Тест/Ext/Module.bsl",
+            "Процедура Тест()\nКонецПроцедуры\n",
+        )]);
+        let overview = analysis.graph_overview(ROOT, None, 10);
+        assert!(!overview.incomplete);
+        assert!(serde_json::to_value(overview).unwrap().get("incomplete").is_none());
+        let params = NeighborsParams {
+            id: "method/common/Тест/Тест",
+            dir: Direction::Both,
+            depth: 1,
+            max_nodes: 10,
+            detail: GraphDetail::Names,
+            provenance_filter: Vec::new(),
+            edge_kind_filter: Vec::new(),
+            call_sites: false,
+            max_call_sites: 0,
+        };
+        let neighbors = analysis.graph_neighbors(ROOT, None, &params).expect("method resolves");
+        assert!(!neighbors.incomplete);
+        assert!(serde_json::to_value(neighbors).unwrap().get("incomplete").is_none());
+    }
+
+    #[test]
+    fn graph_context_for_method_discloses_exhausted_notify_projection() {
+        let analysis = exhausted_notify_projection_workspace();
+        let method = Semantics::new(analysis.database())
+            .find_method(FileId(0), "Тест")
+            .expect("the fixture declares Тест");
+        let facts = hir::method_outbound_facts(analysis.database(), method.id());
+        assert!(
+            facts.notify_projection_incomplete,
+            "the outbound facts must carry the stopped projection"
+        );
+        assert!(facts.callees.is_empty(), "withheld notify edges must not be invented");
+
+        let ctx = analysis.graph_context_for_method(FileId(0), "Тест").expect("method resolves");
+        assert!(ctx.notify_projection_incomplete, "the context must carry the status");
+        assert!(ctx.calls.is_empty(), "withheld notify edges must not become calls");
+        assert!(
+            ctx.render().contains("Incomplete: notify projection"),
+            "consumers must see the gap instead of a complete empty call list: {}",
+            ctx.render()
+        );
+
+        // A context whose only fact is the withheld projection must still render and
+        // must not be dropped as empty by the producer.
+        let withheld = GraphContext { notify_projection_incomplete: true, ..Default::default() };
+        assert!(!withheld.is_empty(), "an incomplete context is not an empty one");
+        assert_eq!(withheld.render(), "Incomplete: notify projection\n");
+    }
+
+    #[test]
+    fn persistent_graph_build_rejects_exhausted_notify_projection_before_sink_writes() {
+        let analysis = exhausted_notify_projection_workspace();
+        let module = ModuleId::new(FileId(0));
+        assert!(analysis.database().module_call_summary(module).notify_projection_incomplete);
+        let modules = [module];
+        let batches = [modules.as_slice()];
+        let paths = FxHashMap::from_iter([(
+            module.file_id,
+            "CommonModules/Тест/Ext/Module.bsl".to_owned(),
+        )]);
+        let mdo_files = hir::graph_index::MdoFiles::default();
+        let mut open_batch = |_: &[ModuleId]| analysis.database().clone();
+        let mut persisted_rows = Vec::new();
+        let mut sink = |nodes: &[NodeRow], edges: &[EdgeRow]| {
+            persisted_rows.push((nodes.len(), edges.len()));
+            Ok(())
+        };
+
+        let result = build_workspace_graph_rows(
+            &modules,
+            &paths,
+            None,
+            &mdo_files,
+            &batches,
+            &mut open_batch,
+            &mut sink,
+            None,
+            None,
+        );
+
+        assert!(result.is_err(), "incomplete notify projection must reject graph build");
+        assert!(persisted_rows.is_empty(), "a rejected build must not publish even a row prefix");
+    }
+
+    #[test]
+    fn persistent_graph_update_rejects_exhausted_notify_projection_before_rows_exist() {
+        let analysis = exhausted_notify_projection_workspace();
+        let module = ModuleId::new(FileId(0));
+        assert!(analysis.database().module_call_summary(module).notify_projection_incomplete);
+        let modules = [module];
+        let batches = [modules.as_slice()];
+        let paths = FxHashMap::from_iter([(
+            module.file_id,
+            "CommonModules/Тест/Ext/Module.bsl".to_owned(),
+        )]);
+        let mdo_files = hir::graph_index::MdoFiles::default();
+        let mut open_batch = |_: &[ModuleId]| analysis.database().clone();
+
+        let result = reproject_changed_modules(
+            &modules,
+            &modules,
+            &paths,
+            None,
+            &mdo_files,
+            &batches,
+            &mut open_batch,
+            None,
+        );
+
+        assert!(result.is_err(), "incomplete notify projection must reject incremental update");
     }
 
     /// Two common modules: a client-dispatched caller invoking a server-only

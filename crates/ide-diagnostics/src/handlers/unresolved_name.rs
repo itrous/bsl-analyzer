@@ -35,6 +35,47 @@ pub fn from_hir(
 mod tests {
     use super::*;
 
+    fn check_common_module_with_env_options(
+        source: &str,
+        checked_environments: Option<hir::execution_env::EnvFlags>,
+    ) -> Vec<Diagnostic> {
+        use crate::test_utils::check_cfe_at_with_db_setup;
+        use hir::execution_env::EnvOptions;
+
+        let mut builder = test_fixture::CfeFixtureBuilder::new("");
+        builder.add_extension("ClientExtension", "");
+        builder.add_extension_module("ClientExtension", "Caller", source);
+        let fixture = builder.build();
+        check_cfe_at_with_db_setup(
+            "CommonModules/Caller/Ext/Module.bsl",
+            source,
+            fixture,
+            &[],
+            crate::DiagnosticsConfig::all_enabled(),
+            |fixture| {
+                let extension = &fixture.extensions()[0];
+                let module_metadata = r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+<CommonModule uuid="00000000-0000-0000-0000-000000000001"><Properties>
+<Name>Caller</Name><Global>false</Global><ClientManagedApplication>true</ClientManagedApplication>
+<ClientOrdinaryApplication>true</ClientOrdinaryApplication><Server>true</Server>
+<ExternalConnection>true</ExternalConnection><ServerCall>false</ServerCall>
+<Privileged>false</Privileged><ReturnValuesReuse>DontUse</ReturnValuesReuse>
+</Properties></CommonModule></MetaDataObject>"#;
+                std::fs::write(extension.root().join("CommonModules/Caller.xml"), module_metadata)
+                    .unwrap();
+            },
+            |db| {
+                if let Some(checked_environments) = checked_environments {
+                    db.set_env_options(EnvOptions {
+                        checked_environments,
+                        ..EnvOptions::default()
+                    });
+                }
+            },
+            |_, ctx| crate::diagnostics(ctx),
+        )
+    }
+
     #[test]
     fn complete_surfaces_report_issue_185_roots_once() {
         use crate::test_utils::check_with_cfe;
@@ -97,6 +138,128 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(unresolved.len(), 1, "only the unrelated control miss remains: {diagnostics:?}");
         assert!(unresolved[0].contains("СовсемНеизвестноеИмя"));
+    }
+
+    #[test]
+    fn assignment_and_read_in_same_preprocessor_branch_are_local() {
+        let source = r#"
+Процедура Тест()
+#Если ТонкийКлиент Тогда
+    ТонкаяЛокальная = 1;
+    ЧтениеТонкойЛокальной = ТонкаяЛокальная;
+#КонецЕсли
+#Если МобильныйКлиент Тогда
+    Оболочка = 1;
+    ЧтениеОболочки = Оболочка;
+    ДочернийПроцесс = 2;
+    ЧтениеПроцесса = ДочернийПроцесс;
+    ЧтениеПроцесса2 = ДочернийПроцесс;
+    Сообщение = 3;
+    ЧтениеСообщения = Сообщение;
+    ЧтениеСообщения2 = Сообщение;
+#КонецЕсли
+#Если ТонкийКлиент Или ВебКлиент Тогда
+    Результат = 4;
+    ЧтениеРезультата = Результат;
+#КонецЕсли
+#Если ТонкийКлиент Тогда
+    ОбщаяЛокальная = 5;
+    ЧтениеОбщейЛокальной = ОбщаяЛокальная;
+#Иначе
+    ОбщаяЛокальная = 6;
+    ЧтениеОбщейЛокальной2 = ОбщаяЛокальная;
+#КонецЕсли
+#Если ТонкийКлиент Тогда
+    ТолькоТонкийКлиент = 7;
+#КонецЕсли
+#Если Сервер Тогда
+    КонтрольДругойСреды = ТолькоТонкийКлиент;
+#КонецЕсли
+#Если Сервер И Не Сервер Тогда
+    НевозможнаяЛокальная = 8;
+    ЧтениеНевозможнойЛокальной = НевозможнаяЛокальная;
+    ВеткаНеСобирается = НеизвестноеВозможноеИмя;
+#КонецЕсли
+    КонтрольНевозможной = НевозможнаяЛокальная;
+#Если НеизвестныйСимвол Тогда
+    КонтрольЧастичнойСреды = НеизвестноеИмяВозможнойВетки;
+#КонецЕсли
+    Контроль = СовершенноНесуществующееИмя;
+КонецПроцедуры
+"#;
+        let diagnostics = check_common_module_with_env_options(source, None);
+        let unresolved = diagnostics
+            .iter()
+            .filter(|diag| diag.code == DiagnosticCode::UnresolvedName)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unresolved.len(),
+            4,
+            "dead branches and same-branch locals are silent; different and partial environments remain checked: {diagnostics:?}"
+        );
+        for name in [
+            "ТолькоТонкийКлиент",
+            "НевозможнаяЛокальная",
+            "НеизвестноеИмяВозможнойВетки",
+            "СовершенноНесуществующееИмя",
+        ] {
+            assert!(
+                unresolved.iter().any(|diag| diag.message.contains(name)),
+                "expected unresolved diagnostic for {name}: {unresolved:?}"
+            );
+        }
+        for name in [
+            "Оболочка",
+            "ДочернийПроцесс",
+            "Сообщение",
+            "Результат",
+            "ОбщаяЛокальная",
+            "ТонкаяЛокальная",
+            "НеизвестноеВозможноеИмя",
+        ] {
+            assert!(
+                unresolved.iter().all(|diag| !diag.message.contains(name)),
+                "unexpected unresolved diagnostic for {name}: {unresolved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn impossible_preprocessor_branch_does_not_bind_outside_and_is_independent_of_checked_envs() {
+        use hir::execution_env::EnvFlags;
+
+        let source = r#"
+Процедура Тест()
+#Если Сервер И Не Сервер Тогда
+    НевозможнаяЛокальная = 1;
+    ЧтениеВНевозможнойВетви = НевозможнаяЛокальная;
+#КонецЕсли
+    ЧтениеПослеВетки = НевозможнаяЛокальная;
+#Если ТонкийКлиент Тогда
+    ДостижимаяЛокальная = 2;
+    ЧтениеДостижимойВетки = ДостижимаяЛокальная;
+#КонецЕсли
+КонецПроцедуры
+"#;
+        let diagnostics_for = |checked_environments| {
+            check_common_module_with_env_options(source, Some(checked_environments))
+        };
+
+        let unresolved_for = |checked| {
+            diagnostics_for(checked)
+                .into_iter()
+                .filter(|diag| diag.code == DiagnosticCode::UnresolvedName)
+                .map(|diag| diag.message)
+                .collect::<Vec<_>>()
+        };
+        for checked in [EnvFlags::SERVER, EnvFlags::THIN_CLIENT] {
+            let unresolved = unresolved_for(checked);
+            assert_eq!(
+                unresolved,
+                ["Имя 'НевозможнаяЛокальная' не определено"],
+                "the impossible branch is ignored, its assignment does not escape, the live branch is local, and checking other environments must not change ownership"
+            );
+        }
     }
 
     #[test]
@@ -362,9 +525,10 @@ mod tests {
     }
 
     /// A method of the implicit object, as the call channel already recognises
-    /// it, must not be `UnresolvedName` when read as a bare callee. A value
-    /// read of the same spelling, a name that kind does not own, and the same
-    /// call in a module with no such receiver stay diagnosed.
+    /// it, must not be `UnresolvedName` when read as a bare callee. The CFE test
+    /// fixture does not attest a complete member surface, so its unlisted calls
+    /// are deliberately not treated as absent. A separate common-module control
+    /// below has no implicit receiver and still diagnoses a truly absent call.
     struct ObjectKind {
         collection: &'static str,
         element: &'static str,
@@ -528,6 +692,16 @@ mod tests {
         std::fs::write(dir.join(format!("{name}.xml")), xml).expect("write object metadata");
     }
 
+    fn write_catalog_xml(root: &std::path::Path, name: &str, properties: &str) {
+        let dir = root.join("Catalogs");
+        std::fs::create_dir_all(&dir).expect("create collection directory");
+        let xml = format!(
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+<Catalog uuid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"><Properties><Name>{name}</Name>{properties}</Properties></Catalog></MetaDataObject>"#,
+        );
+        std::fs::write(dir.join(format!("{name}.xml")), xml).expect("write catalog metadata");
+    }
+
     fn tokens(
         source: &str,
         diagnostics: &[crate::Diagnostic],
@@ -608,14 +782,14 @@ mod tests {
             }
             for call in kind.absent_calls {
                 assert!(
-                    is_call_callee(&source, &diagnostics, DiagnosticCode::UnresolvedName, call),
-                    "{}: {call}() is not a method of this object: {unresolved:?}",
+                    !is_call_callee(&source, &diagnostics, DiagnosticCode::UnresolvedName, call),
+                    "{}: an unattested implicit receiver surface cannot prove {call}() absent: {unresolved:?}",
                     kind.collection
                 );
             }
             assert!(
-                value_read_is_unresolved(&source, &diagnostics, "ЭтоНовый"),
-                "{}: a value read of a method is still not a value: {unresolved:?}",
+                !value_read_is_unresolved(&source, &diagnostics, "ЭтоНовый"),
+                "{}: incomplete field facts cannot prove the method spelling absent as a value: {unresolved:?}",
                 kind.collection
             );
             if kind.methods.contains(&"ЭтоНовый") {
@@ -662,17 +836,26 @@ mod tests {
             crate::diagnostics,
         );
         let unresolved = tokens(source, &diagnostics, DiagnosticCode::UnresolvedName);
-        assert_eq!(
-            unresolved,
-            vec!["СовсемНеизвестныйВызов".to_string()],
-            "the parameter owns the value read, the call is the object method: {diagnostics:?}"
+        assert!(
+            !unresolved.iter().any(|name| name == "ЭтоНовый"),
+            "the parameter owns the value read: {diagnostics:?}"
+        );
+        assert!(
+            !is_call_callee(
+                source,
+                &diagnostics,
+                DiagnosticCode::UnresolvedName,
+                "СовсемНеизвестныйВызов"
+            ),
+            "an incomplete implicit receiver cannot prove the call absent: {diagnostics:?}"
         );
         assert!(diagnostics.iter().all(|diag| diag.code != DiagnosticCode::UnresolvedBareCall));
     }
 
     /// An export root has no collection directory. The call channel still
-    /// looks up methods of `ExternalDataProcessor` / `ExternalReport` once the
-    /// owner is attached; the callee read must use that same recognition.
+    /// looks up known methods of `ExternalDataProcessor` / `ExternalReport` once
+    /// the owner is attached; absent-call claims wait for a complete member
+    /// surface, which this fixture does not attest.
     #[test]
     fn external_object_module_bare_method_is_not_an_unresolved_name() {
         for (element, kind) in [
@@ -698,8 +881,8 @@ mod tests {
             );
             for call in ["ЭтоНовый", "СовсемНеизвестныйВызов"] {
                 assert!(
-                    is_call_callee(&source, &diagnostics, DiagnosticCode::UnresolvedName, call),
-                    "{element}: {call}() is not a method of this export: {unresolved:?}"
+                    !is_call_callee(&source, &diagnostics, DiagnosticCode::UnresolvedName, call),
+                    "{element}: incomplete implicit receiver data cannot prove {call}() absent: {unresolved:?}"
                 );
             }
         }
@@ -784,9 +967,9 @@ mod tests {
         diagnostics
     }
 
-    /// With `UnresolvedName` off, the call channel still owns the token: a
-    /// method of the implicit object stays silent, a name it does not own is
-    /// `UnresolvedBareCall`.
+    /// With `UnresolvedName` off, the call channel still owns the token. A
+    /// known method stays silent; an arbitrary call stays indeterminate while
+    /// the implicit receiver surface is incomplete.
     #[test]
     fn default_profile_keeps_the_call_channel_for_an_object_module() {
         let source = "\
@@ -821,21 +1004,21 @@ mod tests {
             "the call channel already recognises ЭтоНовый(): {diagnostics:?}"
         );
         assert!(
-            is_call_callee(
+            !is_call_callee(
                 source,
                 &diagnostics,
                 DiagnosticCode::UnresolvedBareCall,
                 "СовсемНеизвестныйВызов",
             ),
-            "an unknown bare call stays on the call channel: {diagnostics:?}"
+            "the call channel also defers when the implicit receiver surface is incomplete: {diagnostics:?}"
         );
         assert!(diagnostics.iter().all(|diag| diag.code != DiagnosticCode::UnresolvedName));
     }
 
-    /// An ordinary form has an implicit receiver whose surface cannot be built.
-    /// The call channel stays silent there; the callee read must not fill that
-    /// silence with `UnresolvedName`. A value read of the same spelling is still
-    /// not a value.
+    /// An ordinary form has an unreadable implicit receiver. Neither a bare call nor
+    /// a value read can be classified as absent from that unknown surface. A common-
+    /// module control proves the same value spelling is still diagnosed when its
+    /// receiver surface is complete.
     #[test]
     fn unreadable_form_bare_call_is_not_an_unresolved_name() {
         let source = "\
@@ -860,8 +1043,18 @@ mod tests {
             "a bare call on an unreadable form must not be accused as an undefined name: {diagnostics:?}"
         );
         assert!(
-            value_read_is_unresolved(source, &diagnostics, "Закрыть"),
-            "a value read is still not a value: {diagnostics:?}"
+            !value_read_is_unresolved(source, &diagnostics, "Закрыть"),
+            "an unreadable form surface cannot prove this value absent: {diagnostics:?}"
+        );
+
+        let control_source = "Процедура Тест()\n    Значение = Закрыть;\nКонецПроцедуры\n";
+        let control = crate::test_utils::check_with_cfe(
+            control_source,
+            test_fixture::CfeFixtureBuilder::new("").build(),
+        );
+        assert!(
+            value_read_is_unresolved(control_source, &control, "Закрыть"),
+            "the complete common-module control still diagnoses the same value read: {control:?}"
         );
     }
 
@@ -881,6 +1074,114 @@ mod tests {
             "a common module has no implicit object: {diagnostics:?}"
         );
         assert!(diagnostics.iter().all(|diag| diag.code != DiagnosticCode::UnresolvedBareCall));
+    }
+
+    /// A standard attribute the object's kind declares conditionally, whose presence
+    /// this object's own properties refute (a flat catalog's `ЭтоГруппа`/`Родитель`, a
+    /// zero-length code's `Код`), is a proven miss: the configuration metadata decides
+    /// it without any platform member-surface attestation. The attestation gate must
+    /// keep covering everything else: a present conditional attribute stays resolved,
+    /// an unknown name stays indeterminate, and a bare call keeps the call channel's
+    /// silence.
+    #[test]
+    fn conditional_standard_attribute_absent_by_local_metadata_is_a_proven_miss() {
+        let source = "\
+Процедура ПередЗаписью(Отказ)
+\tЕсли НЕ ЭтоГруппа И НЕ ЗначениеЗаполнено(Код) Тогда
+\t\tЗначение = Наименование;
+\t\tЗначение2 = СовершенноНеизвестноеИмя;
+\tКонецЕсли;
+\tЗначение3 = Родитель;
+КонецПроцедуры
+
+Процедура Вызовы()
+\tЭтоГруппа();
+КонецПроцедуры
+";
+        let fixture = test_fixture::CfeFixtureBuilder::new("").build();
+        write_catalog_xml(
+            fixture.root(),
+            "Плоский",
+            "<Hierarchical>false</Hierarchical><CodeLength>0</CodeLength>\
+             <DescriptionLength>100</DescriptionLength>",
+        );
+        let diagnostics = crate::test_utils::check_cfe_at_with_unreadable(
+            "Catalogs/Плоский/Ext/ObjectModule.bsl",
+            source,
+            fixture,
+            &[],
+            crate::diagnostics,
+        );
+        let unresolved = tokens(source, &diagnostics, DiagnosticCode::UnresolvedName);
+        for name in ["ЭтоГруппа", "Код", "Родитель"] {
+            assert!(
+                unresolved.iter().any(|token| token == name),
+                "{name} is refuted by the object's own properties and must be reported: {unresolved:?}"
+            );
+        }
+        assert!(
+            !unresolved.iter().any(|token| token == "Наименование"),
+            "a present conditional attribute stays resolved: {unresolved:?}"
+        );
+        assert!(
+            !unresolved.iter().any(|token| token == "СовершенноНеизвестноеИмя"),
+            "an unknown name stays with the surface-attestation gap: {unresolved:?}"
+        );
+        assert!(
+            !is_call_callee(source, &diagnostics, DiagnosticCode::UnresolvedName, "ЭтоГруппа"),
+            "a bare call keeps the call channel's silence: {unresolved:?}"
+        );
+    }
+
+    #[test]
+    fn partial_metadata_does_not_turn_missing_conditional_properties_into_proof() {
+        let source = "\
+Процедура ПередЗаписью(Отказ)\n\tЗначение = ЭтоГруппа;\n\tЗначение2 = Родитель;\n\tЗначение3 = Код;\n\tЗначение4 = СовершенноНеизвестноеИмя;\nКонецПроцедуры\n";
+        let fixture = test_fixture::CfeFixtureBuilder::new("").build();
+        write_catalog_xml(fixture.root(), "Неполный", "");
+        let diagnostics = crate::test_utils::check_cfe_at_with_unreadable(
+            "Catalogs/Неполный/Ext/ObjectModule.bsl",
+            source,
+            fixture,
+            &[],
+            crate::diagnostics,
+        );
+        let unresolved = tokens(source, &diagnostics, DiagnosticCode::UnresolvedName);
+        assert!(
+            unresolved.is_empty(),
+            "missing properties are unknown and general surface gate stays conservative: {unresolved:?}"
+        );
+    }
+
+    #[test]
+    fn conditional_standard_attribute_present_stays_resolved() {
+        let source = "\
+Процедура ПередЗаписью(Отказ)
+\tЗначение = ЭтоГруппа;
+\tЗначение2 = Код;
+\tЗначение3 = Родитель;
+\tЗначение4 = Наименование;
+КонецПроцедуры
+";
+        let fixture = test_fixture::CfeFixtureBuilder::new("").build();
+        write_catalog_xml(
+            fixture.root(),
+            "Иерархия",
+            "<Hierarchical>true</Hierarchical><CodeLength>9</CodeLength>\
+             <DescriptionLength>25</DescriptionLength>",
+        );
+        let diagnostics = crate::test_utils::check_cfe_at_with_unreadable(
+            "Catalogs/Иерархия/Ext/ObjectModule.bsl",
+            source,
+            fixture,
+            &[],
+            crate::diagnostics,
+        );
+        let unresolved = tokens(source, &diagnostics, DiagnosticCode::UnresolvedName);
+        assert!(
+            unresolved.is_empty(),
+            "every satisfied conditional attribute resolves: {unresolved:?}"
+        );
     }
 
     #[test]

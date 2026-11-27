@@ -73,12 +73,13 @@ pub use ide_db::{
 };
 pub use ide_diagnostics::{
     all_diagnostic_codes, apply_extension_merge, diagnostic_in_scope,
-    diagnostics as compute_diagnostics, docs, file_diagnostics, file_diagnostics_query,
-    get_metadata, load_vendor_support, message_with_standards, slab_verify_mismatches,
-    standard_url, standards, validate_query_text, CleanCodeAttribute, Diagnostic, DiagnosticCode,
-    DiagnosticOutput, DiagnosticSeverityLevel, DiagnosticTag, DiagnosticType, DiagnosticsConfig,
-    DiagnosticsContext, Fix, ImpactSeverity, MetadataTag, Severity, SoftwareQuality, TextEdit,
-    FOREIGN_HANDLER_BINDINGS_READERS, METADATA_DEPENDENT_CODES,
+    diagnostics as compute_diagnostics, diagnostics_completeness, docs, file_diagnostics,
+    file_diagnostics_query, file_diagnostics_result_query, get_metadata, load_vendor_support,
+    message_with_standards, slab_verify_mismatches, standard_url, standards, validate_query_text,
+    CleanCodeAttribute, Diagnostic, DiagnosticCode, DiagnosticOutput, DiagnosticSeverityLevel,
+    DiagnosticTag, DiagnosticType, DiagnosticsCompleteness, DiagnosticsConfig, DiagnosticsContext,
+    DiagnosticsIncompleteReason, DiagnosticsResult, Fix, ImpactSeverity, MetadataTag, Severity,
+    SoftwareQuality, TextEdit, FOREIGN_HANDLER_BINDINGS_READERS, METADATA_DEPENDENT_CODES,
 };
 pub use inlay_hints::{InlayHint, InlayHintKind};
 pub use name_lookup::{
@@ -155,11 +156,21 @@ impl Analysis {
         salsa::attach(&self.db, || f(self))
     }
 
-    /// A file's final diagnostics under `config`. With `config.defer_scope_line_gate` the
-    /// answer keeps the findings on lines outside the scope, for a caller that classifies
-    /// the complete set against a baseline and then applies [`diagnostic_in_scope`].
+    /// A file's findings under `config`, without their completeness metadata.
+    /// Call [`Self::diagnostics_result`] when callers must distinguish a full empty list
+    /// from a partial one. With `config.defer_scope_line_gate`, findings outside the
+    /// scope's line gate remain present for baseline classification.
     pub fn diagnostics(&self, file_id: FileId, config: &DiagnosticsConfig) -> Vec<Diagnostic> {
-        ide_diagnostics::file_diagnostics(&self.db, file_id, config)
+        self.diagnostics_result(file_id, config).diagnostics
+    }
+
+    /// Return findings and whether every enabled diagnostic rule completed.
+    pub fn diagnostics_result(
+        &self,
+        file_id: FileId,
+        config: &DiagnosticsConfig,
+    ) -> ide_diagnostics::DiagnosticsResult {
+        ide_diagnostics::file_diagnostics_result(&self.db, file_id, config)
     }
 
     pub fn goto_definition(&self, file_id: FileId, offset: u32) -> Option<NavigationTarget> {
@@ -221,7 +232,11 @@ impl Analysis {
         call_hierarchy::incoming_calls(&self.db, file_id, offset, &index)
     }
 
-    pub fn call_hierarchy_outgoing(&self, file_id: FileId, offset: u32) -> Vec<CallHierarchyCall> {
+    pub fn call_hierarchy_outgoing(
+        &self,
+        file_id: FileId,
+        offset: u32,
+    ) -> Option<Vec<CallHierarchyCall>> {
         let offset = TextSize::from(offset);
         call_hierarchy::outgoing_calls(&self.db, file_id, offset)
     }
@@ -340,11 +355,23 @@ impl Analysis {
         ide_diagnostics::file_diagnostics_query(&self.db, file_id_input, config_id)
     }
 
+    pub fn file_diagnostics_result_cached(
+        &self,
+        file_id: FileId,
+        config: DiagnosticsConfigInput,
+    ) -> Arc<ide_diagnostics::DiagnosticsResult> {
+        use ide_db::base_db::{DiagnosticsConfigId, FileIdInput};
+        let file_id_input = FileIdInput::new(&self.db, file_id);
+        let config_id = DiagnosticsConfigId::new(&self.db, config);
+        ide_diagnostics::file_diagnostics_result_query(&self.db, file_id_input, config_id)
+    }
+
     /// Diagnostics for a whole set of files (the LSP `workspace/diagnostic` sweep).
     ///
     /// A thin loop over the per-file query: each file rides the same Salsa-memoized
-    /// `file_diagnostics_query` as push and single-document pull, so results are
-    /// identical and already-computed files are free. Peak memory is bounded by the
+    /// `file_diagnostics_result_query` as push and single-document pull, so results are
+    /// identical and already-computed files are free. Each entry preserves whether its
+    /// diagnostics are complete. Peak memory is bounded by the
     /// queries' own LRU caps (which evict at revision boundaries) — the caller must not
     /// force LRU eviction from a background worker, which would contend with the live
     /// database. Cancellation is automatic: a concurrent edit bumps the revision and the
@@ -355,7 +382,7 @@ impl Analysis {
         &self,
         file_ids: &[FileId],
         config: DiagnosticsConfigInput,
-    ) -> Vec<(FileId, Arc<Vec<Diagnostic>>)> {
+    ) -> Vec<(FileId, Arc<ide_diagnostics::DiagnosticsResult>)> {
         file_ids
             .iter()
             .filter_map(|&file_id| {
@@ -365,7 +392,7 @@ impl Analysis {
                 // analysis (`PendingWrite`) — is not a per-file fault: it must keep unwinding so
                 // the caller's `Cancelled::catch` aborts the request and retries it.
                 let computed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    self.file_diagnostics_cached(file_id, config.clone())
+                    self.file_diagnostics_result_cached(file_id, config.clone())
                 }));
                 match computed {
                     Ok(diagnostics) => Some((file_id, diagnostics)),
@@ -382,6 +409,15 @@ impl Analysis {
                 }
             })
             .collect()
+    }
+
+    /// Compatibility alias for [`Self::workspace_diagnostics`].
+    pub fn workspace_diagnostics_result(
+        &self,
+        file_ids: &[FileId],
+        config: DiagnosticsConfigInput,
+    ) -> Vec<(FileId, Arc<ide_diagnostics::DiagnosticsResult>)> {
+        self.workspace_diagnostics(file_ids, config)
     }
 
     /// Load every configuration root ON THIS THREAD, before a parallel region opens.
@@ -429,7 +465,7 @@ impl Analysis {
     }
 
     /// Parallel variant of [`Self::workspace_diagnostics`] for the deferred whole-project
-    /// batch. Each file's Salsa-memoised `file_diagnostics_query` runs on the caller's
+    /// batch. Each file's Salsa-memoised `file_diagnostics_result_query` runs on the caller's
     /// bounded `pool`, each rayon worker on its own `db` snapshot (`db.clone()` shares the
     /// memo tables, so already-computed files stay free and interactive stays warm). The
     /// pool is the caller's — sized below the core count — so the batch never saturates the
@@ -443,7 +479,7 @@ impl Analysis {
         file_ids: &[FileId],
         config: DiagnosticsConfigInput,
         pool: &rayon::ThreadPool,
-    ) -> Vec<(FileId, Arc<Vec<Diagnostic>>)> {
+    ) -> Vec<(FileId, Arc<ide_diagnostics::DiagnosticsResult>)> {
         self.workspace_diagnostics_parallel_with_cancellation(file_ids, config, pool, |_| {})
     }
 
@@ -454,7 +490,7 @@ impl Analysis {
         config: DiagnosticsConfigInput,
         pool: &rayon::ThreadPool,
         register: impl Fn(salsa::CancellationToken) + Send + Sync,
-    ) -> Vec<(FileId, Arc<Vec<Diagnostic>>)> {
+    ) -> Vec<(FileId, Arc<ide_diagnostics::DiagnosticsResult>)> {
         use ide_db::base_db::{DiagnosticsConfigId, FileIdInput};
         use rayon::prelude::*;
         use salsa::Database as _;
@@ -479,7 +515,11 @@ impl Analysis {
                     let computed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let file_id_input = FileIdInput::new(&*db, file_id);
                         let config_id = DiagnosticsConfigId::new(&*db, config.clone());
-                        ide_diagnostics::file_diagnostics_query(&*db, file_id_input, config_id)
+                        ide_diagnostics::file_diagnostics_result_query(
+                            &*db,
+                            file_id_input,
+                            config_id,
+                        )
                     }));
                     match computed {
                         Ok(diagnostics) => Some((file_id, diagnostics)),
@@ -498,6 +538,16 @@ impl Analysis {
                 .filter_map(|result| result)
                 .collect()
         })
+    }
+
+    /// Compatibility alias for [`Self::workspace_diagnostics_parallel`].
+    pub fn workspace_diagnostics_result_parallel(
+        &self,
+        file_ids: &[FileId],
+        config: DiagnosticsConfigInput,
+        pool: &rayon::ThreadPool,
+    ) -> Vec<(FileId, Arc<ide_diagnostics::DiagnosticsResult>)> {
+        self.workspace_diagnostics_parallel(file_ids, config, pool)
     }
 
     pub fn warm_caches_task(&self, file_ids: &[FileId]) -> WarmCachesTask {

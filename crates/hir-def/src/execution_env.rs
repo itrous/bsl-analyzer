@@ -20,7 +20,9 @@
 //!
 //! [`call_graph::MethodDispatch`]: crate::call_graph::MethodDispatch
 
+use crate::conditional_tree::ConditionalKind;
 use crate::item_tree::{Annotation, AnnotationKind};
+use crate::preproc_condition::PreprocCondition;
 use crate::ModuleMetadata;
 use bsl_metadata::ModuleType;
 use syntax::preproc_symbols::PreprocSymbolId;
@@ -563,9 +565,6 @@ fn conditional_env_where(
     tree: &crate::conditional_tree::ConditionalTree,
     encloses: impl Fn(&text_size::TextRange) -> bool,
 ) -> (EnvFlags, EnvFlags) {
-    use crate::conditional_tree::ConditionalKind;
-    use crate::preproc_condition::PreprocCondition;
-
     // The innermost enclosing node is the smallest containing range: an `If`
     // node's range covers its ElsIf/Else clauses, so depth alone cannot
     // distinguish the then-branch from a sibling clause.
@@ -581,22 +580,51 @@ fn conditional_env_where(
         }
     }
 
+    conditional_env_for_node(tree, node)
+}
+
+/// Environment of an already located conditional node. Callers that index the tree
+/// once use this instead of rescanning every conditional per query.
+pub fn conditional_env_for_node(
+    tree: &crate::conditional_tree::ConditionalTree,
+    node: Option<crate::conditional_tree::ConditionalIdx>,
+) -> (EnvFlags, EnvFlags) {
+    conditional_env_for_node_with_work(tree, node, &mut || true)
+        .unwrap_or((EnvFlags::EMPTY, EnvFlags::ALL))
+}
+
+/// Bounded counterpart to [`conditional_env_for_node`]. `spend` is called for each
+/// conditional node and each sibling branch inspected; `None` means the caller's
+/// work budget was exhausted before the environment could be established.
+pub fn conditional_env_for_node_with_work(
+    tree: &crate::conditional_tree::ConditionalTree,
+    node: Option<crate::conditional_tree::ConditionalIdx>,
+    spend: &mut dyn FnMut() -> bool,
+) -> Option<(EnvFlags, EnvFlags)> {
     let mut env = EnvFlags::ALL;
     let mut possible = EnvFlags::ALL;
     let mut cur = node;
     while let Some(idx) = cur {
+        if !spend() {
+            return None;
+        }
         let chain_if = match tree.conditional(idx).kind {
             ConditionalKind::If => idx,
             // ElsIf/Else clauses always point at their chain's `If`.
             ConditionalKind::ElsIf | ConditionalKind::Else => match tree.parent(idx) {
                 Some(parent) => parent,
-                None => return (EnvFlags::EMPTY, EnvFlags::ALL),
+                None => return Some((EnvFlags::EMPTY, EnvFlags::ALL)),
             },
         };
 
         let mut remaining = EnvFlags::ALL;
         let mut possible_remaining = EnvFlags::ALL;
-        for branch in tree.all_branches(chain_if) {
+        for branch in
+            std::iter::once(chain_if).chain(tree.conditional(chain_if).siblings.iter().copied())
+        {
+            if !spend() {
+                return None;
+            }
             let data = tree.conditional(branch);
             let (branch_env, branch_possible) = match data.kind {
                 ConditionalKind::If | ConditionalKind::ElsIf => {
@@ -619,7 +647,7 @@ fn conditional_env_where(
         }
         cur = tree.parent(chain_if);
     }
-    (env, possible.without(env))
+    Some((env, possible.without(env)))
 }
 
 fn is_compilation_directive(kind: &AnnotationKind) -> bool {

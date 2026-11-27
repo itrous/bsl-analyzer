@@ -1760,7 +1760,11 @@ impl GraphState {
         let fp = observed.map(|(fingerprint, _)| fingerprint);
         let portable_complete = keys_complete && fp.is_some();
         let clean = clean && portable_complete;
-        let fp = fp.unwrap_or(crate::graph_db::GraphFp { files: 0, topology });
+        let fp = fp.unwrap_or(crate::graph_db::GraphFp {
+            files: 0,
+            topology,
+            platform_help: bsl_platform::PlatformDataInner::instance().snapshot_fingerprint(),
+        });
         let map = portable_complete.then(|| {
             project.search_roots.as_ref().expect("portable_complete implies roots").clone()
         });
@@ -1934,6 +1938,7 @@ fn fold_portable_fingerprint(
             digest.as_bytes()[..8].try_into().expect("blake3 yields >= 8 bytes"),
         ),
         topology,
+        platform_help: bsl_platform::PlatformDataInner::instance().snapshot_fingerprint(),
     }
 }
 

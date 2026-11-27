@@ -470,8 +470,8 @@ impl GraphDb {
     /// from the file's own `meta`, so a served response's revision/staleness always
     /// describe the exact build being served (never a torn mix where a concurrent
     /// reload renamed a newer file in after the generation was captured elsewhere).
-    /// Both fingerprint components are required rows (`schema_version` gates out
-    /// builds that predate `topology_fp`); `force_stale` defaults to false when absent.
+    /// All fingerprint components are required rows (`schema_version` gates out
+    /// builds that predate `platform_help_fp`); `force_stale` defaults to false when absent.
     pub fn freshness_token(&self) -> anyhow::Result<(u64, crate::graph_db::GraphFp, bool)> {
         let revision = self
             .meta("revision")?
@@ -485,8 +485,12 @@ impl GraphDb {
             .meta("topology_fp")?
             .and_then(|v| v.parse().ok())
             .context("graph database meta.topology_fp missing or unparsable")?;
+        let platform_help = self
+            .meta("platform_help_fp")?
+            .and_then(|v| v.parse().ok())
+            .context("graph database meta.platform_help_fp missing or unparsable")?;
         let force_stale = self.meta("force_stale")?.map(|v| v == "1").unwrap_or(false);
-        Ok((revision, crate::graph_db::GraphFp { files, topology }, force_stale))
+        Ok((revision, crate::graph_db::GraphFp { files, topology, platform_help }, force_stale))
     }
 
     /// The identity of the publication this database holds.
@@ -1231,6 +1235,7 @@ impl GraphDb {
             nodes,
             edges,
             top_by_centrality,
+            incomplete: false,
             edge_provenance,
             client_to_server_edges,
         })
@@ -1476,6 +1481,7 @@ impl GraphDb {
             root: self.node_ref(&root, params.detail, roots),
             nodes,
             edges,
+            incomplete: false,
             total,
             returned,
             dropped_count: total - returned,
@@ -1591,8 +1597,15 @@ impl GraphDb {
         reads.sort();
         reads.dedup();
 
-        let ctx =
-            GraphContext { dispatch: dispatch_labels(&node.dispatch), signature, calls, reads };
+        // A persisted graph refuses a module whose notify projection stopped, so the
+        // stored edges were complete when the artifact was published.
+        let ctx = GraphContext {
+            dispatch: dispatch_labels(&node.dispatch),
+            signature,
+            notify_projection_incomplete: false,
+            calls,
+            reads,
+        };
         Ok(Some(ctx.render()))
     }
 
@@ -1905,8 +1918,9 @@ mod tests {
     use rusqlite::{params, Connection};
 
     #[test]
-    fn rejects_graph_from_prior_projection_schema_version() {
-        // Given: a complete graph created by the current writer.
+    fn rejects_graph_from_b0_projection_schema_version() {
+        const B0_SCHEMA_VERSION: u32 = 25;
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bsl-graph.db");
         GraphDbWriter::create(&path)
@@ -1919,16 +1933,24 @@ mod tests {
                 publication_id: "test-1".to_owned(),
             })
             .unwrap();
+
+        assert!(GraphDb::open(&path).is_ok(), "the current projection is a positive control");
         Connection::open(&path)
             .unwrap()
-            .execute("UPDATE meta SET value = '12' WHERE key = 'schema_version'", [])
+            .execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                [B0_SCHEMA_VERSION.to_string()],
+            )
             .unwrap();
 
-        // When: the graph is opened through the serving path.
-        let result = GraphDb::open(&path);
-
-        // Then: a graph from the prior projection schema is rejected for rebuilding.
-        assert!(result.is_err(), "prior projection graphs must be rebuilt");
+        let error = GraphDb::open(&path).err().expect("B0 projection must be rejected");
+        assert!(
+            error.to_string().contains(&format!(
+                "schema_version {B0_SCHEMA_VERSION} != expected {}",
+                crate::graph_db::SCHEMA_VERSION
+            )),
+            "B0 projection must be refused: {error:#}"
+        );
     }
 
     #[test]

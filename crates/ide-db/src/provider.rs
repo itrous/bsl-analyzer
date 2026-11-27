@@ -5,9 +5,10 @@ use stdx::case::CaseExt;
 use base_db::SourceRootId;
 use bsl_metadata::Configuration;
 use hir::{
-    dataflow::effect_summary::EffectSummary, AssignmentResolution, DefWithBodyId,
-    InferenceDiagnostic, InferenceResult, ItemTree, MethodDocs, MethodId, ModuleBodies, ModuleId,
-    ModuleIndex, ModuleMetadata, SymbolTree, VariableDocs, VariableId,
+    call_graph::NotifyReg, dataflow::effect_summary::EffectSummary, AssignmentResolution,
+    DefWithBodyId, InferenceDiagnostic, InferenceResult, ItemTree, MethodDocs, MethodId,
+    ModuleBodies, ModuleId, ModuleIndex, ModuleMetadata, Name, SymbolTree, VariableDocs,
+    VariableId,
 };
 use syntax::{Parse, SyntaxNode};
 use vfs::{FileId, VfsPath};
@@ -25,6 +26,14 @@ pub struct VisibleConfigWithRoot {
 
 pub trait AnalysisProvider {
     fn configuration(&self) -> Option<Arc<Configuration>>;
+
+    /// Propagate cancellation while a consumer is traversing already-computed facts.
+    fn check_cancellation(&self) {}
+
+    /// Whether the HIR semantic facade serves a platform-help snapshot.
+    fn platform_help_available(&self) -> bool {
+        hir::platform_help_available()
+    }
 
     fn visible_configurations(&self, _file_id: FileId) -> Vec<VisibleConfigWithRoot> {
         self.configuration()
@@ -107,6 +116,68 @@ pub trait AnalysisProvider {
             }
         }
         merged.map(Arc::new)
+    }
+
+    /// Conditional declarations of a qualified common-module method, grouped by
+    /// expected body priority. Unread or unmapped bodies are represented as uncertainty.
+    fn qualified_method_declarations(
+        &self,
+        _file_id: FileId,
+        _module_name: &Name,
+        _method_name: &Name,
+    ) -> Option<Result<hir::QualifiedMethodDeclarations, hir::QualifiedMethodError>> {
+        None
+    }
+
+    /// Whether a declaration participates in a fully exported local callback surface.
+    fn notify_method_is_exported_in_registration(
+        &self,
+        _file_id: FileId,
+        _registration: &NotifyReg,
+        _method: MethodId,
+        _methods: &[MethodId],
+    ) -> bool {
+        false
+    }
+
+    /// Command-module export protection, or `None` when semantic facts cannot
+    /// safely classify the module's exports.
+    fn command_module_export_protection(
+        &self,
+        _file_id: FileId,
+    ) -> Option<hir::CommandModuleExportProtection> {
+        None
+    }
+
+    /// Local declarations that may satisfy a callback on the current module object.
+    /// Base-aware providers include paired base declarations for extension routes.
+    fn notify_handler_methods(&self, file_id: FileId, name: &hir::Name) -> Vec<MethodId> {
+        self.symbol_tree(ModuleId::new(file_id))
+            .find_methods(name)
+            .into_iter()
+            .map(|method| method.id)
+            .collect()
+    }
+
+    /// Whether same-named local methods provide an exported callback in each
+    /// proven execution environment of a registration.
+    fn notify_handler_availability_in_registration(
+        &self,
+        _file_id: FileId,
+        _registration: &NotifyReg,
+        _methods: &[MethodId],
+    ) -> hir::NotifyHandlerAvailability {
+        hir::NotifyHandlerAvailability::Unknown
+    }
+
+    fn notify_handler_availability_for_method_bodies_in_registration(
+        &self,
+        _file_id: FileId,
+        _registration: &NotifyReg,
+        _method_bodies: &[Vec<MethodId>],
+        _incomplete_tail: bool,
+    ) -> hir::NotifyHandlerAvailability {
+        hir::NotifyHandlerAvailability::Unknown
     }
 
     /// The event subscription `name` visible to `file_id`. The default scans the
@@ -392,6 +463,18 @@ pub trait AnalysisProvider {
         self.module_interface(method_id.module).find_method_by_id_shared(method_id).cloned()
     }
 
+    /// Whether this body can access its form's implicit context. A missing method
+    /// declaration stays conservative, matching the previous per-method lookup.
+    fn owner_has_form_context(&self, file_id: FileId, owner: DefWithBodyId) -> bool {
+        match owner {
+            DefWithBodyId::Method(local_id) => hir::method_has_form_context(
+                self.interface_method(MethodId { module: ModuleId::new(file_id), local_id })
+                    .as_deref(),
+            ),
+            DefWithBodyId::ModuleCode => true,
+        }
+    }
+
     /// The first declaration of `name` in the module — what a bare call
     /// resolves to.
     fn interface_method_named(
@@ -509,6 +592,8 @@ pub trait AnalysisProvider {
     fn module_metadata(&self, module_id: ModuleId) -> Arc<ModuleMetadata>;
 
     fn call_summary(&self, module_id: ModuleId) -> Arc<hir::ModuleCallSummary>;
+
+    fn notify_candidates(&self, file_id: FileId) -> Arc<Vec<hir::NotifyCandidate>>;
 
     fn line_index(&self, file_id: FileId) -> Arc<line_index::LineIndex>;
 

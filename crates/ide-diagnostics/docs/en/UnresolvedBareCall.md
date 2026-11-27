@@ -34,6 +34,9 @@ would judge by is incomplete:
   read — an unknown export may own this very name;
 - the bundled platform catalog is missing, is not attested for the target platform
   version, or the target platform is not supported;
+- the platform catalog does not attest complete method and field lists for an
+  implicit receiver type: without both lists, the analyzer cannot prove that the
+  bare name is absent (even though this diagnostic concerns calls);
 - the call is written in an ordinary form's module — its dialog is stored in binary
   form, and the module also sees the exports of the main attribute's object module —
   or in a form module whose `Form.xml` could not be read;

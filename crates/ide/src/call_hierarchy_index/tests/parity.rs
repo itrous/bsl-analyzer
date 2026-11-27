@@ -10,7 +10,7 @@ fn bounded_builder_method_digest_matches_salsa_fold() {
     // Given: a complete fixture database and the builder's one-module batches.
     let files = fixture();
     let modules = [ModuleId::new(FileId(0)), ModuleId::new(FileId(1)), ModuleId::new(FileId(2))];
-    let db = batch_database(&files, &modules);
+    let db = batch_database(&files);
     let graph_index = GraphIndex::build(&db, &modules);
     let paths: FxHashMap<_, _> = files
         .iter()

@@ -169,6 +169,7 @@ pub enum DiagnosticCode {
     MissingCommonModuleMethod,
     MissingEventSubscriptionHandler,
     MissingFormEventHandler,
+    MissingNotifyHandler,
     OrdinaryFormDialogUnread,
     OrdinaryAppSupport,
     PrivilegedModuleMethodCall,

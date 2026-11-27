@@ -922,6 +922,72 @@ fn age_tree(root: &Path) {
     }
 }
 
+/// Schema 27 graphs can hold speculative `notify_ref` edges published from a
+/// partially read semantic notify projection, and no fingerprint component
+/// notices that semantic change — so a 27-marked cache must be rejected and
+/// rebuilt even when every workspace file still matches.
+#[test]
+fn schema_27_graph_rebuilds_instead_of_serving_speculative_notify_edges() {
+    let _env_lock = crate::state::test_support::env_lock();
+    let dir = tempfile::tempdir().expect("workspace tempdir");
+    let root = dir.path();
+    sample_workspace(root);
+    super::test_support::write(root, "Configuration.xml", "<Configuration/>");
+    super::test_support::write(
+        root,
+        "bsl-analyzer.toml",
+        "[source]\nroot = \".\"\nextensions = []\n",
+    );
+    let fingerprint = super::scan::workspace_fingerprint(root);
+    let cache = WorkspaceCacheLayout::for_workspace(root);
+    seed_cache(root, fingerprint);
+    rusqlite::Connection::open(cache.graph_db_path())
+        .expect("open graph database for the schema 27 fixture")
+        .execute("UPDATE meta SET value = '27' WHERE key = 'schema_version'", [])
+        .expect("mark the graph database as schema 27");
+    assert_eq!(
+        meta_string(&cache.graph_db_path(), "built_at"),
+        "cached-build-sentinel",
+        "the fixture starts from a seeded cache"
+    );
+
+    let server = CountingEmbeddingServer::start();
+    let server_url = server.url();
+    let _test_embedding = crate::state::test_support::EnvVarGuard::set("BSL_TEST_EMBEDDING", "1");
+    let _embedding_url = crate::state::test_support::EnvVarGuard::set("EMBEDDING_URL", &server_url);
+    let _embedding_model =
+        crate::state::test_support::EnvVarGuard::set("EMBEDDING_MODEL", "test-model");
+    let _embedding_dim = crate::state::test_support::EnvVarGuard::set("EMBEDDING_DIM", "3");
+
+    let (state, held) = holding_the_first_build(|| {
+        crate::state::SharedState::workspace_with_cache(root.to_path_buf(), cache.clone())
+            .expect("initialize workspace state over a schema 27 graph")
+    });
+    drop(held);
+    state.graph().ensure_loading();
+    wait_ready(state.graph());
+    wait_until(state.graph(), "the real publish hook", || {
+        state.graph().publish_passes.load(Ordering::SeqCst) >= 1
+    });
+
+    assert_eq!(
+        state.graph().full_builds_started.load(Ordering::SeqCst),
+        1,
+        "one full rebuild for a schema 27 cache"
+    );
+    assert_eq!(
+        meta_string(&cache.graph_db_path(), "schema_version"),
+        crate::graph_db::SCHEMA_VERSION.to_string(),
+        "the rebuilt cache carries the current schema"
+    );
+    assert_ne!(
+        meta_string(&cache.graph_db_path(), "built_at"),
+        "cached-build-sentinel",
+        "schema 27 must be replaced by a newly built graph"
+    );
+    state.shutdown();
+}
+
 fn scan_project(root: &Path) -> (super::input::ProjectSnapshot, bsl_search::WorkspaceRoots) {
     let cache = WorkspaceCacheLayout::for_workspace(root);
     let excluded = cache.exclusions(root);

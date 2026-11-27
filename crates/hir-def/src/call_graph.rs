@@ -1,14 +1,16 @@
 use bsl_metadata::MdoType;
+use cfg_types::IdConversion;
 use rustc_hash::{FxHashMap, FxHashSet};
 use stdx::case::CaseExt;
 use syntax::{TextRange, TextSize};
 
 use crate::{
     body::{Body, ManagerType},
+    execution_env::EnvFlags,
     hir::{Expr, ExprIdx, Literal, Stmt},
     item_tree::{AnnotationKind, ItemTree},
     name::Name,
-    MethodId, MethodKey, ModuleBodies, ModuleId,
+    ExprId, MethodId, MethodKey, ModuleBodies, ModuleId,
 };
 use intern::NormName;
 
@@ -16,6 +18,40 @@ use intern::NormName;
 pub struct ModuleCallSummary {
     pub methods: Vec<MethodSummary>,
     pub call_edges: Vec<CallEdge>,
+    /// Generic syntax-only constructor candidates. Platform validation and callback-slot
+    /// interpretation happen in `hir-ty`; these are not notify registrations.
+    pub notify_candidates: Vec<NotifyConstructorCandidate>,
+    /// Callback names whose fixed signature follows from compatibility constructor names and
+    /// receiver shape. Kept when platform metadata cannot normalize a registration.
+    pub notify_signature_handlers: Vec<Name>,
+    /// Callback names introduced by the current English `CallbackDescription` spelling. Kept
+    /// separate so consumers can use it only when configured platform facts are absent, without
+    /// changing compatibility behavior elsewhere.
+    pub notify_additional_signature_handlers: Vec<Name>,
+    /// Callback-name strings added to arrays passed to dynamic callback-description constructors.
+    /// Kept separate so consumers can restrict this conservative syntax fallback to configurations
+    /// without callback constructor facts.
+    pub notify_dynamic_signature_handlers: Vec<Name>,
+    /// Source call sites for the dynamic callback names above. The callback expression and
+    /// constructor range identify a specific slot, so a resolved registration in a different slot
+    /// with the same handler name cannot disprove this candidate.
+    pub notify_dynamic_signature_handler_sites: Vec<DynamicNotifySignatureHandler>,
+    /// Dynamic callback-array constructors whose alias analysis was incomplete. A non-empty
+    /// list is module-level uncertainty: consumers must not infer that unlisted local methods
+    /// or exports are unused merely because a callback was not recovered from these sites.
+    pub notify_dynamic_signature_analysis_incomplete: Vec<DynamicNotifySignatureAnalysisGap>,
+    /// A notify analysis pass stopped at its work budget: either the semantic projection's
+    /// shared limit or the lower alias pass over one body. This is distinct from a named
+    /// unknown-array alternative: the latter is an intentional conservative boundary, not
+    /// evidence that registrations were only partly read. Suppressed findings behind this
+    /// flag must reach consumers as incompleteness, never as a complete empty answer.
+    pub notify_projection_incomplete: bool,
+    /// Some body binds a callback or a form action by a name that is not one string
+    /// literal, or did not lower completely enough to rule that out. A file-local
+    /// rewrite cannot see those call sites, so consumers that would change a
+    /// signature must stay conservative for the whole module.
+    pub binds_computed_callback: bool,
+    /// Platform-validated registrations. Raw `hir-def` summaries leave this empty.
     pub notify_regs: Vec<NotifyReg>,
     pub idle_handler_regs: Vec<IdleReg>,
     pub set_action_regs: Vec<SetActionReg>,
@@ -28,6 +64,10 @@ pub struct ModuleCallSummary {
     /// cost of also matching string *data* that coincides with a method name.
     /// Sorted and deduplicated.
     pub name_literal_refs: Vec<MethodKey>,
+    /// Source sites for local method-name string literals. The semantic summary narrows this
+    /// to local-object notify callback literals and keeps exact sites separate from other
+    /// string references so an external callback name cannot mask a local method.
+    pub name_literal_ref_sites: Vec<NameLiteralRefSite>,
     pub form_entries: Vec<FormEventEntry>,
 }
 
@@ -111,12 +151,18 @@ impl ModuleCallSummary {
             .collect();
 
         let mut seen_notify = FxHashSet::default();
+        // A partial semantic callback projection must not leak a prefix of its
+        // registrations into the atomic incoming-call index as if it were complete.
         let notify_regs = self
             .notify_regs
             .iter()
+            .filter(|_| !self.notify_projection_incomplete)
             .filter(|reg| {
                 matches!(reg.caller, CallerId::Method(_))
-                    && !matches!(reg.target, NotifyTarget::Unsupported)
+                    && !matches!(
+                        reg.target,
+                        NotifyTarget::Unsupported | NotifyTarget::NotCompiled { .. }
+                    )
             })
             .filter(|reg| {
                 seen_notify.insert((reg.caller, reg.callback_name.clone(), reg.target.clone()))
@@ -136,13 +182,40 @@ impl ModuleCallSummary {
         ModuleCallSummary {
             methods: Vec::new(),
             call_edges,
+            notify_candidates: Vec::new(),
+            notify_signature_handlers: Vec::new(),
+            notify_additional_signature_handlers: Vec::new(),
+            notify_dynamic_signature_handlers: Vec::new(),
+            notify_dynamic_signature_handler_sites: Vec::new(),
+            notify_dynamic_signature_analysis_incomplete: Vec::new(),
+            notify_projection_incomplete: self.notify_projection_incomplete,
+            binds_computed_callback: false,
             notify_regs,
             idle_handler_regs,
             set_action_regs: Vec::new(),
             name_literal_refs: Vec::new(),
+            name_literal_ref_sites: Vec::new(),
             form_entries: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynamicNotifySignatureHandler {
+    pub handler_name: Name,
+    pub callback_expr: ExprId,
+    pub constructor_range: TextRange,
+}
+
+/// One constructor for which dynamic callback-array alias analysis could not finish.
+/// The containing module is semantically incomplete, so downstream negative conclusions
+/// must conservatively retain relevant local methods/exports beyond just `caller`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DynamicNotifySignatureAnalysisGap {
+    pub caller: CallerId,
+    pub constructor: ExprId,
+    pub constructor_range: TextRange,
+    pub array_name: Name,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +224,13 @@ pub struct MethodSummary {
     pub name: Name,
     pub dispatch: MethodDispatch,
     pub is_export: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NameLiteralRefSite {
+    pub caller: CallerId,
+    pub local_id: MethodKey,
+    pub expr: ExprId,
 }
 
 /// Per-method facts derivable from the item tree alone — declaration name,
@@ -270,7 +350,9 @@ pub enum EdgeKind {
     /// as. Derived from form metadata, not from code.
     DataBinding,
     /// A `Новый ОписаниеОповещения("Метод", …)` callback: the registering method (or
-    /// module body) links to the handler named by the string literal. Not a direct
+    /// module body) links to the handler named by the string literal. This is a
+    /// reference to a found name, not a guarantee that the handler can be invoked:
+    /// for example, a local declaration need not be exported. It is not a direct
     /// call — the platform invokes it later — so it is kept separate from `call`.
     NotifyRef,
     /// A `ПодключитьОбработчикОжидания("Метод", …)` idle handler: the registering
@@ -360,27 +442,114 @@ pub enum CallerId {
     ModuleCode,
 }
 
-/// Where a `Новый ОписаниеОповещения` callback's handler lives, decided purely
-/// syntactically from the second constructor argument. Kept distinct from a bare
-/// `Option` because "no module" and "receiver we can't classify" must not collapse:
-/// the graph resolves `ThisObject` to a current-module method but must NOT invent an
-/// edge for an `Unsupported` receiver.
+/// Syntactic shape of a notification receiver, before semantic resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NotifyReceiverSyntax {
+    /// An object or form self-name, in either language.
+    SelfName,
+    /// A bare name other than a self-name.
+    BareName,
+    /// A non-bare or omitted receiver.
+    Other,
+}
+
+impl NotifyReceiverSyntax {
+    /// Classify the syntax of a receiver expression without assuming what a name resolves to.
+    pub fn for_receiver(body: &Body, receiver: Option<ExprId>) -> Self {
+        match receiver.map(|expr| body.expr(expr)) {
+            Some(Expr::Path(name)) => Self::for_bare_name(name),
+            _ => Self::Other,
+        }
+    }
+
+    /// Classify a bare receiver without assuming what the name resolves to.
+    pub fn for_bare_name(name: &Name) -> Self {
+        if is_this_receiver(&name.as_str().fold_lower()) {
+            Self::SelfName
+        } else {
+            Self::BareName
+        }
+    }
+
+    /// Whether a callback beside this receiver may be a method of the current module
+    /// from its syntax alone. A bare name needs semantic resolution; this projection
+    /// therefore never guesses it into the protected or the foreign side.
+    pub fn may_name_local_callback(self) -> bool {
+        matches!(self, Self::SelfName | Self::Other)
+    }
+}
+
+/// A callback-description signature slot, shared by syntactic and semantic projections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NotifyCallbackSlot {
+    Handler,
+    ErrorHandler,
+    Unknown,
+}
+
+impl NotifyCallbackSlot {
+    /// Bundled callback-description handler and receiver argument positions.
+    pub fn callback_description_slots() -> [(usize, usize, Self); 2] {
+        let slots = bsl_platform::bundled_callback_description_slots();
+        [
+            (slots.handler, slots.receiver, Self::Handler),
+            (slots.error_handler, slots.error_receiver, Self::ErrorHandler),
+        ]
+    }
+}
+
+/// Where a `Новый ОписаниеОповещения` callback's handler lives. `hir-ty` resolves
+/// bare receivers using the same inference and name-resolution rules as other semantic
+/// consumers; a receiver proven to be neither the current object nor a common module is
+/// `Unsupported`, while one whose runtime identity, including an unresolved or
+/// indeterminate one, stays unknown is `LocalBinding`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NotifyTarget {
-    /// `ЭтотОбъект` / `ЭтаФорма` (or English forms) — handler is in the current module.
+    /// The registration lies only in an unavailable or unreachable compilation branch.
+    NotCompiled { callback_expr: ExprId, receiver_syntax: NotifyReceiverSyntax },
+    /// The receiver resolves to the current object/form module.
     ThisObject,
-    /// A bare identifier receiver — treated as a (common) module name to resolve.
+    /// The receiver resolves to a common module.
     Module(Name),
-    /// Receiver is not a plain identifier (a call, index, `Неопределено`, …) or is
-    /// absent: the handler module cannot be decided syntactically.
+    /// The receiver has unknown runtime identity — it may be the current module
+    /// object — but is not proven to reference any particular local callback: a
+    /// resolved bare value of non-concrete type, an indeterminate bare read, or a
+    /// non-bare expression whose inferred type is not concrete data.
+    LocalBinding,
+    /// The receiver cannot be resolved as a current object or common module.
     Unsupported,
+}
+
+/// A syntax-shaped constructor expression that may describe a notification callback.
+/// This carries no platform or callback-slot conclusion; semantic consumers validate it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NotifyConstructorCandidate {
+    pub caller: CallerId,
+    pub constructor: ExprId,
+    pub range: TextRange,
+}
+
+/// Execution environments in which a notification registration may exist.
+/// `definite` is proven to register; `possible` also includes undecided
+/// preprocessor conditions. Consumers must not turn a possible-only
+/// environment into a definitive verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct NotifyRegistrationEnvironments {
+    pub definite: EnvFlags,
+    pub possible: EnvFlags,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotifyReg {
     pub caller: CallerId,
+    /// Expression containing the callback string literal, for source-exact reference filtering.
+    pub callback_expr: ExprId,
     pub callback_name: Name,
+    /// Source syntax retained independently of semantic receiver resolution.
+    pub receiver_syntax: NotifyReceiverSyntax,
     pub target: NotifyTarget,
+    /// Environment mask for this constructor, not merely its enclosing method.
+    pub environments: NotifyRegistrationEnvironments,
     pub range: TextRange,
 }
 
@@ -416,6 +585,11 @@ pub struct FormEventEntry {
 pub struct ResolvedModuleSummary {
     pub module: ModuleId,
     pub edges: Vec<ResolvedCallEdge>,
+    /// The module's semantic notify projection stopped at its work budget, so
+    /// `edges` holds no notify edges. A consumer cannot tell such a missing edge
+    /// from a complete projection that has none; it must surface
+    /// this status instead of reading the edge list as complete.
+    pub notify_projection_incomplete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -585,6 +759,9 @@ pub struct WorkspaceCallGraph {
     forward: FxHashMap<GraphNode, Vec<WorkspaceCallEdge>>,
     reverse: FxHashMap<GraphNode, Vec<WorkspaceCallEdge>>,
     node_dispatch: FxHashMap<GraphNode, MethodDispatch>,
+    /// At least one module's semantic callback projection was truncated. The known
+    /// edges remain usable, but the graph must not be mistaken for a full projection.
+    pub incomplete: bool,
 }
 
 impl WorkspaceCallGraph {
@@ -735,6 +912,20 @@ pub fn extract_call_summary(
     module_bodies: &ModuleBodies,
     form_event_handlers: &[bsl_metadata::FormEventHandler],
 ) -> ModuleCallSummary {
+    extract_call_summary_with_cancellation(
+        item_tree,
+        module_bodies,
+        form_event_handlers,
+        &mut || {},
+    )
+}
+
+pub(crate) fn extract_call_summary_with_cancellation(
+    item_tree: &ItemTree,
+    module_bodies: &ModuleBodies,
+    form_event_handlers: &[bsl_metadata::FormEventHandler],
+    cancel: &mut dyn FnMut(),
+) -> ModuleCallSummary {
     // Method enumeration is the cheap, body-free part — share it with the graph
     // build. The `local_method_ids` map (lowercased name → first local id) is what
     // body extraction uses to bind local calls.
@@ -752,10 +943,20 @@ pub fn extract_call_summary(
     }
 
     let mut call_edges = Vec::new();
-    let mut notify_regs = Vec::new();
+    let mut notify_candidates = Vec::new();
+    let mut notify_signature_handlers = Vec::new();
+    let mut notify_additional_signature_handlers = Vec::new();
+    let mut notify_dynamic_signature_handlers = Vec::new();
+    let mut notify_dynamic_signature_handler_sites = Vec::new();
+    let mut notify_dynamic_signature_analysis_incomplete = Vec::new();
     let mut idle_handler_regs = Vec::new();
     let mut set_action_regs = Vec::new();
     let mut name_literals: FxHashSet<MethodKey> = FxHashSet::default();
+    let mut name_literal_ref_sites = Vec::new();
+    // Set when a body's lower alias pass stopped at its work budget; the semantic
+    // projection adds its own stops on top of this.
+    let mut notify_projection_incomplete = false;
+    let mut binds_computed_callback = false;
 
     // Bodies come in item order, which is deterministic.
     for (local_id, lower_result) in module_bodies.iter_lower_results() {
@@ -765,10 +966,19 @@ pub fn extract_call_summary(
             CallerId::Method(local_id),
             &local_method_ids,
             &mut call_edges,
-            &mut notify_regs,
+            &mut notify_candidates,
+            &mut notify_signature_handlers,
+            &mut notify_additional_signature_handlers,
+            &mut notify_dynamic_signature_handlers,
+            &mut notify_dynamic_signature_handler_sites,
+            &mut notify_dynamic_signature_analysis_incomplete,
             &mut idle_handler_regs,
             &mut set_action_regs,
             &mut name_literals,
+            &mut name_literal_ref_sites,
+            &mut notify_projection_incomplete,
+            &mut binds_computed_callback,
+            cancel,
         );
     }
 
@@ -779,12 +989,37 @@ pub fn extract_call_summary(
             CallerId::ModuleCode,
             &local_method_ids,
             &mut call_edges,
-            &mut notify_regs,
+            &mut notify_candidates,
+            &mut notify_signature_handlers,
+            &mut notify_additional_signature_handlers,
+            &mut notify_dynamic_signature_handlers,
+            &mut notify_dynamic_signature_handler_sites,
+            &mut notify_dynamic_signature_analysis_incomplete,
             &mut idle_handler_regs,
             &mut set_action_regs,
             &mut name_literals,
+            &mut name_literal_ref_sites,
+            &mut notify_projection_incomplete,
+            &mut binds_computed_callback,
+            cancel,
         );
     }
+
+    let mut seen_dynamic_sites = FxHashSet::default();
+    notify_dynamic_signature_handler_sites.retain(|site| {
+        seen_dynamic_sites.insert((
+            site.handler_name.clone(),
+            site.callback_expr,
+            site.constructor_range,
+        ))
+    });
+    let mut seen_dynamic_handlers = FxHashSet::default();
+    notify_dynamic_signature_handlers
+        .retain(|handler| seen_dynamic_handlers.insert(handler.clone()));
+    let mut seen_dynamic_gaps = FxHashSet::default();
+    notify_dynamic_signature_analysis_incomplete.retain(|gap| {
+        seen_dynamic_gaps.insert((gap.caller, gap.constructor, gap.constructor_range))
+    });
 
     let mut name_literal_refs: Vec<MethodKey> = name_literals.into_iter().collect();
     name_literal_refs.sort_unstable();
@@ -800,10 +1035,19 @@ pub fn extract_call_summary(
     ModuleCallSummary {
         methods,
         call_edges,
-        notify_regs,
+        notify_candidates,
+        notify_signature_handlers,
+        notify_additional_signature_handlers,
+        notify_dynamic_signature_handlers,
+        notify_dynamic_signature_handler_sites,
+        notify_dynamic_signature_analysis_incomplete,
+        notify_projection_incomplete,
+        binds_computed_callback,
+        notify_regs: Vec::new(),
         idle_handler_regs,
         set_action_regs,
         name_literal_refs,
+        name_literal_ref_sites,
         form_entries,
     }
 }
@@ -897,21 +1141,35 @@ fn is_current_form_items(name_lower: &str) -> bool {
 
 /// Whether `name` is a parameter, a declared variable or an assigned local of `body` -
 /// a binding that shadows a context property of the same name.
+///
+/// Keys are `NormName`, the same match bucket the module classification uses, and NOT
+/// `fold_lower`: the latter falls back to `str::to_lowercase`, which applies contextual
+/// mappings (Greek final sigma), so two names equal for the classification would be
+/// different here - a shadowing binding would be missed and the receiver would be taken
+/// for a common module.
 fn is_body_local(body: &Body, name: &Name) -> bool {
-    let lower = name.as_str().fold_lower();
-    body.bindings_iter().any(|(_, binding)| binding.name.as_str().fold_lower() == lower)
-        || body.stmts_iter().any(|(_, stmt)| {
-            matches!(stmt, Stmt::Assign { target, .. }
-                if matches!(body.expr_idx(*target), Expr::Path(target) if target.as_str().fold_lower() == lower))
-        })
+    let key = NormName::intern(name.as_str());
+    body_local_names(body).any(|local| NormName::intern(local.as_str()) == key)
+}
+
+fn body_local_names(body: &Body) -> impl Iterator<Item = &Name> {
+    body.bindings_iter().map(|(_, binding)| &binding.name).chain(body.stmts_iter().filter_map(
+        |(_, stmt)| match stmt {
+            Stmt::Assign { target, .. } => match body.expr_idx(*target) {
+                Expr::Path(name) => Some(name),
+                _ => None,
+            },
+            _ => None,
+        },
+    ))
 }
 
 fn is_attach_data_change_handler(name_lower: &str) -> bool {
     name_lower == "подключитьобработчикизмененияданных" || name_lower == "attachdatachangehandler"
 }
 
-// One &mut accumulator per output list (call edges + the three string-named dispatch
-// registries) plus the read-only inputs; bundling them into a struct would only move the
+// One &mut accumulator per output list (call edges, constructor candidates, and the string-named
+// dispatch registries) plus the read-only inputs; bundling them into a struct would only move the
 // same fields behind one more indirection.
 #[allow(clippy::too_many_arguments)]
 fn extract_from_body(
@@ -920,17 +1178,122 @@ fn extract_from_body(
     caller: CallerId,
     local_method_ids: &FxHashMap<NormName, MethodKey>,
     call_edges: &mut Vec<CallEdge>,
-    notify_regs: &mut Vec<NotifyReg>,
+    notify_candidates: &mut Vec<NotifyConstructorCandidate>,
+    notify_signature_handlers: &mut Vec<Name>,
+    notify_additional_signature_handlers: &mut Vec<Name>,
+    notify_dynamic_signature_handlers: &mut Vec<Name>,
+    notify_dynamic_signature_handler_sites: &mut Vec<DynamicNotifySignatureHandler>,
+    notify_dynamic_signature_analysis_incomplete: &mut Vec<DynamicNotifySignatureAnalysisGap>,
     idle_handler_regs: &mut Vec<IdleReg>,
     set_action_regs: &mut Vec<SetActionReg>,
     name_literals: &mut FxHashSet<MethodKey>,
+    name_literal_ref_sites: &mut Vec<NameLiteralRefSite>,
+    notify_projection_incomplete: &mut bool,
+    binds_computed_callback: &mut bool,
+    cancel: &mut dyn FnMut(),
 ) {
+    // A body that did not lower completely may have an argument list this pass never
+    // saw. Its bindings cannot be read as literal-only without proving the missing part.
+    if body.is_lowering_incomplete() {
+        *binds_computed_callback = true;
+    }
     let common_bindings = crate::common_module_ref::common_module_var_bindings(body);
+    let mut alias_resolver = None;
+    let mut resolver_initialized = false;
+    let mut dynamic_candidates = Vec::new();
+    for (expr_id, expr) in body.exprs_iter() {
+        cancel();
+        let Expr::New { type_name: None, args } = expr else { continue };
+        let Some(type_name) = args.first().and_then(|&idx| extract_string_literal(body, idx))
+        else {
+            continue;
+        };
+        if !bsl_platform::is_callback_description_type_name(&type_name)
+            || !matches!(args.get(1), Some(idx) if matches!(body.expr_idx(*idx), Expr::Path(_)))
+        {
+            continue;
+        }
+        if !resolver_initialized {
+            alias_resolver = DynamicArrayResolver::new(body, source_map, cancel);
+            resolver_initialized = true;
+            // Construction fails only when its work budget ran out (cancellation
+            // unwinds instead), so every gap below is a stop, not a known-unknown.
+            if alias_resolver.is_none() {
+                *notify_projection_incomplete = true;
+            }
+        }
+        let Some(constructor_range) = source_map.expr_range(expr_id) else { continue };
+        let Some(aliases) = dynamic_notify_array_aliases(
+            body,
+            args,
+            alias_resolver.as_mut(),
+            DynamicNotifyAnalysisContext {
+                caller,
+                constructor: expr_id,
+                constructor_range,
+                incomplete: notify_dynamic_signature_analysis_incomplete,
+            },
+            cancel,
+        ) else {
+            continue;
+        };
+        if alias_resolver.as_ref().is_some_and(DynamicArrayResolver::exhausted) {
+            // The alias resolution stopped at its budget: the gap it recorded is a
+            // truncated read, so the whole result must report incompleteness.
+            *notify_projection_incomplete = true;
+        }
+        dynamic_candidates.extend(aliases.into_iter().map(|alias| DynamicNotifyArrayCandidate {
+            array_name: alias.array_name,
+            array_start: alias.array_start,
+            array_end: alias.array_end,
+            constructor: expr_id,
+            constructor_start: constructor_range.start(),
+            constructor_range,
+        }));
+    }
+    if !dynamic_candidates.is_empty() {
+        let mut analyzed = FxHashSet::default();
+        for candidate in &dynamic_candidates {
+            if !analyzed.insert(*candidate) {
+                continue;
+            }
+            let complete = alias_resolver.as_mut().is_some_and(|resolver| {
+                resolver.spend(cancel)
+                    && extract_dynamic_notify_handlers(
+                        body,
+                        candidate,
+                        resolver,
+                        notify_dynamic_signature_handlers,
+                        notify_dynamic_signature_handler_sites,
+                        cancel,
+                    )
+            });
+            if !complete {
+                notify_dynamic_signature_analysis_incomplete.push(
+                    DynamicNotifySignatureAnalysisGap {
+                        caller,
+                        constructor: candidate.constructor,
+                        constructor_range: candidate.constructor_range,
+                        array_name: Name::new(candidate.array_name.as_str()),
+                    },
+                );
+                if alias_resolver.as_ref().is_some_and(DynamicArrayResolver::exhausted) {
+                    *notify_projection_incomplete = true;
+                }
+            }
+        }
+    }
+
     for (expr_id, expr) in body.exprs_iter() {
         match expr {
             Expr::Literal(Literal::String(s)) if is_identifier_like(s) => {
                 if let Some(&local_id) = local_method_ids.get(&NormName::intern(s)) {
                     name_literals.insert(local_id);
+                    name_literal_ref_sites.push(NameLiteralRefSite {
+                        caller,
+                        local_id,
+                        expr: expr_id,
+                    });
                 }
             }
             Expr::Call { callee, args } => {
@@ -957,9 +1320,19 @@ fn extract_from_body(
                         }
                     }
                     Expr::Field { base: field_base, field } => {
-                        if is_set_action(&field.as_str().fold_lower())
-                            && is_form_element_action_receiver(body, *field_base)
-                        {
+                        let set_action = is_set_action(&field.as_str().fold_lower());
+                        if set_action {
+                            let computed = args.get(1).is_some_and(|&arg| {
+                                !matches!(
+                                    body.expr_idx(arg),
+                                    Expr::Missing | Expr::Literal(Literal::String(_))
+                                )
+                            });
+                            if computed {
+                                *binds_computed_callback = true;
+                            }
+                        }
+                        if set_action && is_form_element_action_receiver(body, *field_base) {
                             if let Some(reg) = extract_set_action_reg(body, caller, args, range) {
                                 set_action_regs.push(reg);
                             }
@@ -980,38 +1353,1353 @@ fn extract_from_body(
                 }
             }
             Expr::New { type_name, args } => {
-                // `Новый ОписаниеОповещения(ИмяПроцедуры, Модуль, ДополнительныеПараметры,
-                // ИмяПроцедурыОбработкиОшибки, МодульОбработкиОшибки)`. `base` is the index of
-                // the first constructor argument: 0 for the typed form, 1 for the string-first
-                // form `Новый("ОписаниеОповещения", …)` where arg 0 is the type name.
-                let base = match type_name {
-                    Some(tn) if is_notify_description(tn) => Some(0usize),
-                    None if !args.is_empty() => match body.expr_idx(args[0]) {
-                        Expr::Literal(Literal::String(tn)) if is_notify_description_str(tn) => {
-                            Some(1usize)
+                if is_notify_constructor_candidate(body, type_name.as_ref(), args) {
+                    notify_candidates.push(NotifyConstructorCandidate {
+                        caller,
+                        constructor: expr_id,
+                        range: source_map.expr_range(expr_id).unwrap_or(TextRange::empty(0.into())),
+                    });
+                }
+                extract_notify_handlers(
+                    body,
+                    type_name.as_ref(),
+                    args,
+                    notify_signature_handlers,
+                    notify_additional_signature_handlers,
+                    binds_computed_callback,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn is_additional_callback_description_type_name(name: &str) -> bool {
+    bsl_platform::is_callback_description_type_name(name)
+        && !bsl_platform::is_callback_description_compatibility_type_name(name)
+}
+
+fn extract_notify_handlers(
+    body: &Body,
+    type_name: Option<&Name>,
+    args: &[ExprIdx],
+    compatibility_handlers: &mut Vec<Name>,
+    additional_handlers: &mut Vec<Name>,
+    binds_computed_callback: &mut bool,
+) {
+    let (type_name, slot_offset) = match type_name {
+        Some(type_name) => (type_name.as_str().to_owned(), 0),
+        None => {
+            let Some(type_name) = args.first().and_then(|&idx| extract_string_literal(body, idx))
+            else {
+                return;
+            };
+            (type_name, 1)
+        }
+    };
+    let is_compatibility_name =
+        bsl_platform::is_callback_description_compatibility_type_name(&type_name);
+    let is_additional_name = is_additional_callback_description_type_name(&type_name);
+    if !is_compatibility_name && !is_additional_name {
+        return;
+    }
+    // Preserve the syntax-only signature protection even for invalid arity. Semantic
+    // registration, unlike this compatibility path, requires constructor binding.
+    for (handler_slot, receiver_slot, _) in NotifyCallbackSlot::callback_description_slots() {
+        let Some(&handler_idx) = args.get(handler_slot + slot_offset) else { continue };
+        let handler = match body.expr_idx(handler_idx) {
+            Expr::Literal(Literal::String(handler)) => handler,
+            Expr::Missing => continue,
+            _ => {
+                *binds_computed_callback = true;
+                continue;
+            }
+        };
+        let receiver_expr = args.get(receiver_slot + slot_offset).map(|&idx| ExprId::from_idx(idx));
+        let receiver_syntax = NotifyReceiverSyntax::for_receiver(body, receiver_expr);
+        if receiver_syntax.may_name_local_callback() {
+            if is_compatibility_name {
+                compatibility_handlers.push(Name::new(handler));
+            }
+            if is_additional_name {
+                additional_handlers.push(Name::new(handler));
+            }
+        }
+    }
+}
+
+/// Candidate identity includes the resolved alias lifetime; different alternatives at the
+/// same constructor must not share an analysis result unless their ranges also match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DynamicNotifyArrayCandidate {
+    array_name: NormName,
+    array_start: Option<TextSize>,
+    array_end: TextSize,
+    constructor: ExprId,
+    constructor_start: TextSize,
+    constructor_range: TextRange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DynamicNotifyArrayAlias {
+    array_name: NormName,
+    array_start: Option<TextSize>,
+    array_end: TextSize,
+}
+
+struct DynamicNotifyAnalysisContext<'a> {
+    caller: CallerId,
+    constructor: ExprId,
+    constructor_range: TextRange,
+    incomplete: &'a mut Vec<DynamicNotifySignatureAnalysisGap>,
+}
+
+fn dynamic_notify_array_aliases(
+    body: &Body,
+    args: &[ExprIdx],
+    resolver: Option<&mut DynamicArrayResolver<'_>>,
+    context: DynamicNotifyAnalysisContext<'_>,
+    cancel: &mut dyn FnMut(),
+) -> Option<Vec<DynamicNotifyArrayAlias>> {
+    let DynamicNotifyAnalysisContext { caller, constructor, constructor_range, incomplete } =
+        context;
+    let type_name = args.first().and_then(|&idx| extract_string_literal(body, idx))?;
+    if !bsl_platform::is_callback_description_type_name(&type_name) {
+        return None;
+    }
+    let Expr::Path(name) = body.expr_idx(*args.get(1)?) else { return None };
+    let array_name = Name::new(name.as_str());
+    let name = NormName::intern(name.as_str());
+    let Some(resolver) = resolver else {
+        incomplete.push(DynamicNotifySignatureAnalysisGap {
+            caller,
+            constructor,
+            constructor_range,
+            array_name,
+        });
+        return Some(Vec::new());
+    };
+    let (mut aliases, complete, has_input_alternative) =
+        resolver.resolve(name, constructor_range.start(), constructor_range.start(), cancel);
+    if !complete {
+        incomplete.push(DynamicNotifySignatureAnalysisGap {
+            caller,
+            constructor,
+            constructor_range,
+            array_name,
+        });
+        if !has_input_alternative {
+            return Some(Vec::new());
+        }
+    }
+    if aliases.is_empty() {
+        aliases.push(DynamicNotifyArrayAlias {
+            array_name: name,
+            array_start: None,
+            array_end: constructor_range.start(),
+        });
+    }
+    Some(aliases)
+}
+
+/// Trace known array references at the binding site. A later reassignment changes the variable,
+/// not the object already copied into another local; conditional bindings retain both the
+/// preceding value and each possible branch value.
+const DYNAMIC_ARRAY_ALIAS_WORK_BUDGET: usize = 8_192;
+const DYNAMIC_ARRAY_CANCEL_INTERVAL: usize = 128;
+
+#[derive(Clone, Copy)]
+struct DynamicArrayAssignment<'a> {
+    range: TextRange,
+    value: &'a Expr,
+    branch: Option<TextRange>,
+}
+
+#[derive(Clone, Copy)]
+struct DynamicArrayStatement<'a> {
+    stmt: &'a Stmt,
+    range: Option<TextRange>,
+}
+
+#[derive(Clone, Copy)]
+struct DynamicArrayExpression<'a> {
+    expr: &'a Expr,
+    range: Option<TextRange>,
+}
+
+struct DynamicArrayRelevantWrites {
+    names: Vec<NormName>,
+    writes: Vec<usize>,
+}
+
+#[derive(Default)]
+struct DynamicArrayControlIndex {
+    ranges: Vec<TextRange>,
+    prefix_max_end: Vec<TextSize>,
+}
+
+impl DynamicArrayControlIndex {
+    fn from_ranges(mut ranges: Vec<TextRange>) -> Self {
+        ranges.sort_unstable_by_key(|range| range.start());
+        let mut prefix_max_end = Vec::with_capacity(ranges.len());
+        let mut max_end = TextSize::from(0);
+        for range in &ranges {
+            max_end = max_end.max(range.end());
+            prefix_max_end.push(max_end);
+        }
+        Self { ranges, prefix_max_end }
+    }
+
+    fn contains(&self, site: TextRange) -> bool {
+        let prefix_len = self.ranges.partition_point(|range| range.start() <= site.start());
+        prefix_len > 0 && self.prefix_max_end[prefix_len - 1] >= site.end()
+    }
+}
+
+/// Shared, bounded body index. Every statement/assignment/branch examined spends budget,
+/// so alias fan-out and large bodies have a fixed upper bound independent of path shape.
+struct DynamicArrayResolver<'a> {
+    body: &'a Body,
+    assignments: FxHashMap<NormName, Vec<DynamicArrayAssignment<'a>>>,
+    assignment_branches: FxHashMap<TextRange, Option<TextRange>>,
+    writes: Vec<DynamicArrayStatement<'a>>,
+    writes_by_target: FxHashMap<NormName, Vec<usize>>,
+    writes_by_source: FxHashMap<NormName, Vec<usize>>,
+    writes_by_receiver: FxHashMap<NormName, Vec<usize>>,
+    relevant_writes_cache: FxHashMap<NormName, std::sync::Arc<DynamicArrayRelevantWrites>>,
+    control_activity: DynamicArrayControlIndex,
+    additions: FxHashMap<NormName, Vec<(TextRange, ExprIdx)>>,
+    activity_sites: FxHashMap<NormName, Vec<TextRange>>,
+    calls: Vec<DynamicArrayExpression<'a>>,
+    calls_by_name: FxHashMap<NormName, Vec<usize>>,
+    relevant_calls_cache: FxHashMap<NormName, std::sync::Arc<[usize]>>,
+    parameters: FxHashSet<NormName>,
+    activity_cache: FxHashMap<DynamicNotifyArrayCandidate, bool>,
+    uncertainty_cache: FxHashMap<DynamicNotifyArrayCandidate, DynamicArrayUncertainty>,
+    remaining: usize,
+    since_cancel: usize,
+    budget_exhausted: bool,
+}
+
+impl<'a> DynamicArrayResolver<'a> {
+    fn new(
+        body: &'a Body,
+        source_map: crate::body::SourceMapAt<'_>,
+        cancel: &mut dyn FnMut(),
+    ) -> Option<Self> {
+        let mut this = Self {
+            body,
+            assignments: FxHashMap::default(),
+            assignment_branches: FxHashMap::default(),
+            writes: Vec::new(),
+            writes_by_target: FxHashMap::default(),
+            writes_by_source: FxHashMap::default(),
+            writes_by_receiver: FxHashMap::default(),
+            relevant_writes_cache: FxHashMap::default(),
+            control_activity: DynamicArrayControlIndex::default(),
+            additions: FxHashMap::default(),
+            activity_sites: FxHashMap::default(),
+            calls: Vec::new(),
+            calls_by_name: FxHashMap::default(),
+            relevant_calls_cache: FxHashMap::default(),
+            parameters: FxHashSet::default(),
+            activity_cache: FxHashMap::default(),
+            uncertainty_cache: FxHashMap::default(),
+            remaining: DYNAMIC_ARRAY_ALIAS_WORK_BUDGET,
+            since_cancel: 0,
+            budget_exhausted: false,
+        };
+        for parameter in body.params() {
+            if !this.spend(cancel) {
+                return None;
+            }
+            this.parameters.insert(NormName::intern(body.binding(parameter).name.as_str()));
+        }
+        let mut branches = Vec::new();
+        let mut unclassified = Vec::new();
+        for (stmt_id, stmt) in body.stmts_iter() {
+            if !this.spend(cancel) {
+                return None;
+            }
+            let range = source_map.stmt_range(stmt_id);
+            if let Stmt::Assign { target, value } = stmt {
+                let write_index = this.writes.len();
+                this.writes.push(DynamicArrayStatement { stmt, range });
+                match body.expr_idx(*target) {
+                    Expr::Path(target_name) => {
+                        this.writes_by_target
+                            .entry(NormName::intern(target_name.as_str()))
+                            .or_default()
+                            .push(write_index);
+                        if let Expr::Path(source_name) = body.expr_idx(*value) {
+                            this.writes_by_source
+                                .entry(NormName::intern(source_name.as_str()))
+                                .or_default()
+                                .push(write_index);
                         }
-                        _ => None,
-                    },
-                    _ => None,
-                };
-                if let Some(base) = base {
-                    let range =
-                        source_map.expr_range(expr_id).unwrap_or(TextRange::empty(0.into()));
-                    // The primary handler (ИмяПроцедуры, Модуль) and the error handler
-                    // (ИмяПроцедурыОбработкиОшибки, МодульОбработкиОшибки) are two independent
-                    // dispatch targets: the platform invokes the second when the async call
-                    // fails. A constructor that omits the error handler simply yields no second
-                    // reg (the args are absent), so this never invents an edge.
-                    for (method_idx, target_idx) in [(base, base + 1), (base + 3, base + 4)] {
-                        if let Some(reg) =
-                            extract_notify_reg_at(body, caller, args, method_idx, target_idx, range)
+                    }
+                    Expr::Index { base, .. } => match body.expr_idx(*base) {
+                        Expr::Path(receiver) => {
+                            this.writes_by_receiver
+                                .entry(NormName::intern(receiver.as_str()))
+                                .or_default()
+                                .push(write_index);
+                        }
+                        Expr::Field { base, field }
+                            if matches!(body.expr_idx(*base), Expr::Path(name)
+                                if is_this_object(&name.as_str().fold_lower())) =>
                         {
-                            notify_regs.push(reg);
+                            this.writes_by_receiver
+                                .entry(NormName::intern(field.as_str()))
+                                .or_default()
+                                .push(write_index);
+                        }
+                        _ => {}
+                    },
+                    Expr::Field { base, field }
+                        if matches!(body.expr_idx(*base), Expr::Path(name)
+                            if is_this_object(&name.as_str().fold_lower())) =>
+                    {
+                        this.writes_by_receiver
+                            .entry(NormName::intern(field.as_str()))
+                            .or_default()
+                            .push(write_index);
+                    }
+                    _ => {}
+                }
+            }
+            let Some(range) = range else { continue };
+            if matches!(
+                stmt,
+                Stmt::If(_)
+                    | Stmt::PreprocIf(_)
+                    | Stmt::While { .. }
+                    | Stmt::For { .. }
+                    | Stmt::ForEach { .. }
+                    | Stmt::Try { .. }
+            ) {
+                branches.push(range);
+            }
+            if let Stmt::Assign { target, value } = stmt {
+                if let Expr::Path(name) = body.expr_idx(*target) {
+                    unclassified.push((
+                        NormName::intern(name.as_str()),
+                        range,
+                        body.expr_idx(*value),
+                    ));
+                }
+            }
+        }
+        for (name, range, value) in unclassified {
+            let mut branch = None;
+            for &candidate in &branches {
+                if !this.spend(cancel) {
+                    return None;
+                }
+                if candidate.contains_range(range)
+                    && branch.is_none_or(|previous: TextRange| candidate.len() < previous.len())
+                {
+                    branch = Some(candidate);
+                }
+            }
+            this.assignment_branches.insert(range, branch);
+            this.assignments.entry(name).or_default().push(DynamicArrayAssignment {
+                range,
+                value,
+                branch,
+            });
+        }
+        this.control_activity = DynamicArrayControlIndex::from_ranges(branches);
+        for assignments in this.assignments.values_mut() {
+            assignments.sort_unstable_by_key(|assignment| assignment.range.start());
+            for _ in assignments.iter() {
+                if !Self::spend_fields(&mut this.remaining, &mut this.since_cancel, cancel) {
+                    return None;
+                }
+            }
+        }
+        for (id, expr) in body.exprs_iter() {
+            if !this.spend(cancel) {
+                return None;
+            }
+            let Expr::Call { callee, args } = expr else { continue };
+            let expression = DynamicArrayExpression { expr, range: source_map.expr_range(id) };
+            let call_index = this.calls.len();
+            this.calls.push(expression);
+            let mut referenced_names = FxHashSet::default();
+            if let Expr::Field { base, field } = body.expr_idx(*callee) {
+                match body.expr_idx(*base) {
+                    Expr::Path(name) => {
+                        referenced_names.insert(NormName::intern(name.as_str()));
+                    }
+                    Expr::Field { base, field: receiver_field }
+                        if matches!(body.expr_idx(*base), Expr::Path(name)
+                            if is_this_object(&name.as_str().fold_lower())) =>
+                    {
+                        referenced_names.insert(NormName::intern(receiver_field.as_str()));
+                    }
+                    _ => {}
+                }
+                let method = field.as_str().fold_lower();
+                if method == "добавить" || method == "add" {
+                    if let ([value, ..], Expr::Field { base, .. }) =
+                        (args.as_ref(), body.expr_idx(*callee))
+                    {
+                        if let Expr::Path(array_name) = body.expr_idx(*base) {
+                            if let Some(range) = expression.range {
+                                this.additions
+                                    .entry(NormName::intern(array_name.as_str()))
+                                    .or_default()
+                                    .push((range, *value));
+                            }
                         }
                     }
                 }
             }
+            for &arg in args {
+                if !this.spend(cancel) {
+                    return None;
+                }
+                match body.expr_idx(arg) {
+                    Expr::Path(name) => {
+                        referenced_names.insert(NormName::intern(name.as_str()));
+                    }
+                    Expr::Field { base, field }
+                        if matches!(body.expr_idx(*base), Expr::Path(name)
+                            if is_this_object(&name.as_str().fold_lower())) =>
+                    {
+                        referenced_names.insert(NormName::intern(field.as_str()));
+                    }
+                    _ => {}
+                }
+            }
+            for name in referenced_names {
+                this.calls_by_name.entry(name).or_default().push(call_index);
+            }
+        }
+        for additions in this.additions.values_mut() {
+            additions.sort_unstable_by_key(|(range, _)| range.start());
+            for _ in additions.iter() {
+                if !Self::spend_fields(&mut this.remaining, &mut this.since_cancel, cancel) {
+                    return None;
+                }
+            }
+        }
+        for (&name, additions) in &this.additions {
+            for &(range, _) in additions {
+                if !Self::spend_fields(&mut this.remaining, &mut this.since_cancel, cancel) {
+                    return None;
+                }
+                if this.control_activity.contains(range) {
+                    this.activity_sites.entry(name).or_default().push(range);
+                }
+            }
+        }
+        for (&name, assignments) in &this.assignments {
+            for assignment in assignments {
+                if !Self::spend_fields(&mut this.remaining, &mut this.since_cancel, cancel) {
+                    return None;
+                }
+                if is_array_constructor(body, assignment.value)
+                    && this.control_activity.contains(assignment.range)
+                {
+                    this.activity_sites.entry(name).or_default().push(assignment.range);
+                }
+            }
+        }
+        for sites in this.activity_sites.values_mut() {
+            sites.sort_unstable_by_key(|range| range.start());
+            for _ in sites.iter() {
+                if !Self::spend_fields(&mut this.remaining, &mut this.since_cancel, cancel) {
+                    return None;
+                }
+            }
+        }
+        Some(this)
+    }
+
+    fn spend(&mut self, cancel: &mut dyn FnMut()) -> bool {
+        Self::spend_tracked(
+            &mut self.remaining,
+            &mut self.since_cancel,
+            &mut self.budget_exhausted,
+            cancel,
+        )
+    }
+
+    fn spend_tracked(
+        remaining: &mut usize,
+        since_cancel: &mut usize,
+        exhausted: &mut bool,
+        cancel: &mut dyn FnMut(),
+    ) -> bool {
+        let spent = Self::spend_fields(remaining, since_cancel, cancel);
+        *exhausted |= !spent;
+        spent
+    }
+
+    /// Reaching zero exactly is still a complete scan; exhaustion means a requested
+    /// unit of work could not be spent.
+    fn exhausted(&self) -> bool {
+        self.budget_exhausted
+    }
+
+    fn spend_fields(
+        remaining: &mut usize,
+        since_cancel: &mut usize,
+        cancel: &mut dyn FnMut(),
+    ) -> bool {
+        if *remaining == 0 {
+            return false;
+        }
+        *remaining -= 1;
+        *since_cancel += 1;
+        if *since_cancel >= DYNAMIC_ARRAY_CANCEL_INTERVAL {
+            *since_cancel = 0;
+            cancel();
+        }
+        true
+    }
+
+    fn assignment_branch(&self, range: TextRange) -> Option<Option<TextRange>> {
+        self.assignment_branches.get(&range).copied()
+    }
+
+    fn addition_index_range(
+        &self,
+        name: NormName,
+        start: TextSize,
+        end: TextSize,
+        strict_start: bool,
+    ) -> (usize, usize) {
+        let Some(additions) = self.additions.get(&name) else { return (0, 0) };
+        let first = if strict_start {
+            additions.partition_point(|(range, _)| range.start() <= start)
+        } else {
+            additions.partition_point(|(range, _)| range.start() < start)
+        };
+        let last = additions.partition_point(|(range, _)| range.start() < end);
+        (first.min(last), last)
+    }
+
+    fn relevant_writes(
+        &mut self,
+        root: NormName,
+        cancel: &mut dyn FnMut(),
+    ) -> Option<std::sync::Arc<DynamicArrayRelevantWrites>> {
+        if let Some(cached) = self.relevant_writes_cache.get(&root) {
+            return Some(cached.clone());
+        }
+        let mut names = FxHashSet::default();
+        let mut pending = vec![root];
+        let mut writes = FxHashSet::default();
+        while let Some(name) = pending.pop() {
+            if !names.insert(name) {
+                continue;
+            }
+            if !self.spend(cancel) {
+                return None;
+            }
+            for index in 0..self.writes_by_target.get(&name).map_or(0, Vec::len) {
+                let write = self.writes_by_target[&name][index];
+                if !self.spend(cancel) {
+                    return None;
+                }
+                writes.insert(write);
+            }
+            for index in 0..self.writes_by_source.get(&name).map_or(0, Vec::len) {
+                let write = self.writes_by_source[&name][index];
+                if !self.spend(cancel) {
+                    return None;
+                }
+                writes.insert(write);
+                let Stmt::Assign { target, .. } = self.writes[write].stmt else { continue };
+                if let Expr::Path(target_name) = self.body.expr_idx(*target) {
+                    let target = NormName::intern(target_name.as_str());
+                    if !names.contains(&target) {
+                        pending.push(target);
+                    }
+                }
+            }
+            for index in 0..self.writes_by_receiver.get(&name).map_or(0, Vec::len) {
+                let write = self.writes_by_receiver[&name][index];
+                if !self.spend(cancel) {
+                    return None;
+                }
+                writes.insert(write);
+            }
+        }
+        let mut writes = writes.into_iter().collect::<Vec<_>>();
+        writes.sort_unstable_by_key(|&index| {
+            self.writes[index].range.map_or(TextSize::from(0), |range| range.start())
+        });
+        for _ in &writes {
+            if !self.spend(cancel) {
+                return None;
+            }
+        }
+        let relevant = std::sync::Arc::new(DynamicArrayRelevantWrites {
+            names: names.into_iter().collect(),
+            writes,
+        });
+        self.relevant_writes_cache.insert(root, relevant.clone());
+        Some(relevant)
+    }
+
+    fn relevant_calls(
+        &mut self,
+        root: NormName,
+        cancel: &mut dyn FnMut(),
+    ) -> Option<std::sync::Arc<[usize]>> {
+        if let Some(cached) = self.relevant_calls_cache.get(&root) {
+            return Some(cached.clone());
+        }
+        let relevant_writes = self.relevant_writes(root, cancel)?;
+        let mut calls = FxHashSet::default();
+        for &name in &relevant_writes.names {
+            if !self.spend(cancel) {
+                return None;
+            }
+            for index in 0..self.calls_by_name.get(&name).map_or(0, Vec::len) {
+                let call = self.calls_by_name[&name][index];
+                if !self.spend(cancel) {
+                    return None;
+                }
+                calls.insert(call);
+            }
+        }
+        let mut calls = calls.into_iter().collect::<Vec<_>>();
+        calls.sort_unstable_by_key(|&index| {
+            self.calls[index].range.map_or(TextSize::from(0), |range| range.start())
+        });
+        for _ in &calls {
+            if !self.spend(cancel) {
+                return None;
+            }
+        }
+        let relevant: std::sync::Arc<[usize]> = std::sync::Arc::from(calls);
+        self.relevant_calls_cache.insert(root, relevant.clone());
+        Some(relevant)
+    }
+
+    fn next_unconditional(
+        &mut self,
+        name: NormName,
+        after: TextSize,
+        before: TextSize,
+        cancel: &mut dyn FnMut(),
+    ) -> Option<TextSize> {
+        let remaining = &mut self.remaining;
+        let since_cancel = &mut self.since_cancel;
+        let Some(assignments) = self.assignments.get(&name) else {
+            return Some(before);
+        };
+        let first_after =
+            assignments.partition_point(|assignment| assignment.range.start() <= after);
+        let before_end =
+            assignments.partition_point(|assignment| assignment.range.start() < before);
+        if first_after >= before_end {
+            return Some(before);
+        }
+        for assignment in &assignments[first_after..before_end] {
+            if !Self::spend_tracked(remaining, since_cancel, &mut self.budget_exhausted, cancel) {
+                return None;
+            }
+            if assignment.branch.is_none() {
+                return Some(assignment.range.start());
+            }
+        }
+        Some(before)
+    }
+
+    fn resolve(
+        &mut self,
+        name: NormName,
+        before: TextSize,
+        candidate_end: TextSize,
+        cancel: &mut dyn FnMut(),
+    ) -> (Vec<DynamicNotifyArrayAlias>, bool, bool) {
+        let mut pending = vec![(name, before, candidate_end, true)];
+        let mut visited = FxHashSet::default();
+        let mut results = Vec::new();
+        let mut unresolved_alternative = false;
+        let mut has_input_alternative = false;
+        while let Some((current_name, current_before, end_cap, is_root)) = pending.pop() {
+            if !visited.insert((current_name, current_before, end_cap)) {
+                continue;
+            }
+            let assignment_index = &self.assignments;
+            let remaining = &mut self.remaining;
+            let since_cancel = &mut self.since_cancel;
+            let Some(all) = assignment_index.get(&current_name) else {
+                unresolved_alternative |= !is_root;
+                if self.parameters.contains(&current_name) {
+                    // The chain runs off the front of the body into the incoming
+                    // parameter: its identity is known and stays recoverable, while
+                    // its arbitrary incoming contents keep the result incomplete.
+                    has_input_alternative = true;
+                    results.push(DynamicNotifyArrayAlias {
+                        array_name: current_name,
+                        array_start: None,
+                        array_end: end_cap,
+                    });
+                }
+                continue;
+            };
+            let before_end =
+                all.partition_point(|assignment| assignment.range.start() < current_before);
+            let assignments = &all[..before_end];
+            for _ in assignments {
+                if !Self::spend_tracked(remaining, since_cancel, &mut self.budget_exhausted, cancel)
+                {
+                    return (Vec::new(), false, false);
+                }
+            }
+            let Some(&latest) = assignments.last() else {
+                unresolved_alternative |= !is_root;
+                if self.parameters.contains(&current_name) {
+                    // Every write to the parameter sits at or after the read being
+                    // resolved, so the read still sees the incoming value. The value's
+                    // lifetime ends at the first such write: later writes belong to the
+                    // rebound array, which this binding never receives.
+                    has_input_alternative = true;
+                    results.push(DynamicNotifyArrayAlias {
+                        array_name: current_name,
+                        array_start: None,
+                        array_end: all
+                            .first()
+                            .map_or(end_cap, |assignment| end_cap.min(assignment.range.start())),
+                    });
+                }
+                continue;
+            };
+            let mut selected = vec![latest];
+            let mut selected_ranges = FxHashSet::default();
+            selected_ranges.insert(latest.range);
+            let mut branch_pending = vec![latest];
+            while let Some(site) = branch_pending.pop() {
+                let Some(branch) = site.branch else { continue };
+                for assignment in assignments {
+                    if !Self::spend_tracked(
+                        remaining,
+                        since_cancel,
+                        &mut self.budget_exhausted,
+                        cancel,
+                    ) {
+                        return (Vec::new(), false, false);
+                    }
+                    if branch.contains_range(assignment.range)
+                        && selected_ranges.insert(assignment.range)
+                    {
+                        selected.push(*assignment);
+                        branch_pending.push(*assignment);
+                    }
+                }
+                let mut previous = None;
+                for assignment in assignments {
+                    if !Self::spend_tracked(
+                        remaining,
+                        since_cancel,
+                        &mut self.budget_exhausted,
+                        cancel,
+                    ) {
+                        return (Vec::new(), false, false);
+                    }
+                    if assignment.range.end() <= branch.start()
+                        && previous.is_none_or(|old: DynamicArrayAssignment<'_>| {
+                            assignment.range.start() > old.range.start()
+                        })
+                    {
+                        previous = Some(*assignment);
+                    }
+                }
+                if let Some(previous) = previous {
+                    if selected_ranges.insert(previous.range) {
+                        selected.push(previous);
+                        branch_pending.push(previous);
+                    }
+                } else if self.parameters.contains(&current_name) {
+                    // The path where this branch is not taken keeps the incoming
+                    // parameter value. Its known local additions remain possible,
+                    // while arbitrary incoming contents keep the result incomplete.
+                    unresolved_alternative = true;
+                    has_input_alternative = true;
+                    results.push(DynamicNotifyArrayAlias {
+                        array_name: current_name,
+                        array_start: None,
+                        array_end: end_cap.min(branch.start()),
+                    });
+                }
+            }
+            for assignment in selected {
+                if !self.spend(cancel) {
+                    return (Vec::new(), false, false);
+                }
+                let binding_start = assignment.range.start();
+                match assignment.value {
+                    Expr::New { .. } if is_array_constructor(self.body, assignment.value) => {
+                        let Some(array_end) = self.next_unconditional(
+                            current_name,
+                            binding_start,
+                            candidate_end,
+                            cancel,
+                        ) else {
+                            return (Vec::new(), false, false);
+                        };
+                        results.push(DynamicNotifyArrayAlias {
+                            array_name: current_name,
+                            array_start: Some(binding_start),
+                            array_end: end_cap.min(array_end),
+                        });
+                    }
+                    Expr::Path(source_name) => {
+                        let source = NormName::intern(source_name.as_str());
+                        if source != current_name {
+                            let Some(source_end) = self.next_unconditional(
+                                source,
+                                binding_start,
+                                candidate_end,
+                                cancel,
+                            ) else {
+                                return (Vec::new(), false, false);
+                            };
+                            pending.push((source, binding_start, end_cap.min(source_end), false));
+                        }
+                    }
+                    _ => unresolved_alternative = true,
+                }
+            }
+        }
+        let mut seen = FxHashSet::default();
+        let mut unique = Vec::with_capacity(results.len());
+        for alias in results {
+            if !self.spend(cancel) {
+                return (Vec::new(), false, false);
+            }
+            if seen.insert(alias) {
+                unique.push(alias);
+            }
+        }
+        // Keep the historical syntax fallback for unknown-only roots. It is mixed
+        // known/unknown alternatives that invalidate the recovered targets.
+        let complete = unique.is_empty() || !unresolved_alternative;
+        (unique, complete, has_input_alternative)
+    }
+}
+
+fn extract_dynamic_notify_handlers(
+    body: &Body,
+    candidate: &DynamicNotifyArrayCandidate,
+    alias_resolver: &mut DynamicArrayResolver<'_>,
+    handlers: &mut Vec<Name>,
+    handler_sites: &mut Vec<DynamicNotifySignatureHandler>,
+    cancel: &mut dyn FnMut(),
+) -> bool {
+    // Only a top-level reassignment to a fresh array is an unconditional reset; a nested
+    // reset cannot be pinpointed this way, and the branch scan below accounts for it.
+    let mut reset_start = candidate.array_start;
+    if reset_start.is_none() {
+        let reset_assignments =
+            alias_resolver.assignments.get(&candidate.array_name).cloned().unwrap_or_default();
+        for assignment in reset_assignments {
+            if !alias_resolver.spend(cancel) {
+                return false;
+            }
+            if !is_array_constructor(body, assignment.value) {
+                continue;
+            }
+            let start = assignment.range.start();
+            if start < candidate.constructor_start && start < candidate.array_end {
+                reset_start = Some(reset_start.map_or(start, |old: TextSize| old.max(start)));
+            }
+        }
+    }
+    let sequence_start = reset_start.unwrap_or(TextSize::from(0));
+    let Some(branched_activity) = dynamic_array_activity_in_branch(
+        candidate,
+        sequence_start,
+        candidate.array_end,
+        alias_resolver,
+        cancel,
+    ) else {
+        return false;
+    };
+    let Some(uncertainty) = dynamic_array_uncertain_writes(
+        body,
+        candidate,
+        sequence_start,
+        candidate.array_end,
+        alias_resolver,
+        cancel,
+    ) else {
+        return false;
+    };
+
+    let mut values = Vec::new();
+    let (first_addition, end_addition) = alias_resolver.addition_index_range(
+        candidate.array_name,
+        sequence_start,
+        candidate.constructor_start.min(candidate.array_end),
+        true,
+    );
+    for index in first_addition..end_addition {
+        let value = alias_resolver
+            .additions
+            .get(&candidate.array_name)
+            .and_then(|additions| additions.get(index))
+            .map(|(_, value)| *value);
+        if !alias_resolver.spend(cancel) {
+            return false;
+        }
+        if let Some(value) = value {
+            values.push(value);
+        }
+    }
+    values.extend(uncertainty.possible_values);
+
+    let mut candidate_handlers = Vec::new();
+    let mut candidate_sites = Vec::new();
+    // Without an unconditional reset the observed appends may be partial, so the exact
+    // slot sequence is never trusted; the same holds when an append or a reset may run
+    // conditionally, or an opaque write shifts the array contents.
+    if reset_start.is_none() || branched_activity || uncertainty.uncertain {
+        for value in values {
+            if !alias_resolver.spend(cancel) {
+                return false;
+            }
+            let Some(name) = extract_string_literal(body, value) else { continue };
+            if is_identifier_like(&name) {
+                push_dynamic_notify_handler(
+                    &name,
+                    ExprId::from_idx(value),
+                    candidate,
+                    &mut candidate_handlers,
+                    &mut candidate_sites,
+                );
+            }
+        }
+        handlers.extend(candidate_handlers);
+        handler_sites.extend(candidate_sites);
+        return true;
+    }
+
+    for (handler_slot, receiver_slot, _) in NotifyCallbackSlot::callback_description_slots() {
+        if !alias_resolver.spend(cancel) {
+            return false;
+        }
+        let Some(handler) =
+            values.get(handler_slot).and_then(|&idx| extract_string_literal(body, idx))
+        else {
+            continue;
+        };
+        if !is_identifier_like(&handler) {
+            continue;
+        }
+        let receiver_expr = values.get(receiver_slot).map(|&idx| ExprId::from_idx(idx));
+        let receiver_syntax = NotifyReceiverSyntax::for_receiver(body, receiver_expr);
+        if receiver_syntax.may_name_local_callback() {
+            push_dynamic_notify_handler(
+                &handler,
+                ExprId::from_idx(values[handler_slot]),
+                candidate,
+                &mut candidate_handlers,
+                &mut candidate_sites,
+            );
+        }
+    }
+    handlers.extend(candidate_handlers);
+    handler_sites.extend(candidate_sites);
+    true
+}
+
+fn push_dynamic_notify_handler(
+    name: &str,
+    callback_expr: ExprId,
+    candidate: &DynamicNotifyArrayCandidate,
+    handlers: &mut Vec<Name>,
+    handler_sites: &mut Vec<DynamicNotifySignatureHandler>,
+) {
+    let handler_name = Name::new(name);
+    handlers.push(handler_name.clone());
+    handler_sites.push(DynamicNotifySignatureHandler {
+        handler_name,
+        callback_expr,
+        constructor_range: candidate.constructor_range,
+    });
+}
+
+fn is_array_constructor(body: &Body, expr: &Expr) -> bool {
+    match expr {
+        Expr::New { type_name: Some(name), .. } => {
+            matches!(name.as_str().fold_lower().as_str(), "массив" | "array")
+        }
+        Expr::New { type_name: None, args } => args
+            .first()
+            .and_then(|&idx| extract_string_literal(body, idx))
+            .is_some_and(|name| matches!(name.fold_lower().as_str(), "массив" | "array")),
+        _ => false,
+    }
+}
+
+/// Whether a branch between `start` and the constructor conditionally executes an append
+/// to, or a reset of, the candidate array. A branch that never touches the array leaves
+/// the append sequence intact, so exact handler slots survive unrelated control flow;
+/// a conditional append or reset makes the slot positions unknowable.
+fn dynamic_array_activity_in_branch(
+    candidate: &DynamicNotifyArrayCandidate,
+    start: TextSize,
+    end: TextSize,
+    resolver: &mut DynamicArrayResolver<'_>,
+    cancel: &mut dyn FnMut(),
+) -> Option<bool> {
+    if let Some(&cached) = resolver.activity_cache.get(candidate) {
+        return Some(cached);
+    }
+    if !resolver.spend(cancel) {
+        return None;
+    }
+    let activity_end = candidate.constructor_start.min(end);
+    let sites = resolver.activity_sites.get(&candidate.array_name);
+    let active = sites.is_some_and(|sites| {
+        let first = sites.partition_point(|range| range.start() < start);
+        let last = sites.partition_point(|range| range.start() < activity_end);
+        first < last
+    });
+    resolver.activity_cache.insert(*candidate, active);
+    Some(active)
+}
+
+/// Writes to the candidate array that the append sequence cannot account for: an indexed
+/// write, a write through a local alias of the array, or a same-named member reached off
+/// `ЭтотОбъект`. Any such write makes the exact slot sequence untrustworthy, and its
+/// string value is a possible handler name.
+#[derive(Debug, Default, Clone)]
+struct DynamicArrayUncertainty {
+    uncertain: bool,
+    possible_values: Vec<ExprIdx>,
+}
+
+/// Whether `expr` may designate the candidate array itself: the variable, a local alias
+/// bound to it, or a same-named member of `ЭтотОбъект`. A same-named member of any other
+/// receiver is an unrelated object.
+fn dynamic_array_alias_is_active(
+    aliases: &FxHashMap<NormName, Vec<(TextSize, TextSize)>>,
+    name: NormName,
+    at: TextSize,
+) -> bool {
+    aliases.get(&name).is_some_and(|intervals| {
+        let index = intervals.partition_point(|(start, _)| *start <= at);
+        index > 0 && at < intervals[index - 1].1
+    })
+}
+
+fn expr_may_designate_candidate_array(
+    body: &Body,
+    expr: &Expr,
+    candidate: &DynamicNotifyArrayCandidate,
+    aliases: &FxHashMap<NormName, Vec<(TextSize, TextSize)>>,
+    at: TextSize,
+) -> bool {
+    match expr {
+        Expr::Path(name) => {
+            let key = NormName::intern(name.as_str());
+            key == candidate.array_name || dynamic_array_alias_is_active(aliases, key, at)
+        }
+        Expr::Field { base, field } => {
+            NormName::intern(field.as_str()) == candidate.array_name
+                && matches!(body.expr_idx(*base), Expr::Path(name)
+                    if is_this_object(&name.as_str().fold_lower()))
+        }
+        _ => false,
+    }
+}
+
+fn dynamic_array_uncertain_writes(
+    body: &Body,
+    candidate: &DynamicNotifyArrayCandidate,
+    start: TextSize,
+    end: TextSize,
+    alias_resolver: &mut DynamicArrayResolver<'_>,
+    cancel: &mut dyn FnMut(),
+) -> Option<DynamicArrayUncertainty> {
+    if let Some(cached) = alias_resolver.uncertainty_cache.get(candidate) {
+        return Some(cached.clone());
+    }
+    let mut result = DynamicArrayUncertainty::default();
+    let relevant_writes = alias_resolver.relevant_writes(candidate.array_name, cancel)?;
+
+    // Track aliases in source order so an unconditional rebinding releases the old array.
+    // Conditional rebinding keeps both possibilities because either arm may execute.
+    let mut bindings = Vec::new();
+    for &index in &relevant_writes.writes {
+        let statement = alias_resolver.writes[index];
+        if !alias_resolver.spend(cancel) {
+            return None;
+        }
+        let Stmt::Assign { target, value } = statement.stmt else { continue };
+        let Expr::Path(target_name) = body.expr_idx(*target) else { continue };
+        let Some(range) = statement.range else { continue };
+        if range.start() < start || range.start() >= candidate.constructor_start {
+            continue;
+        }
+        let value = match body.expr_idx(*value) {
+            Expr::Path(value_name) => Some(NormName::intern(value_name.as_str())),
+            _ => None,
+        };
+        bindings.push((range, NormName::intern(target_name.as_str()), value));
+    }
+    bindings.sort_unstable_by_key(|(range, _, _)| range.start());
+    let mut active_aliases: FxHashSet<NormName> = FxHashSet::default();
+    let mut open_aliases: FxHashMap<NormName, TextSize> = FxHashMap::default();
+    let mut alias_intervals: FxHashMap<NormName, Vec<(TextSize, TextSize)>> = FxHashMap::default();
+    for (range, target, value) in bindings {
+        if !alias_resolver.spend(cancel) {
+            return None;
+        }
+        if target == candidate.array_name {
+            continue;
+        }
+        let bound_to_candidate = value.is_some_and(|value| {
+            (value == candidate.array_name && range.start() < end)
+                || active_aliases.contains(&value)
+        });
+        let conditional = alias_resolver.assignment_branch(range).flatten().is_some();
+        if bound_to_candidate {
+            if active_aliases.insert(target) {
+                open_aliases.insert(target, range.start());
+            }
+        } else if !conditional && active_aliases.remove(&target) {
+            if let Some(opened_at) = open_aliases.remove(&target) {
+                alias_intervals.entry(target).or_default().push((opened_at, range.start()));
+            }
+        }
+    }
+    for alias in active_aliases {
+        if !alias_resolver.spend(cancel) {
+            return None;
+        }
+        if let Some(opened_at) = open_aliases.remove(&alias) {
+            alias_intervals
+                .entry(alias)
+                .or_default()
+                .push((opened_at, candidate.constructor_start));
+        }
+    }
+    for intervals in alias_intervals.values_mut() {
+        intervals.sort_unstable_by_key(|(start, _)| *start);
+        for _ in intervals.iter() {
+            if !alias_resolver.spend(cancel) {
+                return None;
+            }
+        }
+    }
+
+    for &index in &relevant_writes.writes {
+        let statement = alias_resolver.writes[index];
+        if !alias_resolver.spend(cancel) {
+            return None;
+        }
+        let Stmt::Assign { target, value } = statement.stmt else { continue };
+        // An indexed write (`Параметры[0] = …`) targets its base receiver.
+        let target_receiver = match body.expr_idx(*target) {
+            Expr::Index { base, .. } => body.expr_idx(*base),
+            other => other,
+        };
+        let Some(range) = statement.range else {
+            // Without a position, any historical alias could have named the candidate.
+            let maybe_alias = match target_receiver {
+                Expr::Path(name) => alias_intervals.contains_key(&NormName::intern(name.as_str())),
+                _ => false,
+            };
+            if maybe_alias
+                || expr_may_designate_candidate_array(
+                    body,
+                    target_receiver,
+                    candidate,
+                    &alias_intervals,
+                    start,
+                )
+            {
+                result.uncertain = true;
+            }
+            continue;
+        };
+        let writes_through_alias = match body.expr_idx(*target) {
+            Expr::Path(name) => dynamic_array_alias_is_active(
+                &alias_intervals,
+                NormName::intern(name.as_str()),
+                range.start(),
+            ),
+            _ => matches!(target_receiver, Expr::Path(name)
+            if dynamic_array_alias_is_active(
+                &alias_intervals,
+                NormName::intern(name.as_str()),
+                range.start()
+            )),
+        };
+        if range.start() < start
+            || range.start() >= candidate.constructor_start
+            || (range.start() >= end && !writes_through_alias)
+        {
+            continue;
+        }
+        match body.expr_idx(*target) {
+            Expr::Path(name) => {
+                let key = NormName::intern(name.as_str());
+                // A reassignment to something other than a fresh array is opaque; a
+                // fresh array is the reset the caller already accounts for.
+                if (key == candidate.array_name
+                    || dynamic_array_alias_is_active(&alias_intervals, key, range.start()))
+                    && !is_array_constructor(body, body.expr_idx(*value))
+                {
+                    result.uncertain = true;
+                }
+            }
+            _ if expr_may_designate_candidate_array(
+                body,
+                target_receiver,
+                candidate,
+                &alias_intervals,
+                range.start(),
+            ) =>
+            {
+                // An indexed or same-named qualified write replaces a slot the pass
+                // cannot resolve, and its value is a possible handler name.
+                result.uncertain = true;
+                result.possible_values.push(*value);
+            }
             _ => {}
+        }
+    }
+
+    let relevant_calls = alias_resolver.relevant_calls(candidate.array_name, cancel)?;
+    for &index in relevant_calls.iter() {
+        let expression = alias_resolver.calls[index];
+        if !alias_resolver.spend(cancel) {
+            return None;
+        }
+        let Expr::Call { callee, args } = expression.expr else { continue };
+        let range = expression.range;
+        let at = range.map_or(start, |range| range.start());
+        let calls_through_alias = match body.expr_idx(*callee) {
+            Expr::Field { base, .. } => matches!(body.expr_idx(*base), Expr::Path(name)
+            if dynamic_array_alias_is_active(
+                &alias_intervals,
+                NormName::intern(name.as_str()),
+                at
+            )),
+            _ => false,
+        };
+        let mut passes_alias = false;
+        for &arg in args {
+            if !alias_resolver.spend(cancel) {
+                return None;
+            }
+            if matches!(body.expr_idx(arg), Expr::Path(name)
+            if dynamic_array_alias_is_active(
+                &alias_intervals,
+                NormName::intern(name.as_str()),
+                at
+            )) {
+                passes_alias = true;
+                break;
+            }
+        }
+        let in_window = range.is_some_and(|range| {
+            range.start() >= start
+                && range.start() < candidate.constructor_start
+                && (range.start() < end || calls_through_alias || passes_alias)
+        });
+        if !in_window {
+            continue;
+        }
+        // Handing the array to a call exposes it to effects this syntax pass cannot see.
+        for &arg in args {
+            if !alias_resolver.spend(cancel) {
+                return None;
+            }
+            if expr_may_designate_candidate_array(
+                body,
+                body.expr_idx(arg),
+                candidate,
+                &alias_intervals,
+                at,
+            ) {
+                result.uncertain = true;
+            }
+        }
+        let Expr::Field { base, field } = body.expr_idx(*callee) else { continue };
+        let method = field.as_str().fold_lower();
+        let is_append = method == "добавить" || method == "add";
+        match body.expr_idx(*base) {
+            Expr::Path(name) if NormName::intern(name.as_str()) == candidate.array_name => {
+                // A call through the array variable other than a recognized append can
+                // change its contents in a way this pass cannot place in a slot, and
+                // any string it passes may end up in the array; appends are already
+                // part of the sequence.
+                if !is_append {
+                    result.uncertain = true;
+                    for &arg in args {
+                        if !alias_resolver.spend(cancel) {
+                            return None;
+                        }
+                        result.possible_values.push(arg);
+                    }
+                }
+            }
+            receiver
+                if matches!(receiver, Expr::Path(name)
+                if dynamic_array_alias_is_active(
+                    &alias_intervals,
+                    NormName::intern(name.as_str()),
+                    at
+                )) || expr_may_designate_candidate_array(
+                    body,
+                    receiver,
+                    candidate,
+                    &alias_intervals,
+                    at,
+                ) =>
+            {
+                // A call through an alias or a same-named member of `ЭтотОбъект` may
+                // reach the same array: any string it passes is a possible handler
+                // name, and the call itself leaves the append sequence untrustworthy.
+                result.uncertain = true;
+                for &arg in args {
+                    if !alias_resolver.spend(cancel) {
+                        return None;
+                    }
+                    result.possible_values.push(arg);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    alias_resolver.uncertainty_cache.insert(*candidate, result.clone());
+    Some(result)
+}
+
+fn is_notify_constructor_candidate(
+    body: &Body,
+    type_name: Option<&Name>,
+    args: &[ExprIdx],
+) -> bool {
+    match type_name {
+        Some(name) => {
+            bsl_platform::is_callback_description_type_name(name.as_str())
+                && args
+                    .iter()
+                    .any(|&arg| matches!(body.expr_idx(arg), Expr::Literal(Literal::String(_))))
+        }
+        None => {
+            // Dynamic callback constructors use a literal type name followed by an array;
+            // retain the legacy direct-argument form for syntax-only protection as well.
+            args.len() >= 2
+                && args
+                    .first()
+                    .and_then(|&arg| extract_string_literal(body, arg))
+                    .is_some_and(|name| bsl_platform::is_callback_description_type_name(&name))
         }
     }
 }
@@ -1036,15 +2724,6 @@ fn is_identifier_like(s: &str) -> bool {
         _ => return false,
     }
     chars.all(|c| c.is_alphabetic() || c.is_ascii_digit() || c == '_')
-}
-
-fn is_notify_description(name: &Name) -> bool {
-    is_notify_description_str(name.as_str())
-}
-
-fn is_notify_description_str(name: &str) -> bool {
-    let lower = name.fold_lower();
-    lower == "описаниеоповещения" || lower == "notifydescription"
 }
 
 fn is_this_object(name_lower: &str) -> bool {
@@ -1139,25 +2818,6 @@ fn extract_set_action_reg(
 ) -> Option<SetActionReg> {
     let handler_name = extract_string_literal(body, *args.get(1)?)?;
     Some(SetActionReg { caller, handler_name: Name::new(&handler_name), range })
-}
-
-fn extract_notify_reg_at(
-    body: &Body,
-    caller: CallerId,
-    args: &[ExprIdx],
-    method_idx: usize,
-    target_idx: usize,
-    range: TextRange,
-) -> Option<NotifyReg> {
-    let callback_name = extract_string_literal(body, *args.get(method_idx)?)?;
-    let target = match args.get(target_idx).map(|&idx| body.expr_idx(idx)) {
-        Some(Expr::Path(name)) if is_this_receiver(&name.as_str().fold_lower()) => {
-            NotifyTarget::ThisObject
-        }
-        Some(Expr::Path(name)) => NotifyTarget::Module(name.clone()),
-        _ => NotifyTarget::Unsupported,
-    };
-    Some(NotifyReg { caller, callback_name: Name::new(&callback_name), target, range })
 }
 
 fn field_callee_to_edge(
@@ -1373,18 +3033,41 @@ mod tests {
                     60,
                 ),
             ],
+            notify_candidates: Vec::new(),
+            notify_signature_handlers: Vec::new(),
+            notify_additional_signature_handlers: Vec::new(),
+            notify_dynamic_signature_handlers: Vec::new(),
+            notify_dynamic_signature_handler_sites: Vec::new(),
+            notify_dynamic_signature_analysis_incomplete: Vec::new(),
+            notify_projection_incomplete: false,
+            binds_computed_callback: false,
             notify_regs: vec![
                 NotifyReg {
                     caller: CallerId::Method(MethodKey::first("Главная")),
+                    callback_expr: ExprId::from_raw(0.into()),
                     callback_name: Name::new("Обработчик"),
+                    receiver_syntax: NotifyReceiverSyntax::SelfName,
                     target: NotifyTarget::ThisObject,
+                    environments: NotifyRegistrationEnvironments::default(),
                     range: range(70),
                 },
                 NotifyReg {
                     caller: CallerId::Method(MethodKey::first("Главная")),
+                    callback_expr: ExprId::from_raw(0.into()),
                     callback_name: Name::new("Обработчик"),
+                    receiver_syntax: NotifyReceiverSyntax::BareName,
                     target: NotifyTarget::Unsupported,
+                    environments: NotifyRegistrationEnvironments::default(),
                     range: range(80),
+                },
+                NotifyReg {
+                    caller: CallerId::Method(MethodKey::first("Главная")),
+                    callback_expr: ExprId::from_raw(0.into()),
+                    callback_name: Name::new("ВнешнийОбработчик"),
+                    receiver_syntax: NotifyReceiverSyntax::BareName,
+                    target: NotifyTarget::Module(Name::new("Handlers")),
+                    environments: NotifyRegistrationEnvironments::default(),
+                    range: range(85),
                 },
             ],
             idle_handler_regs: vec![
@@ -1408,6 +3091,7 @@ mod tests {
                 range: range(110),
             }],
             name_literal_refs: vec![MethodKey::first("М1")],
+            name_literal_ref_sites: Vec::new(),
             form_entries: Vec::new(),
         };
 
@@ -1449,12 +3133,26 @@ mod tests {
         );
         assert_eq!(
             subset.notify_regs,
-            vec![NotifyReg {
-                caller: CallerId::Method(MethodKey::first("Главная")),
-                callback_name: Name::new("Обработчик"),
-                target: NotifyTarget::ThisObject,
-                range: zero,
-            }],
+            vec![
+                NotifyReg {
+                    caller: CallerId::Method(MethodKey::first("Главная")),
+                    callback_expr: ExprId::from_raw(0.into()),
+                    callback_name: Name::new("Обработчик"),
+                    receiver_syntax: NotifyReceiverSyntax::SelfName,
+                    target: NotifyTarget::ThisObject,
+                    environments: NotifyRegistrationEnvironments::default(),
+                    range: zero,
+                },
+                NotifyReg {
+                    caller: CallerId::Method(MethodKey::first("Главная")),
+                    callback_expr: ExprId::from_raw(0.into()),
+                    callback_name: Name::new("ВнешнийОбработчик"),
+                    receiver_syntax: NotifyReceiverSyntax::BareName,
+                    target: NotifyTarget::Module(Name::new("Handlers")),
+                    environments: NotifyRegistrationEnvironments::default(),
+                    range: zero,
+                },
+            ],
         );
         assert_eq!(
             subset.idle_handler_regs,
@@ -1468,7 +3166,32 @@ mod tests {
         assert!(subset.methods.is_empty());
         assert!(subset.set_action_regs.is_empty());
         assert!(subset.name_literal_refs.is_empty());
+        assert!(subset.name_literal_ref_sites.is_empty());
         assert!(subset.form_entries.is_empty());
+
+        // Named alias uncertainty is not a budget stop; the compact index needs
+        // neither its per-constructor details nor suppression of known registrations.
+        let mut uncertain_array = summary.clone();
+        uncertain_array.notify_dynamic_signature_analysis_incomplete.push(
+            DynamicNotifySignatureAnalysisGap {
+                caller: CallerId::Method(MethodKey::first("Главная")),
+                constructor: ExprId::from_raw(0.into()),
+                constructor_range: range(120),
+                array_name: Name::new("Параметры"),
+            },
+        );
+        let subset = uncertain_array.method_pair_subset();
+        assert_eq!(subset.notify_regs.len(), 2);
+        assert!(subset.notify_dynamic_signature_analysis_incomplete.is_empty());
+
+        // Budget exhaustion gets an explicit marker: do not publish its partial
+        // callback-registration prefix as a complete incoming-call projection.
+        uncertain_array.notify_projection_incomplete = true;
+        let subset = uncertain_array.method_pair_subset();
+        assert!(subset.notify_regs.is_empty());
+        assert!(subset.notify_projection_incomplete);
+        assert!(subset.notify_dynamic_signature_analysis_incomplete.is_empty());
+        assert!(!subset.call_edges.is_empty(), "complete direct calls remain projectable");
     }
 
     #[test]
@@ -1539,14 +3262,6 @@ mod tests {
         assert!(is_attach_idle_handler("подключитьобработчикожидания"));
         assert!(is_attach_idle_handler("attachidlehandler"));
         assert!(!is_attach_idle_handler("отключитьобработчикожидания"));
-    }
-
-    #[test]
-    fn test_is_notify_description() {
-        assert!(is_notify_description(&Name::new("ОписаниеОповещения")));
-        assert!(is_notify_description(&Name::new("NotifyDescription")));
-        assert!(is_notify_description(&Name::new("описаниеоповещения")));
-        assert!(!is_notify_description(&Name::new("ОписаниеОшибки")));
     }
 
     #[test]
@@ -1724,10 +3439,22 @@ mod tests {
         code: &str,
         handlers: &[bsl_metadata::FormEventHandler],
     ) -> ModuleCallSummary {
+        parse_and_extract_with_cancel_and_handlers(code, handlers, &mut || {})
+    }
+
+    fn parse_and_extract_with_cancel(code: &str, cancel: &mut dyn FnMut()) -> ModuleCallSummary {
+        parse_and_extract_with_cancel_and_handlers(code, &[], cancel)
+    }
+
+    fn parse_and_extract_with_cancel_and_handlers(
+        code: &str,
+        handlers: &[bsl_metadata::FormEventHandler],
+        cancel: &mut dyn FnMut(),
+    ) -> ModuleCallSummary {
         let parse = parser::parse(code);
         let item_tree = ItemTree::from_parse(&parse);
         let module_bodies = ModuleBodies::from_parse(&parse);
-        extract_call_summary(&item_tree, &module_bodies, handlers)
+        extract_call_summary_with_cancellation(&item_tree, &module_bodies, handlers, cancel)
     }
 
     #[test]
@@ -1943,112 +3670,788 @@ EndProcedure
     }
 
     #[test]
-    fn test_notify_description_in_module_code() {
+    fn notify_receiver_syntax_recognizes_self_names_case_insensitively() {
+        for name in [
+            "ЭтотОбъект",
+            "эТоТоБъЕкТ",
+            "ThisObject",
+            "THISOBJECT",
+            "ЭтаФорма",
+            "этаформа",
+            "ThisForm",
+            "thisform",
+        ] {
+            assert_eq!(
+                NotifyReceiverSyntax::for_bare_name(&Name::new(name)),
+                NotifyReceiverSyntax::SelfName,
+                "{name}"
+            );
+        }
+        for name in ["ДругойМодуль", "CommonModule", "ЭтотОбъектДругой"]
+        {
+            assert_eq!(
+                NotifyReceiverSyntax::for_bare_name(&Name::new(name)),
+                NotifyReceiverSyntax::BareName,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn callback_description_slots_share_the_bundled_handler_receiver_pairs() {
+        let slots = bsl_platform::bundled_callback_description_slots();
+        assert_eq!(
+            NotifyCallbackSlot::callback_description_slots(),
+            [
+                (slots.handler, slots.receiver, NotifyCallbackSlot::Handler),
+                (slots.error_handler, slots.error_receiver, NotifyCallbackSlot::ErrorHandler,),
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_summary_keeps_only_callback_shaped_constructor_candidates_unverified() {
         let code = r#"
 Перем Оповещение;
 Оповещение = Новый ОписаниеОповещения("ОбработатьОповещение", ЭтотОбъект);
 
-Процедура ОбработатьОповещение(Результат, ДопПараметры) Экспорт
-КонецПроцедуры
-"#;
-        let summary = parse_and_extract(code);
-
-        assert_eq!(summary.notify_regs.len(), 1);
-        assert_eq!(summary.notify_regs[0].caller, CallerId::ModuleCode);
-        assert_eq!(summary.notify_regs[0].callback_name, Name::new("ОбработатьОповещение"));
-        assert_eq!(
-            summary.notify_regs[0].target,
-            NotifyTarget::ThisObject,
-            "ЭтотОбъект means current module"
-        );
-    }
-
-    #[test]
-    fn test_notify_description_english() {
-        let code = r#"
 Procedure Test()
     Notification = New NotifyDescription("HandleResult", ThisObject);
+    Other = New UnknownType("AnotherHandler", CommonModule);
+    Structure = New Structure("Key", ThisObject);
+    DynamicStructure = New("Structure", Params);
+    Params = New Array;
+    Params.Add("DynamicHandler");
+    Params.Add(ThisObject);
+    Params.Add(Undefined);
+    Params.Add("DynamicErrorHandler");
+    Params.Add(ThisObject);
+    Dynamic = New("CallbackDescription", Params);
+    Positional = New("NotifyDescription", "PositionalHandler", ThisObject);
+    PositionalWithError = New("NotifyDescription", "PrimaryHandler", ThisObject, Undefined, "ErrorHandler", ThisObject);
+    CallbackDescriptionPositional = New("CallbackDescription", "NotProtectedBySource", ThisObject);
 EndProcedure
-
-Procedure HandleResult(Result, AdditionalParameters) Export
-EndProcedure
 "#;
         let summary = parse_and_extract(code);
 
-        assert_eq!(summary.notify_regs.len(), 1);
-        assert_eq!(summary.notify_regs[0].caller, CallerId::Method(MethodKey::first("Test")));
-        assert_eq!(summary.notify_regs[0].callback_name, Name::new("HandleResult"));
-        assert_eq!(summary.notify_regs[0].target, NotifyTarget::ThisObject);
-    }
-
-    #[test]
-    fn test_notify_description_this_form_is_this_object() {
-        let code = r#"
-Процедура Тест()
-    Оповещение = Новый ОписаниеОповещения("ПослеЗакрытия", ЭтаФорма, Параметры);
-КонецПроцедуры
-"#;
-        let summary = parse_and_extract(code);
-        assert_eq!(summary.notify_regs.len(), 1);
-        assert_eq!(summary.notify_regs[0].target, NotifyTarget::ThisObject);
-    }
-
-    #[test]
-    fn test_notify_description_common_module_target() {
-        let code = r#"
-Процедура Тест()
-    Оповещение = Новый ОписаниеОповещения("ОбработатьРезультат", МойОбщийМодуль);
-КонецПроцедуры
-"#;
-        let summary = parse_and_extract(code);
-        assert_eq!(summary.notify_regs.len(), 1);
+        assert!(summary.notify_regs.is_empty(), "raw syntax candidates are not registrations");
         assert_eq!(
-            summary.notify_regs[0].target,
-            NotifyTarget::Module(Name::new("МойОбщийМодуль"))
+            summary.notify_signature_handlers.iter().map(Name::as_str).collect::<Vec<_>>(),
+            [
+                "HandleResult",
+                "PositionalHandler",
+                "PrimaryHandler",
+                "ErrorHandler",
+                "ОбработатьОповещение",
+            ]
+        );
+        assert_eq!(
+            summary
+                .notify_additional_signature_handlers
+                .iter()
+                .map(Name::as_str)
+                .collect::<Vec<_>>(),
+            ["NotProtectedBySource"]
+        );
+        assert_eq!(
+            summary.notify_dynamic_signature_handlers.iter().map(Name::as_str).collect::<Vec<_>>(),
+            ["DynamicHandler", "DynamicErrorHandler"]
+        );
+        assert_eq!(summary.notify_candidates.len(), 6, "{:#?}", summary.notify_candidates);
+        assert!(summary.notify_candidates[..5]
+            .iter()
+            .all(|candidate| candidate.caller == CallerId::Method(MethodKey::first("Test"))));
+        assert_eq!(summary.notify_candidates[5].caller, CallerId::ModuleCode);
+        assert!(summary
+            .notify_candidates
+            .iter()
+            .all(|candidate| candidate.range.start() < candidate.range.end()));
+    }
+
+    #[test]
+    fn dynamic_callback_array_passed_through_this_object_field_is_uncertain() {
+        let code = r#"
+Процедура Тест()
+    Параметры = Новый Массив;
+    Параметры.Добавить("ВозможныйОбработчик");
+    Параметры.Добавить(ДругойОбъект);
+    Изменить(ЭтотОбъект.Параметры);
+    О = Новый("CallbackDescription", Параметры);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        assert!(
+            summary
+                .notify_dynamic_signature_handlers
+                .iter()
+                .any(|name| name.as_str() == "ВозможныйОбработчик"),
+            "passing a same-named member may change the array: {summary:#?}"
         );
     }
 
     #[test]
-    fn test_notify_description_unsupported_receiver() {
+    fn dynamic_callback_array_input_value_is_an_alternative_to_branch_assignment() {
+        let code = r#"
+Процедура Регистрация(А, Флаг)
+    А.Добавить("H");
+    А.Добавить(ЭтотОбъект);
+    Если Флаг Тогда
+        А = Новый Массив;
+        А.Добавить("Другой");
+        А.Добавить(ЭтотОбъект);
+    КонецЕсли;
+    О = Новый("CallbackDescription", А);
+КонецПроцедуры
+Процедура H(Параметр) Экспорт
+    Сообщить("Обработка");
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        let handlers: FxHashSet<_> =
+            summary.notify_dynamic_signature_handlers.iter().map(Name::as_str).collect();
+        assert!(
+            handlers.contains("H"),
+            "the untaken branch preserves the input array: {summary:#?}"
+        );
+        assert!(
+            handlers.contains("Другой"),
+            "the taken branch contributes its fresh array too: {summary:#?}"
+        );
+        assert_eq!(
+            summary.notify_dynamic_signature_analysis_incomplete.len(),
+            1,
+            "the unknown incoming array may contain additional handlers"
+        );
+    }
+
+    #[test]
+    fn dynamic_callback_array_input_survives_branch_via_local_alias() {
+        let code = r#"
+Процедура Регистрация(А, Флаг)
+    Копия = А;
+    Копия.Добавить("H");
+    Копия.Добавить(ЭтотОбъект);
+    Если Флаг Тогда
+        Копия = Новый Массив;
+        Копия.Добавить("Другой");
+        Копия.Добавить(ЭтотОбъект);
+    КонецЕсли;
+    О = Новый("CallbackDescription", Копия);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        let handlers: FxHashSet<_> =
+            summary.notify_dynamic_signature_handlers.iter().map(Name::as_str).collect();
+        assert!(
+            handlers.contains("H"),
+            "the untaken branch keeps the input array reached through the alias: {summary:#?}"
+        );
+        assert!(
+            handlers.contains("Другой"),
+            "the taken branch still contributes its fresh array: {summary:#?}"
+        );
+        assert_eq!(
+            summary.notify_dynamic_signature_analysis_incomplete.len(),
+            1,
+            "the incoming array may carry additional handlers"
+        );
+
+        // An opaque local in the same place is not the incoming array: without a known
+        // identity the branch alternatives cannot be combined, and the known one is dropped.
+        let local_source = code.replace(
+            "Процедура Регистрация(А, Флаг)",
+            "Процедура Регистрация(Флаг)\n    Перем А;\n    А = ПолучитьМассив();",
+        );
+        let summary = parse_and_extract(&local_source);
+        assert!(
+            summary.notify_dynamic_signature_handlers.is_empty(),
+            "an opaque local alternative cannot keep sibling aliases: {summary:#?}"
+        );
+        assert_eq!(summary.notify_dynamic_signature_analysis_incomplete.len(), 1);
+    }
+
+    #[test]
+    fn dynamic_callback_array_input_reached_when_parameter_reassigned_after_aliasing() {
+        let code = r#"
+Процедура Регистрация(А, Флаг)
+    Копия = А;
+    Копия.Добавить("H");
+    Копия.Добавить(ЭтотОбъект);
+    Если Флаг Тогда
+        А = Новый Массив;
+        А.Добавить("ИзА");
+        А.Добавить(ЭтотОбъект);
+    КонецЕсли;
+    О = Новый("CallbackDescription", Копия);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        let handlers: FxHashSet<_> =
+            summary.notify_dynamic_signature_handlers.iter().map(Name::as_str).collect();
+        assert!(
+            handlers.contains("H"),
+            "the alias bound before the branch keeps the input array: {summary:#?}"
+        );
+        assert!(
+            !handlers.contains("ИзА"),
+            "the branch rebinds the parameter itself, and the alias bound earlier keeps the old value: {summary:#?}"
+        );
+        assert_eq!(
+            summary.notify_dynamic_signature_analysis_incomplete.len(),
+            1,
+            "the incoming array may carry additional handlers"
+        );
+    }
+
+    #[test]
+    fn dynamic_callback_array_alias_reads_the_original_array_under_none() {
+        let code = r#"
+Процедура Тест()
+    Перем Параметры;
+    Перем Алиас;
+    Параметры = Новый Массив;
+    Алиас = Параметры;
+    Параметры.Добавить("ИзИсходногоМассива");
+    Параметры.Добавить(ЭтотОбъект);
+    О = Новый("CallbackDescription", Алиас);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        assert_eq!(
+            summary.notify_dynamic_signature_handlers.iter().map(Name::as_str).collect::<Vec<_>>(),
+            ["ИзИсходногоМассива"]
+        );
+
+        let negative_control =
+            code.replace("Алиас = Параметры;", "Алиас = Параметры;\n    Параметры = Новый Массив;");
+        let summary = parse_and_extract(&negative_control);
+        assert!(summary.notify_dynamic_signature_handlers.is_empty(), "{summary:#?}");
+    }
+
+    #[test]
+    fn dynamic_callback_array_alias_survives_source_rebinding_and_branching() {
+        let code = r#"
+Процедура Тест(Условие)
+    Перем Параметры;
+    Перем Копия;
+    Перем Альтернативный;
+    Параметры = Новый Массив;
+    Параметры.Добавить("ДоКопирования");
+    Параметры.Добавить(ЭтотОбъект);
+    Альтернативный = Новый Массив;
+    Альтернативный.Добавить("ИзВетви");
+    Альтернативный.Добавить(ЭтотОбъект);
+    Копия = Параметры;
+    Параметры = Новый Массив;
+    Если Условие Тогда
+        Копия = Альтернативный;
+    КонецЕсли;
+    О = Новый("CallbackDescription", Копия);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        let mut handlers =
+            summary.notify_dynamic_signature_handlers.iter().map(Name::as_str).collect::<Vec<_>>();
+        handlers.sort_unstable();
+        assert_eq!(handlers, ["ДоКопирования", "ИзВетви"]);
+    }
+
+    #[test]
+    fn direct_dynamic_callback_arguments_are_retained_as_candidates() {
+        let code = r#"
+Процедура Тест()
+    О = Новый("NotifyDescription", "Готово", ЭтотОбъект, Неопределено, "Ошибка", ЭтотОбъект);
+    Другое = Новый("Unrelated", "Готово", ЭтотОбъект);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        assert_eq!(summary.notify_candidates.len(), 1, "{summary:#?}");
+    }
+
+    #[test]
+    fn dynamic_callback_array_alias_chain_survives_source_rebinding() {
+        let code = r#"
+Процедура Тест()
+    Перем Источник;
+    Перем Алиас;
+    Перем Итог;
+    Источник = Новый Массив;
+    Источник.Добавить("ДоПерепривязки");
+    Источник.Добавить(ЭтотОбъект);
+    Алиас = Источник;
+    Источник = Новый Массив;
+    Итог = Алиас;
+    Итог.Добавить("ЧерезЦепочку");
+    Итог.Добавить(ЭтотОбъект);
+    О = Новый("CallbackDescription", Итог);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        let mut handlers =
+            summary.notify_dynamic_signature_handlers.iter().map(Name::as_str).collect::<Vec<_>>();
+        handlers.sort_unstable();
+        assert_eq!(handlers, ["ДоПерепривязки", "ЧерезЦепочку"]);
+
+        let rebound = r#"
+Процедура Тест()
+    Перем Источник;
+    Перем ДолгоживущийАлиас;
+    Перем КраткийАлиас;
+    Источник = Новый Массив;
+    Источник.Добавить("ПравильныйОбработчик");
+    Источник.Добавить(ЭтотОбъект);
+    ДолгоживущийАлиас = Источник;
+    Источник = Новый Массив;
+    КраткийАлиас = ДолгоживущийАлиас;
+    КраткийАлиас = Новый Массив;
+    КраткийАлиас.Добавить("НеИзСтарогоМассива");
+    КраткийАлиас.Добавить(ЭтотОбъект);
+    О = Новый("CallbackDescription", ДолгоживущийАлиас);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(rebound);
+        assert!(
+            !summary
+                .notify_dynamic_signature_handlers
+                .iter()
+                .any(|handler| handler.eq_ignore_case(&Name::new("НеИзСтарогоМассива"))),
+            "a rebound alias must not contribute values to the old array: {summary:#?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_callback_alias_chain_does_not_follow_source_after_reset() {
+        let code = r#"
+Процедура Тест()
+    Перем Источник;
+    Перем ДолгоживущийАлиас;
+    Перем КопияАлиаса;
+    Перем НовыйАлиас;
+    Источник = Новый Массив;
+    Источник.Добавить("СтарыйОбработчик");
+    Источник.Добавить(ЭтотОбъект);
+    ДолгоживущийАлиас = Источник;
+    КопияАлиаса = ДолгоживущийАлиас;
+    Источник = Новый Массив;
+    НовыйАлиас = Источник;
+    НовыйАлиас[0] = "НеИзСтарогоМассива";
+    О = Новый("CallbackDescription", КопияАлиаса);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        assert!(
+            summary
+                .notify_dynamic_signature_handlers
+                .iter()
+                .any(|handler| handler.eq_ignore_case(&Name::new("СтарыйОбработчик"))),
+            "aliases captured before source reset must remain linked: {summary:#?}"
+        );
+        assert!(
+            !summary
+                .notify_dynamic_signature_handlers
+                .iter()
+                .any(|handler| handler.eq_ignore_case(&Name::new("НеИзСтарогоМассива"))),
+            "aliases copied from the source after reset must not reach the old array: {summary:#?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_callback_array_alias_write_before_rebinding_is_preserved() {
+        let code = r#"
+Процедура Тест()
+    Перем Параметры;
+    Перем Алиас;
+    Параметры = Новый Массив;
+    Параметры.Добавить("Old");
+    Параметры.Добавить(ЭтотОбъект);
+    Алиас = Параметры;
+    Алиас[0] = "Actual";
+    Алиас = Новый Массив;
+    О = Новый("CallbackDescription", Параметры);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        assert!(
+            summary
+                .notify_dynamic_signature_handlers
+                .iter()
+                .any(|handler| handler.eq_ignore_case(&Name::new("Actual"))),
+            "writes made through an alias before its rebinding must be retained: {summary:#?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_callback_alias_branch_fanout_is_bounded_and_keeps_handler() {
+        const ALIAS_COUNT: usize = 32;
+        let mut code = String::from("Процедура Тест(Условие)\nПерем Root;\n");
+        for index in 0..=ALIAS_COUNT {
+            code.push_str(&format!("Перем Alias{index};\n"));
+        }
+        code.push_str(
+            "Root = Новый Массив;\nRoot.Добавить(\"ОжидаемыйОбработчик\");\nRoot.Добавить(ЭтотОбъект);\nAlias0 = Root;\n",
+        );
+        for index in 1..=ALIAS_COUNT {
+            code.push_str(&format!(
+                "Если Условие Тогда\nAlias{index} = Alias{};\nИначе\nAlias{index} = Alias{};\nКонецЕсли;\n",
+                index - 1,
+                index - 1,
+            ));
+        }
+        code.push_str(&format!(
+            "О = Новый(\"CallbackDescription\", Alias{ALIAS_COUNT});\nКонецПроцедуры\n"
+        ));
+
+        let summary = parse_and_extract(&code);
+        assert!(
+            summary.notify_dynamic_signature_analysis_incomplete.is_empty(),
+            "32 aliases with two branch bindings each must fit the bounded walk: {summary:#?}"
+        );
+        assert!(
+            summary
+                .notify_dynamic_signature_handlers
+                .iter()
+                .any(|handler| handler.eq_ignore_case(&Name::new("ОжидаемыйОбработчик"))),
+            "the handler reachable through either branch must be retained: {summary:#?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_callback_array_unknown_root_assignment_remains_complete() {
+        let code = r#"
+Процедура Тест()
+    Перем Параметры;
+    Параметры = ПолучитьПараметры();
+    О = Новый("CallbackDescription", Параметры);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        assert!(summary.notify_dynamic_signature_analysis_incomplete.is_empty(), "{summary:#?}");
+    }
+
+    #[test]
+    fn dynamic_callback_array_mixed_known_and_unknown_branches_are_incomplete() {
+        let code = r#"
+Процедура Тест(Условие)
+    Перем Параметры;
+    Параметры = Новый Массив;
+    Параметры.Добавить("ИзИзвестнойВетви");
+    Параметры.Добавить(ЭтотОбъект);
+    Если Условие Тогда
+        Параметры = Новый Массив;
+    Иначе
+        Параметры = НеизвестноеЗначение;
+    КонецЕсли;
+    О = Новый("CallbackDescription", Параметры);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        assert!(
+            summary.notify_dynamic_signature_handlers.is_empty(),
+            "known alternatives cannot be trusted when another branch is opaque: {summary:#?}"
+        );
+        assert_eq!(summary.notify_dynamic_signature_analysis_incomplete.len(), 1);
+        assert_eq!(
+            summary.notify_dynamic_signature_analysis_incomplete[0].array_name,
+            Name::new("Параметры")
+        );
+    }
+
+    #[test]
+    fn dynamic_callback_many_constructors_share_the_body_indexes() {
+        let mut code = String::from(
+            "Процедура Тест()\nПерем Параметры;\nПараметры = Новый Массив;\nПараметры.Добавить(\"Обработчик\");\nПараметры.Добавить(ЭтотОбъект);\n",
+        );
+        for index in 0..40 {
+            code.push_str(&format!(
+                "Описание{index} = Новый(\"CallbackDescription\", Параметры);\n"
+            ));
+        }
+        code.push_str("КонецПроцедуры\n");
+
+        let summary = parse_and_extract(&code);
+        assert!(summary.notify_dynamic_signature_analysis_incomplete.is_empty(), "{summary:#?}");
+        assert!(
+            summary
+                .notify_dynamic_signature_handlers
+                .iter()
+                .any(|handler| handler.eq_ignore_case(&Name::new("Обработчик"))),
+            "indexed constructor analysis must preserve the handler: {summary:#?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_callback_body_scan_budget_reports_incomplete_without_partial_handlers() {
+        let mut code =
+            String::from("Процедура Тест()\nПерем Параметры;\nПараметры = Новый Массив;\n");
+        for _ in 0..1_400 {
+            code.push_str("Параметры.Добавить(\"ПредполагаемыйОбработчик\");\n");
+        }
+        code.push_str(
+            "Параметры.Добавить(ЭтотОбъект);\nО = Новый(\"CallbackDescription\", Параметры);\nКонецПроцедуры\n",
+        );
+
+        let summary = parse_and_extract(&code);
+        assert!(
+            summary.notify_dynamic_signature_handlers.is_empty(),
+            "budget exhaustion must not expose a partial handler list: {summary:#?}"
+        );
+        assert_eq!(summary.notify_dynamic_signature_analysis_incomplete.len(), 1);
+        // The stop must reach consumers as incompleteness: suppressed findings behind
+        // a budget stop may not be reported as a complete empty answer.
+        assert!(
+            summary.notify_projection_incomplete,
+            "the alias budget stop must set the projection incompleteness flag: {summary:#?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_array_budget_is_exhausted_only_after_a_failed_spend() {
+        let mut remaining = 1;
+        let mut since_cancel = 0;
+        let mut exhausted = false;
+        let mut cancel = || {};
+
+        assert!(DynamicArrayResolver::spend_tracked(
+            &mut remaining,
+            &mut since_cancel,
+            &mut exhausted,
+            &mut cancel,
+        ));
+        assert_eq!(remaining, 0);
+        assert!(!exhausted, "using the final available unit completes the analysis");
+
+        assert!(!DynamicArrayResolver::spend_tracked(
+            &mut remaining,
+            &mut since_cancel,
+            &mut exhausted,
+            &mut cancel,
+        ));
+        assert!(exhausted, "only an unsuccessful spend marks the analysis incomplete");
+    }
+
+    #[test]
+    fn named_unknown_array_stays_publishable_while_budget_stops_set_incompleteness() {
+        // A named unknown alternative is the intentional conservative boundary: the
+        // analysis finished reading, it just refused to guess. It must not set the
+        // incompleteness flag, so the projection stays publishable.
+        let code = r#"
+Процедура Тест(Вход, Флаг)
+    А = Вход;
+    А.Добавить("Обработчик");
+    А.Добавить(ЭтотОбъект);
+    Если Флаг Тогда
+        А = Новый Массив;
+    КонецЕсли;
+    О = Новый("CallbackDescription", А);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        assert!(
+            !summary.notify_dynamic_signature_analysis_incomplete.is_empty(),
+            "the named unknown alternative must keep its gap: {summary:#?}"
+        );
+        assert!(
+            !summary.notify_projection_incomplete,
+            "a named unknown alternative is not a budget stop: {summary:#?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_callback_alias_analysis_is_bounded_and_cancellable() {
+        let mut code = String::from("Процедура Тест()\nПерем А;\n");
+        for _ in 0..5_000 {
+            code.push_str("А = НеизвестноеЗначение;\n");
+        }
+        code.push_str("О = Новый(\"CallbackDescription\", А);\nКонецПроцедуры\n");
+
+        let mut cancellation_checks = 0;
+        let summary = parse_and_extract_with_cancel(&code, &mut || cancellation_checks += 1);
+        assert!(cancellation_checks > 1, "large scans must periodically check cancellation");
+        assert!(
+            summary.notify_dynamic_signature_handlers.is_empty(),
+            "an incomplete alias analysis must not recommend handlers: {summary:#?}"
+        );
+        assert_eq!(summary.notify_dynamic_signature_analysis_incomplete.len(), 1);
+        assert_eq!(
+            summary.notify_dynamic_signature_analysis_incomplete[0].caller,
+            CallerId::Method(MethodKey::first("Тест"))
+        );
+        assert_eq!(
+            summary.notify_dynamic_signature_analysis_incomplete[0].array_name,
+            Name::new("А")
+        );
+    }
+
+    #[test]
+    fn dynamic_callback_array_alias_writes_survive_source_rebinding() {
+        let code = r#"
+Процедура Тест()
+    Перем Параметры;
+    Перем Копия;
+    Параметры = Новый Массив;
+    Параметры.Добавить("ДоПерепривязки");
+    Параметры.Добавить(ЭтотОбъект);
+    Копия = Параметры;
+    Параметры = Новый Массив;
+    Копия.Добавить("ЧерезКопию");
+    Копия.Добавить(ЭтотОбъект);
+    О = Новый("CallbackDescription", Копия);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        let mut handlers =
+            summary.notify_dynamic_signature_handlers.iter().map(Name::as_str).collect::<Vec<_>>();
+        handlers.sort_unstable();
+        assert_eq!(handlers, ["ДоПерепривязки", "ЧерезКопию"]);
+
+        // Rebinding and appending through the source changes a different object.
+        let source_write =
+            code.replace("Копия.Добавить(\"ЧерезКопию\");", "Параметры.Добавить(\"ЧужаяЗапись\");");
+        let summary = parse_and_extract(&source_write);
+        assert!(
+            !summary
+                .notify_dynamic_signature_handlers
+                .iter()
+                .any(|handler| handler.eq_ignore_case(&Name::new("ЧужаяЗапись"))),
+            "{summary:#?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_callback_array_unknown_conditional_rebinding_is_incomplete() {
+        let code = r#"
+Процедура Тест(Условие1, Условие2)
+    Перем Параметры;
+    Перем Запасной;
+    Параметры = Новый Массив;
+    Параметры.Добавить("Базовый");
+    Параметры.Добавить(ЭтотОбъект);
+    Если Условие1 Тогда
+        Параметры = Запасной;
+    КонецЕсли;
+    Если Условие2 Тогда
+        Параметры = Новый Массив;
+        Параметры.Добавить("ИзВторойВетви");
+        Параметры.Добавить(ЭтотОбъект);
+    КонецЕсли;
+    О = Новый("CallbackDescription", Параметры);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        assert!(summary.notify_dynamic_signature_handlers.is_empty(), "{summary:#?}");
+        assert_eq!(summary.notify_dynamic_signature_analysis_incomplete.len(), 1);
+
+        let no_base = code.replace(
+            "Параметры.Добавить(ЭтотОбъект);\n    Если Условие1 Тогда",
+            "Параметры.Добавить(ЭтотОбъект);\n    Параметры = Новый Массив;\n    Если Условие1 Тогда",
+        );
+        let summary = parse_and_extract(&no_base);
+        assert!(
+            !summary
+                .notify_dynamic_signature_handlers
+                .iter()
+                .any(|handler| handler.eq_ignore_case(&Name::new("Базовый"))),
+            "{summary:#?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_callback_array_keeps_values_before_nested_conditional_rebindings() {
+        let code = r#"
+Процедура Тест(Первое, Второе)
+    Перем Параметры;
+    Перем Альт;
+    Параметры = Новый Массив;
+    Параметры.Добавить("Главный");
+    Параметры.Добавить(ЭтотОбъект);
+    Альт = Новый Массив;
+    Альт.Добавить("ИзВетви");
+    Альт.Добавить(ЭтотОбъект);
+    Если Первое Тогда
+        Параметры = Альт;
+        Если Второе Тогда
+            Параметры = Новый Массив;
+        КонецЕсли;
+    КонецЕсли;
+    О = Новый("CallbackDescription", Параметры);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        let mut handlers =
+            summary.notify_dynamic_signature_handlers.iter().map(Name::as_str).collect::<Vec<_>>();
+        handlers.sort_unstable();
+        assert_eq!(handlers, ["Главный", "ИзВетви"]);
+
+        // If the only incoming array is definitely replaced, its handlers are not candidates.
+        let reset =
+            code.replace("Если Первое Тогда", "Параметры = Новый Массив;\n    Если Первое Тогда");
+        let summary = parse_and_extract(&reset);
+        assert!(
+            !summary
+                .notify_dynamic_signature_handlers
+                .iter()
+                .any(|handler| handler.eq_ignore_case(&Name::new("Главный"))),
+            "{summary:#?}"
+        );
+    }
+
+    #[test]
+    fn raw_generic_candidates_do_not_resolve_receiver_shadowing() {
+        let code = r#"
+Перем ЭтотОбъект;
+Процедура Тест(ЭтаФорма, МойОбщийМодуль)
+    Перем Местный;
+    А = Новый ОписаниеОповещения("Первый", этаформа);
+    Б = Новый ОписаниеОповещения("Второй", местный);
+    В = Новый ОписаниеОповещения("Третий", МойОбщийМодуль);
+    МойОбщийМодуль = Новый Структура;
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+
+        assert!(summary.notify_regs.is_empty());
+        assert_eq!(summary.notify_candidates.len(), 3);
+        assert!(summary.notify_candidates.iter().all(|candidate| {
+            candidate.caller == CallerId::Method(MethodKey::first("Тест"))
+        }));
+    }
+
+    #[test]
+    fn raw_candidate_keeps_non_bare_receiver_for_semantic_filtering() {
         let code = r#"
 Процедура Тест()
     Оповещение = Новый ОписаниеОповещения("ОбработатьРезультат", Объекты[0]);
 КонецПроцедуры
 "#;
         let summary = parse_and_extract(code);
-        assert_eq!(summary.notify_regs.len(), 1);
-        assert_eq!(summary.notify_regs[0].target, NotifyTarget::Unsupported);
+        assert!(summary.notify_regs.is_empty());
+        assert_eq!(summary.notify_candidates.len(), 1);
     }
 
     #[test]
-    fn test_notify_description_error_handler_is_second_reg() {
-        // `Новый ОписаниеОповещения(ИмяПроцедуры, Модуль, ДопПараметры,
-        // ИмяПроцедурыОбработкиОшибки, МодульОбработкиОшибки)` — both the success and the
-        // error handler are independent dispatch targets and must each yield a reg.
+    fn raw_candidate_does_not_assign_platform_callback_slots() {
         let code = r#"
 Процедура Тест()
     Оповещение = Новый ОписаниеОповещения("Готово", ЭтотОбъект, Параметры, "ПриОшибке", МодульОшибок);
 КонецПроцедуры
 "#;
         let summary = parse_and_extract(code);
-        assert_eq!(summary.notify_regs.len(), 2);
-        assert_eq!(summary.notify_regs[0].callback_name, Name::new("Готово"));
-        assert_eq!(summary.notify_regs[0].target, NotifyTarget::ThisObject);
-        assert_eq!(summary.notify_regs[1].callback_name, Name::new("ПриОшибке"));
-        assert_eq!(summary.notify_regs[1].target, NotifyTarget::Module(Name::new("МодульОшибок")));
+
+        assert!(summary.notify_regs.is_empty());
+        assert_eq!(summary.notify_candidates.len(), 1);
     }
 
     #[test]
-    fn test_notify_description_omitted_error_handler_yields_one_reg() {
-        // The error handler is optional: a 2-arg constructor must not invent a second reg.
+    fn raw_candidate_does_not_assume_an_error_handler_slot() {
         let code = r#"
 Процедура Тест()
     Оповещение = Новый ОписаниеОповещения("Готово", ЭтотОбъект);
 КонецПроцедуры
 "#;
         let summary = parse_and_extract(code);
-        assert_eq!(summary.notify_regs.len(), 1);
-        assert_eq!(summary.notify_regs[0].callback_name, Name::new("Готово"));
+
+        assert!(summary.notify_regs.is_empty());
+        assert_eq!(summary.notify_candidates.len(), 1);
     }
 
     #[test]

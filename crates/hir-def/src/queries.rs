@@ -77,7 +77,9 @@ mod heap_estimate {
 
     pub(super) fn module_call_summary_heap(v: &Arc<ModuleCallSummary>) -> usize {
         use crate::call_graph::{
-            CallEdge, FormEventEntry, IdleReg, MethodSummary, NotifyReg, NotifyTarget, SetActionReg,
+            CallEdge, DynamicNotifySignatureAnalysisGap, DynamicNotifySignatureHandler,
+            FormEventEntry, IdleReg, MethodSummary, NameLiteralRefSite, NotifyConstructorCandidate,
+            NotifyReg, NotifyTarget, SetActionReg,
         };
 
         let s = &**v;
@@ -90,6 +92,31 @@ mod heap_estimate {
         bytes += vec_bytes::<CallEdge>(s.call_edges.len());
         for e in &s.call_edges {
             bytes += call_target_name_heap(&e.target);
+        }
+        bytes += vec_bytes::<NotifyConstructorCandidate>(s.notify_candidates.len());
+        bytes += vec_bytes::<crate::name::Name>(s.notify_signature_handlers.len());
+        for handler in &s.notify_signature_handlers {
+            bytes += name_bytes(handler);
+        }
+        bytes += vec_bytes::<crate::name::Name>(s.notify_additional_signature_handlers.len());
+        for handler in &s.notify_additional_signature_handlers {
+            bytes += name_bytes(handler);
+        }
+        bytes += vec_bytes::<crate::name::Name>(s.notify_dynamic_signature_handlers.len());
+        for handler in &s.notify_dynamic_signature_handlers {
+            bytes += name_bytes(handler);
+        }
+        bytes += vec_bytes::<DynamicNotifySignatureHandler>(
+            s.notify_dynamic_signature_handler_sites.len(),
+        );
+        for site in &s.notify_dynamic_signature_handler_sites {
+            bytes += name_bytes(&site.handler_name);
+        }
+        bytes += vec_bytes::<DynamicNotifySignatureAnalysisGap>(
+            s.notify_dynamic_signature_analysis_incomplete.len(),
+        );
+        for gap in &s.notify_dynamic_signature_analysis_incomplete {
+            bytes += name_bytes(&gap.array_name);
         }
         bytes += vec_bytes::<NotifyReg>(s.notify_regs.len());
         for r in &s.notify_regs {
@@ -107,6 +134,7 @@ mod heap_estimate {
             bytes += name_bytes(&r.handler_name);
         }
         bytes += vec_bytes::<u32>(s.name_literal_refs.len());
+        bytes += vec_bytes::<NameLiteralRefSite>(s.name_literal_ref_sites.len());
         bytes += vec_bytes::<FormEventEntry>(s.form_entries.len());
         for f in &s.form_entries {
             bytes += f.event_type.capacity() + name_bytes(&f.handler_name);
@@ -148,6 +176,12 @@ mod heap_estimate {
     pub(super) fn file_dependencies_heap(v: &Arc<Vec<FileId>>) -> usize {
         vec_bytes::<FileId>(v.len())
     }
+}
+
+/// Approximate heap owned by a module call summary for Salsa caches in dependent crates.
+#[doc(hidden)]
+pub fn module_call_summary_heap(summary: &Arc<crate::call_graph::ModuleCallSummary>) -> usize {
+    heap_estimate::module_call_summary_heap(summary)
 }
 
 // Condensed per-module data (built from item_tree, no green-tree pin): on the
@@ -452,7 +486,12 @@ pub fn module_call_summary_query<'db>(
     let form_handlers: &[bsl_metadata::FormEventHandler] =
         module_metadata.form.as_ref().map(|f| f.event_handlers.as_slice()).unwrap_or(&[]);
 
-    Arc::new(crate::call_graph::extract_call_summary(item_tree, module_bodies, form_handlers))
+    Arc::new(crate::call_graph::extract_call_summary_with_cancellation(
+        item_tree,
+        module_bodies,
+        form_handlers,
+        &mut || db.unwind_if_revision_cancelled(),
+    ))
 }
 
 #[salsa::tracked(
@@ -591,7 +630,11 @@ pub fn resolved_module_summary_query<'db>(
     let global_modules = resolver.global_common_module_names(db);
     edges.extend(resolve_callback_edges(&summary, find_local, find_qualified, &global_modules));
 
-    Arc::new(crate::call_graph::ResolvedModuleSummary { module: module_id, edges })
+    Arc::new(crate::call_graph::ResolvedModuleSummary {
+        module: module_id,
+        edges,
+        notify_projection_incomplete: summary.notify_projection_incomplete,
+    })
 }
 
 /// Outcome of resolving a callback handler named by a string literal to a method in a
@@ -610,9 +653,20 @@ pub(crate) enum QualifiedLookup {
 /// is injected: `find_local` resolves a handler in the current module, `find_qualified`
 /// resolves a handler in a named common module. `global_module_names` lists the
 /// configuration's global common modules (shared by both callers), used to resolve a
-/// global-context idle handler that names no module. A handler that does not resolve
-/// yields no edge — `Unresolved` targets are dropped in projection anyway, and inventing
-/// edges for unknown receivers is worse than omitting them.
+/// global-context idle handler that names no module. An absent handler yields no edge;
+/// a visibility-blocked handler is retained as an unresolved edge. Inventing edges for
+/// unknown receivers is worse than omitting them.
+///
+/// Every notify-graph publication path converges here — the Salsa
+/// `workspace_call_graph_query` fold, the batched full build, and the incremental
+/// reprojection — so this is where a projection that stopped at its work budget is
+/// withheld: `notify_projection_incomplete` means only a prefix of the module's
+/// registrations was read, and a resolved prefix is indistinguishable from a complete
+/// projection. Publishing it would serve speculative `notify_ref` edges to every
+/// consumer, so the whole notify projection stays unpublished instead — the same
+/// contract [`crate::call_graph::ModuleCallSummary::method_pair_subset`] applies to
+/// the incoming index. Idle handlers are collected outside the notify projection's
+/// budget and are not affected by the flag.
 pub(crate) fn resolve_callback_edges(
     summary: &crate::call_graph::ModuleCallSummary,
     find_local: impl Fn(&crate::name::Name) -> Option<crate::MethodId>,
@@ -625,7 +679,9 @@ pub(crate) fn resolve_callback_edges(
 
     let mut out = Vec::new();
 
-    for reg in &summary.notify_regs {
+    let notify_regs =
+        if summary.notify_projection_incomplete { &[][..] } else { &summary.notify_regs[..] };
+    for reg in notify_regs {
         let resolved = match &reg.target {
             NotifyTarget::ThisObject => find_local(&reg.callback_name)
                 .map(|m| (ResolvedTarget::Method(m), EdgeProvenance::StringResolved)),
@@ -646,7 +702,9 @@ pub(crate) fn resolve_callback_edges(
                     QualifiedLookup::Absent => None,
                 }
             }
-            NotifyTarget::Unsupported => None,
+            NotifyTarget::NotCompiled { .. }
+            | NotifyTarget::Unsupported
+            | NotifyTarget::LocalBinding => None,
         };
         if let Some((target, provenance)) = resolved {
             out.push(ResolvedCallEdge {
@@ -1061,6 +1119,10 @@ pub struct MethodOutboundFacts {
     /// Client/server dispatch, by the same rule the fold seeds (module execution
     /// context wins, else the method's own annotation).
     pub dispatch: MethodDispatch,
+    /// The module's semantic notify projection stopped at its work budget. The
+    /// notify edges are withheld from `callees`, so an empty or short list is not
+    /// evidence that the method calls nothing.
+    pub notify_projection_incomplete: bool,
     /// Resolved user-method calls.
     pub callees: Vec<crate::MethodId>,
     /// Metadata objects touched through a manager.
@@ -1159,7 +1221,14 @@ pub fn method_outbound_facts(
         seen_attr_reads.insert((*ty, object.fold_lower(), attr.fold_lower()))
     });
 
-    MethodOutboundFacts { dispatch, callees, manager_refs, query_reads, query_attr_reads }
+    MethodOutboundFacts {
+        dispatch,
+        notify_projection_incomplete: summary.notify_projection_incomplete,
+        callees,
+        manager_refs,
+        query_reads,
+        query_attr_reads,
+    }
 }
 
 #[salsa::tracked(
@@ -1192,6 +1261,7 @@ pub fn workspace_call_graph_query(
     // is unknown (form/command modules).
     for &module in &modules {
         let summary = db.module_call_summary(module);
+        graph.incomplete |= summary.notify_projection_incomplete;
         let module_dispatch = db
             .module_metadata(module)
             .execution_context
