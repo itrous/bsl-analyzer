@@ -1494,10 +1494,9 @@ pub fn infer_owner(
     }
 }
 
-/// The ordinary body inference a notification projection needs. It is not the
-/// memoised full inference because that would run query facts and other
-/// reaching-definitions reads outside the projection's budget. This context
-/// defers both and marks the result incomplete when either was needed.
+/// The ordinary body inference a notification projection needs. Query facts are
+/// deferred because this projection does not consume them; reaching-definitions
+/// reads run only when their complete solve fits the projection's shared budget.
 pub(crate) fn infer_owner_for_notify(
     db: &dyn HirDatabase,
     file_id: FileId,
@@ -2841,9 +2840,8 @@ impl<'db> InferenceContext<'db> {
         self.query_facts_deferred = true;
     }
 
-    /// Forbid inference from starting an unbounded reaching-definitions solve.
-    /// A deferred read may still solve through `flow`, but only within this work
-    /// limit; the finished result records the work used and whether it stopped.
+    /// Bound inference's reaching-definitions solves by the projection's shared
+    /// allowance; the finished result records the work used and whether a solve stopped.
     fn defer_reaching_definitions_with_limit(&mut self, work_limit: usize) {
         self.reaching_defs_deferred = true;
         self.reaching_defs_work_remaining.set(work_limit);
@@ -2858,11 +2856,28 @@ impl<'db> InferenceContext<'db> {
     }
 
     fn executable_reaching_defs(&self) -> Option<Arc<dataflow::reaching_defs::ReachingDefsResult>> {
-        if self.reaching_defs_deferred {
-            self.reaching_defs_skipped.set(true);
-            return None;
+        if !self.reaching_defs_deferred {
+            return self.flow.executable_reaching_defs(self.db);
         }
-        self.flow.executable_reaching_defs(self.db)
+
+        let mut cancel = || self.db.unwind_if_revision_cancelled();
+        let result = self.flow.executable_reaching_defs_with_work(self.db, &mut |work| {
+            let accepted = charge_deferred_reaching_defs(
+                &self.reaching_defs_work_remaining,
+                &self.reaching_defs_work_spent,
+                &self.reaching_defs_since_cancel,
+                work,
+                &mut cancel,
+            );
+            if !accepted {
+                self.reaching_defs_skipped.set(true);
+            }
+            accepted
+        });
+        if result.is_none() {
+            self.reaching_defs_skipped.set(true);
+        }
+        result
     }
 
     fn reaching_defs(&self) -> Option<Arc<dataflow::reaching_defs::ReachingDefsResult>> {

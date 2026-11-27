@@ -133,9 +133,9 @@ pub struct SemanticNotifyFacts {
 /// answer: the projection then emits an [`NotifyCandidate::analysis_incomplete`]
 /// marker so diagnostics stay conservative instead of reporting the partial data as
 /// complete.
-const NOTIFY_TARGET_WORK_BUDGET: usize = 131_072;
-const NOTIFY_TARGET_WORK_PER_BODY_ITEM: usize = 128;
-const NOTIFY_TARGET_BUDGET_SATURATION_SIZE: usize = 3_072;
+const NOTIFY_TARGET_WORK_BUDGET: usize = 262_144;
+const NOTIFY_TARGET_WORK_PER_BODY_ITEM: usize = 256;
+const NOTIFY_TARGET_BUDGET_SATURATION_SIZE: usize = 5_120;
 const NOTIFY_TARGET_MAX_WORK_BUDGET: usize = NOTIFY_TARGET_WORK_BUDGET
     + NOTIFY_TARGET_WORK_PER_BODY_ITEM * NOTIFY_TARGET_BUDGET_SATURATION_SIZE;
 const NOTIFY_TARGET_CANCEL_INTERVAL: usize = 128;
@@ -2281,7 +2281,7 @@ mod tests {
         assert_eq!(small, NOTIFY_TARGET_WORK_BUDGET + NOTIFY_TARGET_WORK_PER_BODY_ITEM);
         assert!(larger > small);
         assert_eq!(notify_target_work_budget(usize::MAX), NOTIFY_TARGET_MAX_WORK_BUDGET);
-        assert_eq!(NOTIFY_TARGET_MAX_WORK_BUDGET, 524_288);
+        assert_eq!(NOTIFY_TARGET_MAX_WORK_BUDGET, 1_572_864);
     }
 
     #[test]

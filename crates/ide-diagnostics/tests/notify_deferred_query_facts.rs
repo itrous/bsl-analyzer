@@ -1,7 +1,6 @@
-//! The notification projection must not trigger the query-in-loop
-//! reaching-definitions solve through inference. Query facts are ordinary
-//! inference data and this projection does not consume them, so its per-body
-//! inference defers them and marks the result incomplete instead.
+//! Query facts are ordinary inference data that notification projection does not
+//! consume, so per-body inference defers them. Reaching-definitions reads needed
+//! by receiver inference remain available through the projection's shared budget.
 
 use hir::{
     semantic_notify_candidates_query, semantic_notify_candidates_weaving_query,
