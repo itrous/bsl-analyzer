@@ -531,6 +531,78 @@ fn every_readonly_correction_changes_a_built_in_property() {
     }
 }
 
+/// Every version correction must resolve to a record of the built-in facts that
+/// is served with the date the entry names: a correction of an absent target is
+/// skipped at load time, so a misspelt or stale entry would otherwise go unnoticed.
+///
+/// On the built-in 8.3.27 corpus the `ColumnEditMode` entry restates what the
+/// extract already says (the type is dated 8.0 there), so this test proves that
+/// the target resolves and that the served date is the entry's, not that the
+/// correction fires: the firing is proved against a corpus that dates the type
+/// 8.5.1 by `a_type_version_correction_redates_the_type_and_only_the_type` in
+/// `overlays_tests.rs`.
+#[test]
+fn every_version_correction_resolves_to_a_built_in_record_served_with_its_date() {
+    let overlays: Value =
+        serde_json::from_str(include_str!("../data/platform_overlays.json")).unwrap();
+    let help = PlatformHelp::without_io(&PlatformHelpRequest::Bundled).unwrap();
+    let data = PlatformData::from_help(help);
+
+    let type_corrections = overlays["type_version_corrections"].as_array().unwrap();
+    assert!(!type_corrections.is_empty());
+    for correction in type_corrections {
+        let type_name = correction["type"].as_str().unwrap();
+        let min_version = correction["min_version"].as_str().unwrap();
+        let record =
+            data.get_type(type_name).unwrap_or_else(|| panic!("{type_name} is a built-in type"));
+        for name in [record.name.as_str(), record.english_name.as_str()] {
+            assert_eq!(
+                data.get_type(name).and_then(|ty| ty.min_version.as_deref()),
+                Some(min_version),
+                "{name}: the served date of the type"
+            );
+        }
+    }
+
+    let member_corrections = overlays["member_version_corrections"].as_array().unwrap();
+    assert!(!member_corrections.is_empty());
+    for correction in member_corrections {
+        let type_name = correction["type"].as_str().unwrap();
+        let member_name = correction["name"].as_str().unwrap();
+        let min_version = correction["min_version"].as_str().unwrap();
+        let canonical_type = data
+            .get_type(type_name)
+            .unwrap_or_else(|| panic!("{type_name} is a built-in type"))
+            .english_name
+            .clone();
+        let property = data.get_property(&canonical_type, member_name);
+        let method = data.get_method(&canonical_type, member_name);
+        assert!(
+            property.is_some() != method.is_some(),
+            "{type_name}.{member_name}: the name must be exactly one of a property and a method"
+        );
+        let (russian, english) = match (property, method) {
+            (Some(property), _) => (property.name.clone(), property.english_name.clone()),
+            (_, Some(method)) => (method.name.clone(), method.english_name.clone()),
+            (None, None) => unreachable!("asserted above"),
+        };
+        for owner in [&canonical_type, type_name] {
+            for name in [&russian, &english] {
+                let version = if property.is_some() {
+                    data.get_property(owner, name).and_then(|p| p.min_version.clone())
+                } else {
+                    data.get_method(owner, name).and_then(|m| m.min_version.clone())
+                };
+                assert_eq!(
+                    version.as_deref(),
+                    Some(min_version),
+                    "{owner}.{name}: the served date of the member"
+                );
+            }
+        }
+    }
+}
+
 /// The folded names of the functions the shipped passing attestation leaves out.
 fn shipped_unverified_functions() -> std::collections::BTreeSet<String> {
     use stdx::case::CaseExt;

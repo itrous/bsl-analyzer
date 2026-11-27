@@ -1034,11 +1034,7 @@ const DOCUMENT_FENCE_MARKER: &str = "<!-- overlay-document -->";
 fn the_documented_examples_load_as_they_stand() {
     let page = include_str!("../data/OVERLAYS.md");
     let blocks = documented_overlay_blocks(page);
-    assert!(
-        blocks.len() >= 8,
-        "the page documents eight loadable examples, found {}",
-        blocks.len()
-    );
+    assert!(blocks.len() >= 10, "the page documents ten loadable examples, found {}", blocks.len());
 
     for block in &blocks {
         // The root of the document: schema version, the root field allow-list
@@ -1052,6 +1048,8 @@ fn the_documented_examples_load_as_they_stand() {
             + super::overlay_schema::parse_property_additions(block).unwrap().len()
             + super::overlay_schema::parse_property_corrections(block).unwrap().len()
             + super::overlay_schema::parse_method_return_type_corrections(block).unwrap().len()
+            + super::overlay_schema::parse_type_version_corrections(block).unwrap().len()
+            + super::overlay_schema::parse_member_version_corrections(block).unwrap().len()
             + super::overlay_schema::parse_member_surface_attestations(block).unwrap().len()
             + super::overlay_schema::parse_parameter_passing_attestations(block).unwrap().len();
         assert!(entries > 0, "an example documents no section entry:\n{block}");
@@ -2315,6 +2313,304 @@ fn the_shipped_overlay_marks_exactly_the_seven_text_functions() {
             .collect();
     expected.sort();
     assert_eq!(marked, expected);
+}
+
+fn version_corpus() -> Value {
+    json!({
+        "types": [
+            {"name": "РежимРедактированияКолонки", "english_name": "ColumnEditMode", "min_version": "8.5.1"},
+            {"name": "ХешированиеДанных", "english_name": "DataHashing", "min_version": "8.3.1"}
+        ],
+        "properties": [
+            {"id": 1, "type_name": "ColumnEditMode", "name": "Непосредственно", "english_name": "Directly", "min_version": "8.0"},
+            {"id": 2, "type_name": "ColumnEditMode", "name": "Авто", "english_name": "Auto", "min_version": "8.5.1"},
+            {"id": 3, "type_name": "DataHashing", "name": "ХешСумма", "english_name": "HashSum", "min_version": "8.3.18"},
+            {"id": 4, "type_name": "DataHashing", "name": "ХешФункция", "english_name": "HashFunction", "min_version": "8.3.18"}
+        ],
+        "methods": [
+            {"id": 5, "type_name": "DataHashing", "name": "Добавить", "english_name": "Append", "min_version": "8.3.1"}
+        ]
+    })
+}
+
+fn type_version_overlay(entries: Value) -> String {
+    json!({
+        "schema_version": 1,
+        "method_parameter_overrides": [],
+        "type_version_corrections": entries
+    })
+    .to_string()
+}
+
+fn member_version_overlay(entries: Value) -> String {
+    json!({
+        "schema_version": 1,
+        "method_parameter_overrides": [],
+        "member_version_corrections": entries
+    })
+    .to_string()
+}
+
+fn column_edit_mode_correction() -> Value {
+    json!({
+        "type": "ColumnEditMode",
+        "min_version": "8.0",
+        "evidence_source": "the help of the earlier release dates the type 8.0",
+        "rationale": "the newest help re-dated the whole enumeration for one new value"
+    })
+}
+
+fn hash_sum_correction() -> Value {
+    json!({
+        "type": "DataHashing",
+        "name": "ХешСумма",
+        "min_version": "8.3.1",
+        "evidence_source": "runtime probe: the property is read on the earlier release",
+        "rationale": "the help dates the property later than the release that runs it"
+    })
+}
+
+/// The proof that the type correction fires: the built-in 8.3.27 facts already
+/// carry 8.0 for the type, so only a corpus that dates it 8.5.1 shows the overlay
+/// writing anything.
+#[test]
+fn a_type_version_correction_redates_the_type_and_only_the_type() {
+    let mut data = version_corpus();
+
+    apply_type_version_corrections(
+        &mut data,
+        &type_version_overlay(json!([column_edit_mode_correction()])),
+    )
+    .unwrap();
+
+    assert_eq!(data["types"][0]["min_version"], "8.0");
+    assert_eq!(data["types"][1]["min_version"], "8.3.1", "another type is not touched");
+    // Control: a type correction must not touch member records, so the value
+    // that really is new keeps its own date and the old one keeps its own.
+    assert_eq!(data["properties"][0]["min_version"], "8.0");
+    assert_eq!(data["properties"][1]["min_version"], "8.5.1");
+}
+
+#[test]
+fn a_type_version_correction_is_named_by_either_spelling() {
+    let mut data = version_corpus();
+    let mut entry = column_edit_mode_correction();
+    entry["type"] = Value::String("РежимРедактированияКолонки".to_owned());
+
+    apply_type_version_corrections(&mut data, &type_version_overlay(json!([entry]))).unwrap();
+
+    assert_eq!(data["types"][0]["min_version"], "8.0");
+}
+
+#[test]
+fn a_member_version_correction_redates_the_named_property_only() {
+    let mut data = version_corpus();
+
+    apply_member_version_corrections(
+        &mut data,
+        &member_version_overlay(json!([hash_sum_correction()])),
+    )
+    .unwrap();
+
+    assert_eq!(data["properties"][2]["min_version"], "8.3.1");
+    assert_eq!(data["properties"][3]["min_version"], "8.3.18", "the sibling keeps its date");
+    assert_eq!(data["properties"][2]["id"], 3, "a correction keeps the record's identity");
+}
+
+#[test]
+fn a_member_version_correction_redates_a_method_when_no_property_has_the_name() {
+    let mut data = version_corpus();
+    let mut entry = hash_sum_correction();
+    entry["name"] = Value::String("Append".to_owned());
+    entry["min_version"] = Value::String("8.0".to_owned());
+
+    apply_member_version_corrections(&mut data, &member_version_overlay(json!([entry]))).unwrap();
+
+    assert_eq!(data["methods"][0]["min_version"], "8.0");
+    assert_eq!(data["properties"][2]["min_version"], "8.3.18");
+}
+
+#[test]
+fn a_member_name_that_is_both_a_property_and_a_method_is_left_uncorrected() {
+    let mut data = version_corpus();
+    data["methods"].as_array_mut().unwrap().push(json!({
+        "id": 6, "type_name": "DataHashing", "name": "ХешСумма", "english_name": "HashSum",
+        "min_version": "8.3.18"
+    }));
+
+    apply_member_version_corrections(
+        &mut data,
+        &member_version_overlay(json!([hash_sum_correction()])),
+    )
+    .unwrap();
+
+    assert_eq!(data["properties"][2]["min_version"], "8.3.18");
+    assert_eq!(data["methods"][1]["min_version"], "8.3.18");
+}
+
+#[test]
+fn a_version_correction_without_a_target_leaves_the_corpus_alone() {
+    let mut absent_type = column_edit_mode_correction();
+    absent_type["type"] = Value::String("СовсемДругойТип".to_owned());
+    let mut absent_member = hash_sum_correction();
+    absent_member["name"] = Value::String("НетТакогоЧлена".to_owned());
+    let mut absent_member_type = hash_sum_correction();
+    absent_member_type["type"] = Value::String("СовсемДругойТип".to_owned());
+
+    let mut data = version_corpus();
+    apply_type_version_corrections(&mut data, &type_version_overlay(json!([absent_type])))
+        .expect("an absent type is not a corpus error");
+    apply_member_version_corrections(
+        &mut data,
+        &member_version_overlay(json!([absent_member, absent_member_type])),
+    )
+    .expect("an absent member is not a corpus error");
+    assert_eq!(data, version_corpus());
+
+    let mut empty = json!({"types": []});
+    apply_type_version_corrections(
+        &mut empty,
+        &type_version_overlay(json!([column_edit_mode_correction()])),
+    )
+    .expect("a corpus without the type is not a corpus error");
+    apply_member_version_corrections(
+        &mut empty,
+        &member_version_overlay(json!([hash_sum_correction()])),
+    )
+    .expect("a corpus without the member is not a corpus error");
+    assert_eq!(empty, json!({"types": []}));
+}
+
+#[test]
+fn version_corrections_that_resolve_to_one_record_are_rejected() {
+    let mut data = version_corpus();
+    let mut second_type = column_edit_mode_correction();
+    second_type["type"] = Value::String("РежимРедактированияКолонки".to_owned());
+    let error = apply_type_version_corrections(
+        &mut data,
+        &type_version_overlay(json!([column_edit_mode_correction(), second_type])),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "type version corrections ColumnEditMode and РежимРедактированияКолонки resolve to the same type ColumnEditMode"
+    );
+
+    let mut second_member = hash_sum_correction();
+    second_member["type"] = Value::String("ХешированиеДанных".to_owned());
+    second_member["name"] = Value::String("HashSum".to_owned());
+    let error = apply_member_version_corrections(
+        &mut data,
+        &member_version_overlay(json!([hash_sum_correction(), second_member])),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "member version corrections DataHashing.ХешСумма and ХешированиеДанных.HashSum resolve to the same member of DataHashing"
+    );
+}
+
+#[test]
+fn the_curated_overlay_redates_the_misdated_type_and_member() {
+    let mut data = version_corpus();
+    let curated = include_str!("../data/platform_overlays.json");
+
+    apply_type_version_corrections(&mut data, curated).unwrap();
+    apply_member_version_corrections(&mut data, curated).unwrap();
+
+    assert_eq!(data["types"][0]["min_version"], "8.0", "ColumnEditMode is dated 8.0");
+    assert_eq!(data["properties"][1]["min_version"], "8.5.1", "Авто stays 8.5.1");
+    assert_eq!(data["properties"][2]["min_version"], "8.3.1", "ХешСумма is dated with its type");
+    assert_eq!(data["properties"][3]["min_version"], "8.3.18", "ХешФункция is not touched");
+}
+
+#[test]
+fn a_version_correction_entry_is_checked_by_the_schema() {
+    for field in ["type", "min_version", "evidence_source", "rationale"] {
+        let mut entry = column_edit_mode_correction();
+        entry.as_object_mut().unwrap().remove(field);
+        let error =
+            super::overlay_schema::parse_type_version_corrections(&type_version_overlay(json!([
+                entry
+            ])))
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("overlay entry 0 {field} must be a non-empty string")
+        );
+    }
+    for field in ["type", "name", "min_version", "evidence_source", "rationale"] {
+        let mut entry = hash_sum_correction();
+        entry.as_object_mut().unwrap().remove(field);
+        let error = super::overlay_schema::parse_member_version_corrections(
+            &member_version_overlay(json!([entry])),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("overlay entry 0 {field} must be a non-empty string")
+        );
+    }
+
+    let mut unknown = column_edit_mode_correction();
+    unknown["max_version"] = Value::String("8.3".to_owned());
+    let error =
+        super::overlay_schema::parse_type_version_corrections(&type_version_overlay(json!([
+            unknown
+        ])))
+        .unwrap_err();
+    assert_eq!(error.to_string(), "type version correction 0 has unknown field max_version");
+    let mut unknown = hash_sum_correction();
+    unknown["max_version"] = Value::String("8.3".to_owned());
+    let error =
+        super::overlay_schema::parse_member_version_corrections(&member_version_overlay(json!([
+            unknown
+        ])))
+        .unwrap_err();
+    assert_eq!(error.to_string(), "member version correction 0 has unknown field max_version");
+
+    for bad in ["8.x", "+8.3", "8..3", "latest"] {
+        let mut entry = column_edit_mode_correction();
+        entry["min_version"] = Value::String(bad.to_owned());
+        let error =
+            super::overlay_schema::parse_type_version_corrections(&type_version_overlay(json!([
+                entry
+            ])))
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "type version correction 0 min_version must be a platform version"
+        );
+        let mut entry = hash_sum_correction();
+        entry["min_version"] = Value::String(bad.to_owned());
+        let error = super::overlay_schema::parse_member_version_corrections(
+            &member_version_overlay(json!([entry])),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "member version correction 0 min_version must be a platform version"
+        );
+    }
+}
+
+#[test]
+fn duplicate_version_corrections_are_rejected_by_the_schema() {
+    let error =
+        super::overlay_schema::parse_type_version_corrections(&type_version_overlay(json!([
+            column_edit_mode_correction(),
+            column_edit_mode_correction()
+        ])))
+        .unwrap_err();
+    assert_eq!(error.to_string(), "duplicate type version correction for ColumnEditMode");
+
+    let error =
+        super::overlay_schema::parse_member_version_corrections(&member_version_overlay(json!([
+            hash_sum_correction(),
+            hash_sum_correction()
+        ])))
+        .unwrap_err();
+    assert_eq!(error.to_string(), "duplicate member version correction for DataHashing.ХешСумма");
 }
 
 #[test]
