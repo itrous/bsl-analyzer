@@ -1293,4 +1293,102 @@ mod tests {
         assert_eq!(in_object_module.len(), 1, "object module: {in_object_module:?}");
         assert!(in_object_module[0].contains("'ЭтоНабор'"), "{in_object_module:?}");
     }
+
+    const BUTTON_OWNER_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" version="2.10">
+    <DataProcessor uuid="00000000-0000-0000-0000-000000000101">
+        <Properties><Name>Товары</Name></Properties>
+    </DataProcessor>
+</MetaDataObject>"#;
+
+    const BUTTON_FORM_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.10">
+    <ChildItems>
+        <Button name="КнопкаПечать" id="2"/>
+    </ChildItems>
+</Form>"#;
+
+    fn button_misses(body: &str) -> Vec<String> {
+        let source = format!(
+            "&НаКлиенте
+Процедура Тест()
+{body}КонецПроцедуры
+"
+        );
+        crate::test_utils::check_form_with_owner_xml(&source, BUTTON_FORM_XML, BUTTON_OWNER_XML)
+            .into_iter()
+            // The fixture also trips the module-layout rules; this test is about the
+            // button's member surface alone.
+            .filter(|diag| matches!(diag.code, DiagnosticCode::UnresolvedField))
+            .map(|diag| format!("{:?}: {}", diag.code, diag.message))
+            .collect()
+    }
+
+    /// A form button is attested for both surfaces: no extension family widens it, so a
+    /// property the corpus does not list is a miss. The control is the half that matters:
+    /// a property the button really has, read and written, stays silent.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_nonexistent_property_of_a_form_button_is_reported_and_a_real_one_is_not() {
+        if !crate::test_utils::built_in_facts_are_served() {
+            return;
+        }
+        let missing = button_misses(
+            "    Элементы.КнопкаПечать.Подсказка = \"текст\";
+    Элементы.КнопкаПечать.ОтображениеКнопки = Истина;
+",
+        );
+        assert_eq!(missing.len(), 2, "both nonexistent properties are reported: {missing:?}");
+        assert!(missing[0].contains("Подсказка"), "{missing:?}");
+        assert!(missing[1].contains("ОтображениеКнопки"), "{missing:?}");
+
+        let real = button_misses(
+            "    Элементы.КнопкаПечать.Заголовок = \"Печать\";
+    Элементы.КнопкаПечать.Видимость = Ложь;
+    Видна = Элементы.КнопкаПечать.Доступность;
+",
+        );
+        assert!(real.is_empty(), "properties the button has must stay silent: {real:?}");
+    }
+
+    /// The every-path gate stays in charge of a button read through a local: the local may
+    /// hold another control on another path, and the form fixes only `Элементы.<Имя>`.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_form_button_read_through_a_local_keeps_its_verdict() {
+        if !crate::test_utils::built_in_facts_are_served() {
+            return;
+        }
+        let missing = button_misses(
+            "    Кн = Элементы.КнопкаПечать;
+    Кн.Подсказка = \"текст\";
+",
+        );
+        assert_eq!(missing, Vec::<String>::new(), "observed verdict of the local path");
+    }
+
+    /// Without this a module that adds items would still get its button judged as closed:
+    /// the new term must not outlive the item-set closure it borrows.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_button_of_an_open_item_set_is_not_judged() {
+        if !crate::test_utils::built_in_facts_are_served() {
+            return;
+        }
+        let missing = button_misses(
+            "    Элементы.Добавить(\"Новая\", Тип(\"КнопкаФормы\"));
+    Элементы.КнопкаПечать.Подсказка = \"текст\";
+",
+        );
+        assert!(missing.is_empty(), "an open item set must not be judged: {missing:?}");
+    }
 }
