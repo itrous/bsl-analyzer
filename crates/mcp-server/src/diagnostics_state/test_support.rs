@@ -602,14 +602,18 @@ pub(crate) const NOTIFY_EXHAUSTION_NEIGHBOUR_REL: &str = "CommonModules/Серв
 /// A client common module whose notification projection exhausts its production work
 /// budget, so its `DiagnosticsResult` reports the notify projection incomplete.
 ///
-/// The exhaustion comes from thousands of MODULE-LEVEL conditional regions: they charge
-/// the projection's conditional index (one entry each plus the log-linear range sort)
-/// past the budget cap while the module's own bodies stay tiny. In-method regions would
-/// lose this race — the budget grows with body items, so regions inside a method feed
-/// the budget faster than the sort spends it.
+/// The exhaustion comes from MODULE-LEVEL conditionals. Each one feeds an item into the
+/// module-code body, which saturates the projection's work budget at its hard cap, and
+/// each one also charges the projection's conditional index — one entry, one merge
+/// level of the range sort, and its segment-tree slots — for roughly `log2(N) + 3`
+/// units. The index cost therefore grows as `N · (log2 N + 3)` while the budget stays
+/// capped, and the count only has to clear that cap with a margin: 131,072 conditionals
+/// charge ≈2.6M units against the ≈1.6M cap. In-method regions would lose this race —
+/// they feed the per-item budget faster (256 units per body item) than the sort spends,
+/// so the projection finishes before it exhausts.
 pub(crate) fn notify_exhaustion_module_text() -> String {
-    const REGIONS: usize = 65_536;
-    let mut text = String::with_capacity(REGIONS * 24 + 256);
+    const REGIONS: usize = 131_072;
+    let mut text = String::with_capacity(REGIONS * 32 + 256);
     for _ in 0..REGIONS {
         text.push_str("#Если Сервер Тогда\n#КонецЕсли\n");
     }
