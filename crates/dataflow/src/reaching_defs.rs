@@ -495,10 +495,12 @@ pub fn solve_reaching_definitions(
     solve_reaching_definitions_with_work(cfg, body_arc, events, seed_params, &mut |_| true)
 }
 
-/// [`solve_reaching_definitions`] that reports the index, entry state and every
-/// solver visit to `spend`, and returns `None` when it refuses more. A deferred
-/// reader can therefore bound the full reaching-definitions solve instead of
-/// either running it unbounded or treating every body as incomplete.
+/// [`solve_reaching_definitions`] that reports the index, entry state, the two
+/// bottom states of every block and every solver visit to `spend`, and returns
+/// `None` when it refuses more. A deferred reader can therefore bound the full
+/// reaching-definitions solve — the bottom states alone cost two bitsets of the
+/// index width per block, so they are charged before they are built — instead
+/// of either running it unbounded or treating every body as incomplete.
 pub fn solve_reaching_definitions_with_work(
     cfg: Arc<cfg::ControlFlowGraph>,
     body_arc: &Arc<Body>,
@@ -534,7 +536,18 @@ pub fn solve_reaching_definitions_with_work(
 
     let mut solver = DataflowSolver::new(cfg, body.clone(), ReachingDefsTransfer);
     solver.set_max_iterations(DEFAULT_MAX_ITERATIONS);
-    solver.set_bottom_factory(|| ReachingDefs::new(def_index.clone()));
+    // A bottom state is an empty bitset over the whole index, so its words are
+    // the same measure `work_weight` reports for states: seeding every block
+    // costs two of those per block and is paid before each state is built.
+    let bottom_words = def_index.len().div_ceil(usize::BITS as usize);
+    let seeded = solver.set_bottom_factory_with_work(
+        || ReachingDefs::new(def_index.clone()),
+        bottom_words,
+        &mut metered,
+    );
+    if !seeded {
+        return None;
+    }
     solver.set_initial_state(initial_defs);
 
     let solved = solver.solve_with_work(&mut metered);

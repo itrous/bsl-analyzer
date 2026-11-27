@@ -200,6 +200,34 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
         }
     }
 
+    /// [`DataflowSolver::set_bottom_factory`] that meters every bottom state
+    /// before the factory builds it: each of a vertex's two states charges
+    /// `cost_per_state` through `spend`, and a refusal stops the seeding with
+    /// `false`, leaving the solver uninitialized — the caller must give up
+    /// instead of solving. Like [`spend_for_state`], a state charges at least
+    /// one unit, so even a free state still reaches the cancellation check.
+    pub fn set_bottom_factory_with_work<F>(
+        &mut self,
+        mut factory: F,
+        cost_per_state: usize,
+        spend: &mut dyn FnMut(usize) -> bool,
+    ) -> bool
+    where
+        F: FnMut() -> L,
+    {
+        for (block_idx, _vertex) in self.cfg.vertices() {
+            if !spend(cost_per_state.max(1)) {
+                return false;
+            }
+            self.block_in.insert(block_idx, factory());
+            if !spend(cost_per_state.max(1)) {
+                return false;
+            }
+            self.block_out.insert(block_idx, factory());
+        }
+        true
+    }
+
     pub fn solve(self) -> Option<DataflowResult<L>> {
         self.solve_with_work(&mut |_| true)
     }
@@ -1092,6 +1120,49 @@ mod tests {
 
         assert!(!result.converged(), "the fallback charge must be refused");
         assert_eq!(clones.get(), 0, "the fallback state must not be cloned behind its refusal");
+    }
+
+    /// Each bottom state is charged before the factory builds it, so a budget
+    /// that funds exactly `n` charges builds exactly `n` states and stops; a
+    /// full budget builds both states of every vertex and the solve may run.
+    #[test]
+    fn bottom_factory_charges_each_state_before_it_is_built() {
+        use cfg::{BasicBlockVertex, CfgEdgeType, CfgVertex};
+
+        let mut cfg = ControlFlowGraph::new();
+        let entry = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
+        let mid = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
+        cfg.set_start(entry);
+        cfg.add_edge(entry, mid, CfgEdgeType::Unconditional);
+        let vertices = cfg.vertex_count();
+
+        let builds = Rc::new(Cell::new(0usize));
+        let clones = Rc::new(Cell::new(0usize));
+        let mut solver =
+            DataflowSolver::new(Arc::new(cfg.clone()), Body::default(), PassThroughTransfer);
+        let built = solver.set_bottom_factory_with_work(
+            || {
+                builds.set(builds.get() + 1);
+                CloneCountedLattice { values: vec![], clones: Rc::clone(&clones) }
+            },
+            3,
+            &mut refused_after(4),
+        );
+        assert!(!built, "a budget that funds fewer charges than the states must refuse");
+        assert_eq!(builds.get(), 4, "every accepted charge bought its state before the refusal");
+
+        builds.set(0);
+        let mut solver = DataflowSolver::new(Arc::new(cfg), Body::default(), PassThroughTransfer);
+        let built = solver.set_bottom_factory_with_work(
+            || {
+                builds.set(builds.get() + 1);
+                CloneCountedLattice { values: vec![], clones: Rc::clone(&clones) }
+            },
+            3,
+            &mut |_| true,
+        );
+        assert!(built, "an unlimited budget seeds every block");
+        assert_eq!(builds.get(), 2 * vertices, "both states of every vertex are built");
     }
 
     /// With an adequate budget the same forward solve converges and the charged

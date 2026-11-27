@@ -1446,6 +1446,88 @@ fn full_reaching_definitions_solve_is_budgeted() {
     );
 }
 
+/// The bottom states of every block are charged before they are built: a budget
+/// that ends right after the entry state stops the solve before any of them is
+/// allocated, instead of letting the seeding run outside the meter.
+#[test]
+fn bottom_seeding_is_charged_before_allocation() {
+    const DECLARATIONS: usize = 300;
+    let mut source = String::from("Процедура Т(Усл)\n");
+    for index in 0..DECLARATIONS {
+        source.push_str(&format!("    Перем A{index};\n"));
+    }
+    source.push_str("    Если Усл Тогда\n        A0 = 1;\n    КонецЕсли;\nКонецПроцедуры\n");
+    let f = fixture(&source);
+    let blocks = f.cfg.vertex_count();
+    let params = params_of(&f.body, true).len();
+    let bottom_words = f.index.len().div_ceil(usize::BITS as usize);
+    assert!(blocks >= 2, "the fixture declares a branching body: {blocks}");
+    assert!(bottom_words > 1, "the fixture declares enough definitions: {bottom_words}");
+
+    let mut index_work = 0usize;
+    DefinitionIndex::from_body_with_params_with_work(
+        &f.body,
+        &f.events,
+        params_of(&f.body, true),
+        &mut |work| {
+            index_work += work;
+            true
+        },
+    );
+
+    let mut spent = 0usize;
+    let solved = solve_reaching_definitions_with_work(
+        f.cfg.clone(),
+        &f.body,
+        f.events.clone(),
+        true,
+        &mut |work| {
+            spent += work;
+            true
+        },
+    );
+    assert!(solved.is_some(), "an unlimited budget solves the body");
+    assert!(
+        spent >= index_work + params + 2 * blocks * bottom_words,
+        "the unlimited solve pays for both bottom states of every block: spent {spent}"
+    );
+
+    // The budget ends exactly where the entry state ends: the next charge is
+    // the first bottom state, so the solve refuses and charges nothing more.
+    let before_seeding = index_work + params;
+    let (stopped, accepted) = solve_within(before_seeding, &f);
+    assert!(stopped.is_none(), "a budget that ends with the entry state must stop the solve");
+    assert_eq!(accepted, before_seeding, "nothing past the entry state was charged");
+
+    // One more unit bought the first block visit before the metering; a bottom
+    // state of a wide index costs more than one, so it still buys nothing.
+    let (stopped, accepted) = solve_within(before_seeding + 1, &f);
+    assert!(stopped.is_none(), "a budget inside the seeding must stop the solve");
+    assert_eq!(accepted, before_seeding, "the extra unit must not buy a bottom state");
+}
+
+/// Runs the metered solve with a budget of exactly `budget` units and reports
+/// the published result (if any) with the work it accepted.
+fn solve_within(budget: usize, f: &Fixture) -> (Option<Arc<ReachingDefsResult>>, usize) {
+    let mut remaining = budget;
+    let mut accepted = 0usize;
+    let stopped = solve_reaching_definitions_with_work(
+        f.cfg.clone(),
+        &f.body,
+        f.events.clone(),
+        true,
+        &mut |work| {
+            if work > remaining {
+                return false;
+            }
+            remaining -= work;
+            accepted += work;
+            true
+        },
+    );
+    (stopped, accepted)
+}
+
 /// The write index charges every root, call and argument it visits, including an
 /// argument that is not a bare name and so yields no write event.
 #[test]
